@@ -274,7 +274,10 @@ def main():
         display_stop.set()
         if name and session_history:
             print("💾 대화 결과지를 생성합니다...")
-            report_manager.generate_and_save_reports(name, "\n".join(session_history), facts_summary)
+            # 대화 중 remember_fact로 새로 저장된 사실을 반영하려면 세션 시작 전에
+            # 로드해둔 facts_summary가 아니라 지금 시점 기준으로 다시 읽어야 한다.
+            latest_facts_summary = profiles.load_profile_for_chat(name)
+            report_manager.generate_and_save_reports(name, "\n".join(session_history), latest_facts_summary)
         elif session_history:
             print("ℹ️  이름을 몰라 결과지는 생성하지 않습니다 (대화 자체는 정상 진행됨).")
 

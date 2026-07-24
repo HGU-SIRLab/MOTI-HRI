@@ -2,9 +2,10 @@
 Gemini 툴로 노출한다. memory_tools.py/emotion_tools.py와 같은 클로저 패턴.
 
 play_manual_motion은 "dance"를 제외한 나머지 매크로(hug/greeting/wave/shy)를 블로킹으로
-실행한다(포옹 10초+ 등). Live 세션의 tool_call 처리는 동기적이라(docs/progress.md §09),
-그대로 블로킹하면 그동안 오디오 스트림도 멈춘다 — 그래서 실제 실행은 항상 백그라운드
-스레드로 넘기고, 툴 자체는 "시작했다"는 응답만 즉시 돌려준다.
+실행한다(포옹 10초+ 등). Live 세션의 tool_call 처리는 동기적이라(docs/architecture.md §09,
+docs/progress.md 4단계 핵심 발견 2번), 그대로 블로킹하면 그동안 오디오 스트림도 멈춘다 —
+그래서 실제 실행은 항상 백그라운드 스레드로 넘기고, 툴 자체는 "시작했다"는 응답만 즉시
+돌려준다.
 """
 import threading
 

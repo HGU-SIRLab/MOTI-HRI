@@ -14,7 +14,9 @@ ALPHA = 1e-5        # 선택 파라미터
 BETA = 0.1          # 학습률
 BUFFER_SIZE = 5     # 인식 안정화 버퍼 크기
 VOTE_THRESHOLD = 3  # 투표 임계값
-DB_FILE = "art_brain.pkl"
+# v2는 cwd 상대경로였다 — 실행 위치에 따라 엉뚱한 폴더에 읽고 쓰게 되는 문제가
+# 있어(face.py의 모델 경로와 같은 이유로) __file__ 기준 절대경로로 바꿈.
+DB_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "art_brain.pkl")
 
 class FuzzyART:
     def __init__(self, rho=RHO, alpha=ALPHA, beta=BETA):
