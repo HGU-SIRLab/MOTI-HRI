@@ -17,6 +17,19 @@
 
 **검증**: 자동 종료되는 스모크 테스트(HAPPY→SAD→SCANNING 순서로 큐에 명령 넣고 3초 후 종료)를 실제로 실행해 통과 확인함 — 실제 pygame 창이 뜨고 감정 전환이 정상 동작. `core/emotion_tools.py`는 수정 없이 그대로 연결됨(애초에 `emotion_queue` 파라미터로 설계돼 있었음).
 
+### vision/vision_brain.py 포팅 (완료, 커밋 `7eeb201`)
+
+| 파일 | 내용 |
+|---|---|
+| `vision/vision_brain.py` | `FuzzyART`(패턴 기억) + `RobotBrain`(insightface `buffalo_l` 얼굴 임베딩 추출 + 인식/등록) — v2에서 변경 없이 포팅. `recognize_face(frame)`/`register_face(embedding, name)` 인터페이스가 `vision/face.py`의 `brain=` 파라미터가 기대하는 것과 이미 정확히 일치해서 face.py 쪽 수정 불필요 |
+| `scripts/test_vision_brain.py` | 웹캠으로 실시간 인식 미리보기 + `r` 키로 현재 얼굴 등록하는 독립 테스트 도구. 로봇 불필요 |
+
+**검증**: `buffalo_l` 모델이 v2 사용 이력 덕분에 `~/.insightface/models/`에 이미 캐시되어 있어 재다운로드 없이 바로 로딩됨. `RobotBrain()` 실제 초기화 + 빈 프레임에 `recognize_face()` 호출까지 실행해 `(None, None)`이 정상 반환되는 것 확인. `art_brain.pkl`이 v3 루트에 아직 없어 "기억된 얼굴 수: 0"으로 시작 — v2의 학습된 얼굴 데이터와 분리된 깨끗한 상태(의도된 동작, v2 파일을 갖고 오지 않음).
+
+### 다음 단계
+
+`core/profile_manager.py`와 연결 — art_brain이 이름을 확정하는 지점에서 `profiles.load_profile_for_chat(name)`을 호출해 `build_persona_system_instruction`에 넘기는 코드 작성.
+
 ## 5단계 — vision/face.py 포팅 (완료, 커밋 `4bf8e46`)
 
 ### 만든 것
