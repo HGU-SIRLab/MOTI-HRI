@@ -1,65 +1,45 @@
 # 통합 시 연결해야 할 지점 (Integration TODOs)
 
-지금까지(로드맵 §10 1~4단계) 만든 코드는 전부 **독립적으로 검증 가능하게** 일부러 서로 느슨하게 떨어뜨려 놓았다. 나중에 다음 단계(vision/, display/, launcher.py)를 만들 때 "이미 있는 것을 어디에 꽂아야 하는지" 매번 코드를 다시 뒤지지 않도록 여기 모아둔다. 무언가를 새로 만들 때 이 문서의 해당 항목도 같이 지워나가면 된다.
+로드맵 §10 1~5단계(로봇 없이 가능한 작업 전부)까지 만든 코드는 `scripts/run_no_robot.py`가 실제로 이어붙였다. 이 문서는 **아직 진짜로 안 이어진 지점만** 남긴다 — 뭔가 새로 만들 때 여기 항목도 같이 지워나갈 것(파일 자체의 오래된 원칙).
 
-## vision/face.py — 포팅 완료(추적만), 얼굴인식은 아직
+## 로봇이 있어야 이어지는 지점
 
-**결정됨(더 이상 오픈 이슈 아님)**: barge-in을 사람이 직접 이어폰 끼고 검증한 결과 서버 측 VAD(`RealtimeInputConfig.automatic_activity_detection`)가 정상 동작함을 확인했다. 그래서 `vision/face.py`(커밋 `4bf8e46`)는 입모양(jawOpen) 커스텀 VAD를 전부 제거하고 팬/틸트 추적만 담당하도록 포팅했다.
+### `vision/face.py`의 `shared_state['detected_user']` ↔ `profile_manager` — 아직 안 이어짐
 
-- **아직 안 된 것**: `vision/vision_brain.py`(`RobotBrain`, insightface+FuzzyART, `art_brain.pkl`)가 없어서 `face_tracker_worker(brain=None)`으로만 쓸 수 있다 — 얼굴 인식(누가 왔는지 식별)이 안 되므로 `shared_state['detected_user']`가 갱신되지 않는다. 포팅하려면 v2의 `vision/vision_brain.py`를 그대로 가져오면 됨(설계 변경 불필요, `docs/architecture.md` §07).
-- **새로 발견된 이슈**: 스피커+마이크를 이어폰 없이 같이 쓰면(=로봇의 실제 구성과 동일) 스피커 소리를 마이크가 되먹여서 서버 VAD가 오탐(`interrupted=True`가 저절로 뜸)한다. `launcher.py` 오디오 루프를 만들 때 AEC 또는 "TTS 재생 중 마이크 입력 무시" 처리가 필요할 것으로 보임 — 아직 코드 없음, `docs/progress.md` 4단계 항목 참고.
+`face_tracker_worker(..., brain=RobotBrain())`는 얼굴을 인식하면 `shared_state['detected_user']`를 갱신하도록 되어 있다(팬/틸트 추적 스레드 안에서 지속적으로 갱신되는 방식). 하지만 **이 경로는 아직 아무 데도 연결 안 됨** — `run_no_robot.py`는 이거 대신 훨씬 단순한 `identify_user_via_webcam()`(최대 8초짜리 동기 함수, 스레드도 shared_state도 안 씀)로 이름을 알아내고 그걸로 `profile_manager`를 연결했다. `face_tracker_worker`를 실제로 스레드로 띄우게 되면(=로봇 연결 후, 팬/틸트가 필요해지는 시점) 그 스레드가 갱신하는 `shared_state['detected_user']`를 세션이 볼 수 있게 다시 연결해야 한다 — 지금의 1회성 웹캠 인식 방식과는 다른 설계가 필요할 수 있음(예: 대화 도중 다른 사람으로 바뀌는 경우를 어떻게 할지).
 
-## hardware/motion.py — `play_manual_motion`이 아직 아무 데도 안 붙어 있음
+### `core/motion_tools.py`의 `play_gesture` 툴 — 만들어졌지만 어디에도 등록 안 됨
 
-- `play_manual_motion(name, port, pkt, lock, shared_state, home_pan, home_tilt, emotion_queue)`는 `scripts/test_motions.py`의 키보드 메뉴로만 트리거된다. Gemini가 스스로 호출할 수 있는 툴이 아직 아니다.
-- **할 일**: `core/memory_tools.py`·`core/emotion_tools.py`와 같은 패턴으로 `core/motion_tools.py`를 만들어 `make_play_motion_tool(port, pkt, lock, shared_state, home_pan, home_tilt, emotion_queue)` 클로저를 정의하고, Cognition 세션의 `tools=[...]`에 `remember_fact`, `set_emotion`과 함께 추가한다.
-- `core/utils.py`의 `build_persona_system_instruction`에도 이 툴을 언제 쓸지 안내하는 절(section 7의 `set_emotion` 가이드와 같은 형태)을 추가해야 한다. 지금은 존재하지 않음.
-- ID 5·11 관련 이름 정리(§05)는 끝났지만 **ID 10 모터의 정체는 여전히 불명**이다. 실물 로봇으로 어떤 관절인지 확인되면 `hardware/config.py`에 정식 이름을 붙이고 `hardware/init.py`의 "용도 불명" 주석을 지운다.
-- Layer 2(`express_gesture`, 파라미터화된 프리미티브)는 아직 코드가 없다. 안전 범위 표는 `docs/architecture.md` §05에 이미 있으므로, 구현 시 그 표를 그대로 `hardware/motion.py`에 옮기면 된다.
+툴 자체(`make_play_motion_tool`)는 존재하고 잘못된 제스처 이름을 거르는 부분까지는 검증됐다. 하지만 `run_no_robot.py`의 `tools=[...]`에는 로봇이 없어서 아직 안 넣었다. **할 일**: 로봇 연결 후 `port`/`pkt`/`lock`/`shared_state`가 생기면 `make_play_motion_tool(...)`을 호출해 `remember_fact`, `set_emotion`과 함께 세션에 추가 — 이 시점에 `run_no_robot.py`를 `launcher.py`로 승격.
 
-## core/profile_manager.py — 아직 세션 생명주기에 연결 안 됨
+### Layer 2 파라미터 제스처 (`express_gesture`) — 코드 없음
 
-- `load_profile_for_chat(name)`과 `is_known(name)`은 완성됐지만, 지금은 테스트 스크립트가 직접 호출할 때만 쓰인다.
-- **할 일**: art_brain(얼굴인식, 아직 미포팅)이 이름을 확정하는 지점에서 `profiles.load_profile_for_chat(name)`을 호출해 `build_persona_system_instruction(name, facts_summary)`에 넘기는 코드가 필요하다. 이게 §08 시나리오 A/B("신규"/"재회")를 실제로 갈라주는 지점이다.
-- `report_manager.py`(세션 종료 시 "마음처방전" 생성, v2에 있었음)는 아직 포팅 안 됨. 포팅할 때 v2의 고정 `user_info` 딕셔너리가 아니라 새 `facts` 배열 스키마를 입력으로 받도록 새로 짜야 한다.
-- facts가 세션을 거듭할수록 계속 쌓이기만 하는데, 오래되거나 상충하는 항목을 정리하는 로직(v2의 `batch_update_summary`가 하던 일)은 없다. 지금 당장 필요하진 않지만(정정은 덮어쓰기라 무한정 늘어나진 않음), 세션이 많이 쌓였을 때 재검토할 것.
+안전 범위 표는 `docs/architecture.md` §05에 이미 있으므로, 구현 시 그 표를 그대로 `hardware/motion.py`에 옮기면 된다.
 
-## core/utils.py — 감정 툴 가이드만 있고 제스처 툴 가이드는 없음, `[대화종료]` 태그 소비자 없음
+### ID 10 모터 — 정체 여전히 불명
 
-- `build_persona_system_instruction`의 "5번 룰"에 `[대화종료]` 텍스트 태그를 출력하라는 지시가 v2 그대로 남아있다. 지금은 이걸 파싱해서 세션을 끝내는 코드가 어디에도 없다.
-- **할 일**: Cognition 루프(4단계 이후)를 만들 때 응답 텍스트에서 `[대화종료]`를 감지 → 발화 전에 태그를 잘라내고 → 세션 종료/플러시 트리거로 쓰는 로직이 필요하다. (v2 `gemini_api.py`의 처리 방식을 참고하되 batch/Live 어느 쪽이든 적용 가능하게 짤 것.)
+`hardware/init.py`가 위치 1001로 초기화만 하고 있음. 실물 로봇으로 어떤 관절인지 확인되면 `hardware/config.py`에 정식 이름을 붙이고 "용도 불명" 주석을 지운다.
 
-## core/emotion_tools.py — display/ 포팅 완료로 연결 가능해짐
+### 스피커→마이크 음향 에코로 인한 barge-in 오탐 — 코드 없음
 
-- `make_set_emotion_tool(emotion_queue=None)`은 코드 수정 없이 그대로 사용 가능. `display/main.py`(커밋 `5c17dd7`)의 `RobotFaceApp`이 정확히 같은 `emotion_queue` 인터페이스를 기대하도록 만들어져 있었다.
-- **할 일**: launcher.py를 만들 때 `queue.Queue()`를 만들어 `make_set_emotion_tool(emotion_queue)`와 `RobotFaceApp(emotion_queue=emotion_queue, ...)` 양쪽에 같은 인스턴스를 넘기기만 하면 된다.
+이어폰 없이 스피커+마이크를 같이 쓰면(=로봇의 실제 구성) 스피커 소리를 마이크가 되먹여서 서버 VAD가 오탐한다(`docs/architecture.md` §09, `docs/progress.md` 4단계). AEC 또는 "TTS 재생 중 마이크 입력 무시" 중 하나를 오디오 루프(현재는 `run_no_robot.py`의 `MicStreamer`/`Speaker`)에 넣어야 함.
 
-## vision/ — face.py, vision_brain.py 둘 다 포팅 완료
+## 로봇과 무관하게 남은 것 (우선순위 낮음)
 
-- `vision/face.py`(커밋 `4bf8e46`, 팬/틸트 추적)와 `vision/vision_brain.py`(커밋 `7eeb201`, insightface+FuzzyART 인식) 둘 다 포팅됨. `face_tracker_worker(..., brain=RobotBrain())`으로 넘기면 자동으로 연결된다 — 인터페이스가 이미 일치해서 face.py 쪽 수정도 없었음.
-- `shared_state['detected_user']`가 갱신되는 지점이 아래 profile_manager 연결 지점과 만나는 곳이다 — **아직 이어지지 않음**, 다음 할 일.
+- **facts 정리 로직 없음**: 세션을 거듭할수록 `profile_manager`의 facts가 계속 쌓이기만 한다(v2의 `batch_update_summary`가 하던 정리 작업이 v3엔 없음). 정정은 덮어쓰기라 무한정 늘어나진 않지만, 세션이 많이 쌓이면 재검토할 것.
+- **`media/` 패키지가 비어있음**: 마이크/스피커 I/O는 실제로는 존재한다 — `run_no_robot.py`의 `MicStreamer`/`Speaker` 클래스가 그 역할을 한다. 다만 v2처럼 `media/audio_manager.py`로 분리되어 있진 않고 스크립트에 inline돼 있다. `launcher.py`로 승격할 때 재사용성이 필요해지면(예: batch 폴백 경로도 같이 쓰려면) 그때 `media/`로 뽑아낼 것 — 지금 당장은 불필요한 추상화라 미룸.
+- **`subtitle.py`의 번들 폰트가 런타임에 자동 등록 안 됨**: `display/fonts/`에 파일은 있지만 tkinter가 시스템에 설치된 폰트만 찾는다. 미설치 시 조용히 기본 폰트로 대체(에러 아님, v2도 동일). 필요하면 폰트 파일을 수동 설치할 것.
 
-## display/ — 포팅 완료
+## 완료된 통합 (참고용 — `scripts/run_no_robot.py`, 커밋 `25e8e8d`)
 
-- `display/main.py`, `display/emotions/*.py`(12종 표정 + eyebrow/cheeks), `display/subtitle.py`, `display/fonts/` 전부 포팅됨(커밋 `5c17dd7`). v2에서 변경 없이 그대로 가져왔다 — 전부 자기완결형이라 하드웨어/core 의존성이 없었음.
-- `subtitle.py`는 tkinter가 `display/fonts/`에 번들된 폰트 파일을 런타임에 자동 등록하지 않는다 — 시스템에 해당 폰트가 설치되어 있지 않으면 조용히 기본 폰트로 대체된다(에러 아님, v2도 동일). 필요하면 폰트 파일을 수동 설치할 것.
+로봇 없이 가능한 부분은 전부 실제로 이어져 있다:
 
-## media/ — 통째로 비어 있음
-
-- 마이크 녹음(v2 `media/audio_manager.py`)과 TTS(v2 `media/tts_manager.py`, Typecast 기반 — 이건 설계상 폐기하고 Live API 오디오 출력 또는 Gemini TTS로 교체하기로 했었음, §03)가 없다.
-- 이건 로드맵 4단계(Live API PoC) 자체의 일부라 별도 "TODO"라기보다 다음 작업 그 자체임.
-
-## Cognition 오케스트레이션 — launcher.py는 아직 없지만 no-robot 버전은 있음
-
-`scripts/run_no_robot.py`(커밋 `25e8e8d`)가 아래 7단계 중 모터가 필요 없는 부분을 전부 실제로 연결했다:
-1. art_brain(`vision_brain.RobotBrain`)이 웹캠으로 이름을 확정(또는 미확정) — ✅
-2. `profiles.load_profile_for_chat(name)` 호출 — ✅ (이름 확정 시에만)
-3. `build_persona_system_instruction(name, facts_summary)`로 시스템 인스트럭션 생성 — ✅
-4. `tools=[remember_fact(이름 알 때만), set_emotion]`로 세션 생성 — ✅. **`play_gesture`(motion_tools)는 로봇이 없어서 아직 안 붙임** — 로봇 연결되면 여기에 추가
-5. 오디오 in/out 연결 — ✅ (test_live_audio.py와 동일한 MicStreamer/Speaker)
+1. `vision_brain.RobotBrain`으로 웹캠 얼굴 인식(또는 미확정) — ✅
+2. `profiles.load_profile_for_chat(name)` 호출(이름 확정 시) — ✅
+3. `build_persona_system_instruction(name, facts_summary)` — ✅
+4. `tools=[remember_fact(이름 알 때만), set_emotion]` — ✅ (`play_gesture`는 위 "로봇이 있어야" 항목 참고)
+5. 오디오 in/out (`MicStreamer`/`Speaker`) — ✅
 6. `message.tool_call` 수동 처리 — ✅
-7. `[대화종료]` 감지 시 세션 종료·리포트 생성 — ✅ (`extract_exit_tag` + `report_manager`)
+7. `extract_exit_tag()`로 `[대화종료]` 감지 → `report_manager.generate_and_save_reports(name, log, 최신_facts_summary)` — ✅ (facts_summary는 리포트 생성 직전에 다시 로드함 — 대화 중 새로 안 사실 반영)
 
-**남은 것은 모터뿐**: 로봇이 생기면 `run_no_robot.py`에 (a) `vision/face.py`의 `face_tracker_worker`를 별도 스레드로 추가하고(팬/틸트 추적 + brain 인식을 얼굴추적 스레드 쪽으로 이관), (b) `core/motion_tools.py`의 `play_gesture` 툴을 `tools=[...]`에 추가하면 된다 — 이 시점에 파일을 `launcher.py`로 승격.
-
-모델명은 이미 분리해뒀다: batch 폴백용 `MODEL_NAME`(기본값 `gemini-3.1-flash-lite`), Live API용 `LIVE_MODEL_NAME`(기본값 `models/gemini-3.1-flash-live-preview`, `.env.example`에 기록됨). `client.models.list()`로 실제 `bidiGenerateContent` 지원 여부를 확인했음 — 모델명이 바뀌면 이 방법으로 재확인.
+모델명: batch 폴백용 `MODEL_NAME`(기본값 `gemini-3.1-flash-lite`), Live API용 `LIVE_MODEL_NAME`(기본값 `models/gemini-3.1-flash-live-preview`), `.env.example`에 기록됨. `client.models.list()`로 실제 `bidiGenerateContent` 지원 여부 재확인 가능.

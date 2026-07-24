@@ -5,7 +5,7 @@ v2 core/report_manager.py 포팅. v2는 학년/전공/RC/MBTI 같은 고정 슬�
 만드는 자유형 facts_summary 문자열을 그대로 프롬프트에 박아 넣는다.
 
 conversation_log는 "User: {발화} | Moti: {응답}" 형식 줄바꿈 로그를 기대한다(v2와 동일 계약) —
-아직 Cognition 루프(launcher.py)가 없어 이 형식을 실제로 만드는 코드는 없다, 만들 때 맞출 것.
+scripts/run_no_robot.py가 매 턴마다 이 형식으로 session_history를 쌓아서 그대로 넘긴다.
 """
 import os
 from datetime import datetime

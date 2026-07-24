@@ -2,8 +2,10 @@
 [EMOTION]happy[/EMOTION] 같은 태그를 심고 정규식으로 파싱했는데, 파싱 실패
 가능성이 있었다. function calling으로 바꾸면 파싱이 아예 필요 없다.
 
-display/가 아직 없어서 지금은 콘솔 로그만 남긴다. display/main.py가 생기면
-emotion_queue를 넘겨서 그대로 emotion_queue.put(...)으로 바꾸면 된다.
+display/main.py(RobotFaceApp)가 포팅된 뒤로는 emotion_queue를 넘기면 그대로
+emotion_queue.put(...)으로 화면에 반영된다 — scripts/run_no_robot.py가 실제로
+이렇게 연결해서 씀. emotion_queue가 없을 때(예: display 없이 로직만 테스트할
+때)는 콘솔 로그만 남기는 폴백으로 동작한다.
 """
 
 VALID_EMOTIONS = (

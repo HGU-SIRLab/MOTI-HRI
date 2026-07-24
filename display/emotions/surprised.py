@@ -33,9 +33,10 @@ class Emotion:
             progress = elapsed / animation_duration
             body_offset_y = -jump_height * 4 * (progress - progress**2)
         else:
-             # 애니메이션이 끝나면 is_animating을 False로 만들어 다른 표정으로 갔다가 돌아왔을 때 다시 애니메이션을 볼 수 있게 함
-             # 단, main.py에서 상태가 바뀔 때 reset을 호출해주는 로직이 없으므로, 현재는 한 번만 실행됨.
-             # 이 부분은 추후 개선 가능성이 있음.
+             # 애니메이션이 끝난 뒤 여기서 is_animating을 다시 False로 내릴 필요는 없다 —
+             # main.py의 change_emotion()이 감정이 바뀔 때마다 이 클래스의 reset()을
+             # 호출해서 is_animating을 지워주므로, SURPRISED로 다시 들어올 때마다
+             # 점프 애니메이션이 자동으로 재생된다.
              pass
 
         # --- 눈썹 (더 높이 올림) ---
