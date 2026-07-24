@@ -38,9 +38,19 @@ v2는 학년/전공/RC/MBTI 고정 슬롯(`user_info` dict)을 받았는데, v3�
 
 `core/utils.py`에 `EXIT_TAG = "[대화종료]"`와 `extract_exit_tag(text) -> (cleaned_text, should_end)` 추가. 페르소나 시스템 인스트럭션은 처음부터 이 태그를 내보내라고 지시해왔지만 소비하는 코드가 없었음(integration-points.md). 스트리밍 청크가 아니라 한 턴이 끝난 뒤 누적 텍스트에 대해 호출하는 계약 — 청크 경계에서 태그가 잘리는 문제는 launcher.py(Cognition 루프)가 다룰 몫으로 남겨둠. 태그 있음/없음/trailing whitespace 3가지 케이스 inline assertion으로 검증.
 
+### scripts/run_no_robot.py — 통합 데모 (완료, 커밋 `25e8e8d`)
+
+로봇 없이 포팅한 모든 조각을 실제로 이어붙인 하나의 실행 가능한 스크립트. `launcher.py`는 아직 없음 — 이 스크립트가 로봇 연결 후 그 뼈대가 될 예정(모터 관련해서 `vision/face.py`의 `face_tracker_worker`와 `core/motion_tools.py`만 추가하면 됨).
+
+흐름: 웹캠으로 얼굴 인식 시도(최대 8초) → 인식되면 `profile_manager`에서 기존 facts 로드 → `build_persona_system_instruction`으로 페르소나 조립 → Live API 세션 시작(`remember_fact`는 이름을 알 때만 붙임, `set_emotion`은 항상) → `display/`로 표정 렌더링 → 매 턴마다 `extract_exit_tag`로 종료 감지 → 종료되면(정상이든 Ctrl+C든) 이름을 아는 경우 `report_manager`로 결과지 생성.
+
+**알려진 제한(의도된 범위)**: 얼굴을 못 알아보면 이번 세션은 `remember_fact` 툴 자체를 안 붙인다 — 이름 없이는 무엇의 프로필에 저장할지 알 수 없기 때문(얼굴을 미리 등록하려면 `scripts/test_vision_brain.py`의 'r' 키 사용). vitals_data(심박수 등)는 v2도 원래 수동 콘솔 입력이었는데, 이 스크립트에선 아예 안 물어보고 `None`으로 넘김 — 로드맵 범위 밖.
+
+**검증 상태**: 비대화 구간(startup)은 unbuffered stdout으로 실제 실행해 끝까지 확인함 — RobotBrain 로딩 → 웹캠 인식 8초 타임아웃 후 정상적으로 "이름 모른 채 진행" 분기 → remember_fact 미부착 확인 → Live API 세션 연결 성공까지 전부 정상. **실제 음성 대화 자체(마이크에 말하고 응답 듣기)는 사람이 직접 해봐야 함** — 이 세션에선 자동화된 스모크 테스트만 가능했음.
+
 ### 다음 단계
 
-launcher.py 뼈대 — 로봇 없이도 되는 부분(웹캠 얼굴인식→profile_manager 연결 포함해서) 전부 실제로 이어붙여서 오늘 대화까지 되는 상태로 만들기. 모터 관련(motion_tools 툴 등록)은 로봇 연결 후로 미룸.
+사용자가 `python scripts/run_no_robot.py`로 실제 대화(마이크+웹캠+표정 UI)를 해보고 결과 확인. 그 다음은 로봇 연결을 기다리는 항목들(Layer 2 파라미터 제스처, `vision/face.py` 실제 추적 검증, `run_no_robot.py`를 `launcher.py`로 승격) — §10 로드맵상 로봇 없이 할 수 있는 작업은 이걸로 전부 소진됨.
 
 ## 5단계 — vision/face.py 포팅 (완료, 커밋 `4bf8e46`)
 

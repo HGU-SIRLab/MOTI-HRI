@@ -49,17 +49,17 @@
 - 마이크 녹음(v2 `media/audio_manager.py`)과 TTS(v2 `media/tts_manager.py`, Typecast 기반 — 이건 설계상 폐기하고 Live API 오디오 출력 또는 Gemini TTS로 교체하기로 했었음, §03)가 없다.
 - 이건 로드맵 4단계(Live API PoC) 자체의 일부라 별도 "TODO"라기보다 다음 작업 그 자체임.
 
-## Cognition 오케스트레이션 — 아직 launcher.py도, 세션 매니저도 없음
+## Cognition 오케스트레이션 — launcher.py는 아직 없지만 no-robot 버전은 있음
 
-가장 큰 공백. 지금까지 만든 `remember_fact`/`set_emotion`/`build_persona_system_instruction`은 전부 테스트 스크립트(`scripts/test_live_poc.py`, `test_live_audio.py`)가 손으로 조립해서 쓰고 있다. 실제로는:
-1. art_brain이 이름을 확정(또는 미확정)
-2. `profiles.load_profile_for_chat(name)` 호출
-3. `build_persona_system_instruction(name, facts_summary)`로 시스템 인스트럭션 생성
-4. `tools=[remember_fact, set_emotion, (미래의)play_gesture]`로 모델/세션 생성
-5. 오디오 in/out 연결 (마이크→`send_realtime_input(audio=...)`, 스피커←`message.data`)
-6. `message.tool_call` 수신 시 직접 함수 실행 후 `send_tool_response` — **Live 세션은 batch의 `enable_automatic_function_calling`처럼 자동 실행을 해주지 않는다.** `scripts/test_live_poc.py`의 루프를 그대로 launcher 코드로 옮기면 됨.
-7. `[대화종료]` 감지 시 세션 종료·리포트 생성
+`scripts/run_no_robot.py`(커밋 `25e8e8d`)가 아래 7단계 중 모터가 필요 없는 부분을 전부 실제로 연결했다:
+1. art_brain(`vision_brain.RobotBrain`)이 웹캠으로 이름을 확정(또는 미확정) — ✅
+2. `profiles.load_profile_for_chat(name)` 호출 — ✅ (이름 확정 시에만)
+3. `build_persona_system_instruction(name, facts_summary)`로 시스템 인스트럭션 생성 — ✅
+4. `tools=[remember_fact(이름 알 때만), set_emotion]`로 세션 생성 — ✅. **`play_gesture`(motion_tools)는 로봇이 없어서 아직 안 붙임** — 로봇 연결되면 여기에 추가
+5. 오디오 in/out 연결 — ✅ (test_live_audio.py와 동일한 MicStreamer/Speaker)
+6. `message.tool_call` 수동 처리 — ✅
+7. `[대화종료]` 감지 시 세션 종료·리포트 생성 — ✅ (`extract_exit_tag` + `report_manager`)
 
-이 전체를 묶는 코드가 필요하다 — 이게 사실상 launcher.py 작업의 본체다. 툴 실행 루프 자체는 4단계에서 이미 검증됐으니 그대로 재사용하면 된다.
+**남은 것은 모터뿐**: 로봇이 생기면 `run_no_robot.py`에 (a) `vision/face.py`의 `face_tracker_worker`를 별도 스레드로 추가하고(팬/틸트 추적 + brain 인식을 얼굴추적 스레드 쪽으로 이관), (b) `core/motion_tools.py`의 `play_gesture` 툴을 `tools=[...]`에 추가하면 된다 — 이 시점에 파일을 `launcher.py`로 승격.
 
 모델명은 이미 분리해뒀다: batch 폴백용 `MODEL_NAME`(기본값 `gemini-3.1-flash-lite`), Live API용 `LIVE_MODEL_NAME`(기본값 `models/gemini-3.1-flash-live-preview`, `.env.example`에 기록됨). `client.models.list()`로 실제 `bidiGenerateContent` 지원 여부를 확인했음 — 모델명이 바뀌면 이 방법으로 재확인.
