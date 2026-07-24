@@ -1,0 +1,355 @@
+"""얼굴추적(Pan/Tilt PID) — v2 vision/face.py 포팅.
+
+v1/v2는 mediapipe 입모양(jawOpen) blendshape로 커스텀 VAD를 만들어 녹음
+시작/종료를 트리거했다. v3는 Gemini Live API의 서버 측 자동 VAD가 barge-in을
+포함해 이 역할을 대신한다는 게 실사용 테스트로 확인되어(docs/progress.md),
+그 로직을 통째로 제거했다 — 여기서는 얼굴추적(팬/틸트 제어)과 (선택적) 얼굴인식
+연동만 담당한다.
+"""
+from __future__ import annotations
+import os
+import threading
+import queue
+import time
+
+from hardware import config as C
+from core import suppress
+from hardware import dxl_io as io
+from dynamixel_sdk import PortHandler, PacketHandler
+from mediapipe.tasks import python
+from mediapipe.tasks.python import vision
+
+try:
+    import screeninfo
+except ImportError:
+    screeninfo = None
+
+_DISPLAY_Q: "queue.Queue" = queue.Queue(maxsize=1)
+
+
+def _publish_frame(frame):
+    try:
+        if _DISPLAY_Q.full():
+            try: _DISPLAY_Q.get_nowait()
+            except Exception: pass
+        _DISPLAY_Q.put_nowait(frame)
+    except Exception:
+        pass
+
+
+def _as_int(v, default=None):
+    try:
+        if isinstance(v, (tuple, list)):
+            v = v[0]
+        return int(v)
+    except Exception:
+        return default
+
+
+def face_tracker_worker(port: PortHandler, pkt: PacketHandler, lock: threading.Lock,
+                        stop_event: threading.Event, video_frame_q: queue.Queue,
+                        shared_state: dict,
+                        camera_index: int = 1,
+                        draw_mesh: bool = True,
+                        print_debug: bool = True,
+                        brain=None):
+    """얼굴을 추적해 팬/틸트 모터를 움직인다. brain이 주어지면 인식 결과로
+    shared_state['detected_user']도 갱신한다(없으면 추적만)."""
+
+    cv2, mp = suppress.import_cv2_mp()
+
+    model_asset_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'models', 'face_landmarker.task')
+
+    try:
+        base_options = python.BaseOptions(model_asset_path=model_asset_path)
+        options = vision.FaceLandmarkerOptions(
+            base_options=base_options,
+            running_mode=vision.RunningMode.VIDEO,
+            num_faces=20,
+            min_face_detection_confidence=0.5,
+            min_face_presence_confidence=0.5,
+            min_tracking_confidence=0.5,
+            output_face_blendshapes=False,
+            output_facial_transformation_matrixes=False
+        )
+        landmarker = vision.FaceLandmarker.create_from_options(options)
+        print("✅ 최신 FaceLandmarker 모델 로딩 완료.")
+
+    except Exception as e:
+        print(f"❌ FaceLandmarker 모델 로딩 실패: {e}")
+        return
+
+    def read_pos(dxl_id: int) -> int:
+        v = io.read_present_position(pkt, port, lock, dxl_id)
+        v = _as_int(v, None)
+        if v is None:
+            v = (C.SERVO_MIN + C.SERVO_MAX) // 2
+        return v
+
+    home_pan_pos = read_pos(C.PAN_ID)
+    home_tilt_pos = read_pos(C.TILT_ID)
+    pan_pos  = home_pan_pos
+    tilt_pos = home_tilt_pos
+
+    last_sent_pan = pan_pos
+    last_sent_tilt = tilt_pos
+
+    if print_debug:
+        print(f"▶ Initial(Home) pan={pan_pos}, tilt={tilt_pos}")
+
+    print(f"🤖 추적 모터(Pan/Tilt) 설정 (반응속도 최우선)...")
+    with lock:
+        accel_value = 20
+        velocity_value = 60
+
+        io.write4(pkt, port, C.PAN_ID, C.ADDR_PROFILE_VELOCITY, velocity_value)
+        io.write4(pkt, port, C.TILT_ID, C.ADDR_PROFILE_VELOCITY, velocity_value)
+
+        io.write4(pkt, port, C.PAN_ID, C.ADDR_PROFILE_ACCELERATION, accel_value)
+        io.write4(pkt, port, C.TILT_ID, C.ADDR_PROFILE_ACCELERATION, accel_value)
+
+    print(f"▶ 카메라({camera_index})를 여는 중입니다...")
+    cap = cv2.VideoCapture(camera_index, cv2.CAP_DSHOW)
+
+    if not cap.isOpened():
+        print(f"⚠️ 카메라({camera_index}) 열기 실패")
+        landmarker.close(); return
+    print(f"✅ 카메라({camera_index})가 성공적으로 열렸습니다.")
+
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+
+    last_mode = shared_state.get('mode', 'tracking')
+
+    last_error_pan = 0
+    last_error_tilt = 0
+    integral_pan = 0
+    integral_tilt = 0
+
+    prev_time = 0
+
+    smooth_nx = 1280 // 2
+    smooth_ny = 720 // 2
+    SMOOTH_FACTOR = 0.4
+
+    last_recog_time = 0
+    RECOG_INTERVAL = 0.5
+    is_initial_recognition_active = True
+
+    try:
+        while not stop_event.is_set():
+            ok, frame = cap.read()
+            if not ok: break
+
+            current_time = time.time()
+            fps = 0
+            if prev_time != 0:
+                delta_time = current_time - prev_time
+                if delta_time > 0:
+                    fps = 1 / delta_time
+            prev_time = current_time
+
+            frame = cv2.flip(frame, 1)
+
+            try:
+                if not video_frame_q.full():
+                    video_frame_q.put_nowait(frame.copy())
+            except Exception: pass
+
+            current_mode = shared_state.get('mode', 'tracking')
+
+            if brain:
+                cur_time = time.time()
+
+                force_learning = shared_state.get('force_learning', False)
+                target_name = shared_state.get('learning_target_name', None)
+
+                if shared_state.get('detected_user') not in ["Unknown", None, "Thinking..."] or shared_state.get('current_user_name') is not None:
+                    is_initial_recognition_active = False
+
+                is_recognition_needed = (
+                    force_learning or
+                    (current_mode == 'tracking' and is_initial_recognition_active)
+                )
+
+                if is_recognition_needed and (cur_time - last_recog_time >= RECOG_INTERVAL):
+
+                    last_recog_time = cur_time
+
+                    recog_frame = frame.copy()
+                    emb, name = brain.recognize_face(recog_frame)
+
+                    if emb is not None:
+                        shared_state['current_face_embedding'] = emb
+
+                        if is_initial_recognition_active:
+                            if name not in [None, "Thinking..."]:
+                                shared_state['detected_user'] = name
+
+                        if not force_learning and print_debug and name != "Thinking...":
+                            print(f"👤 [ART 인식] detected_user: {shared_state.get('detected_user')}, 결과: {name}")
+                    else:
+                        shared_state['current_face_embedding'] = None
+                        if is_initial_recognition_active:
+                            shared_state['detected_user'] = None
+
+                    if force_learning and emb is not None and target_name:
+                        msg = brain.register_face(emb, target_name)
+                        if print_debug:
+                            print(f"🔥 [집중 학습 중] {target_name}: {msg}")
+                        cv2.putText(frame, "SCANNING MODE", (10, 100),
+                                     cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+
+            h, w = frame.shape[:2]
+            cx, cy = w // 2, h // 2
+
+            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+            frame_timestamp_ms = int(time.perf_counter() * 1000)
+            res = landmarker.detect_for_video(mp_image, frame_timestamp_ms)
+
+            current_mode = shared_state.get('mode', 'tracking')
+
+            if current_mode != last_mode:
+                if current_mode == 'tracking':
+                    print("▶ Mode changed to Tracking: Re-reading current motor position.")
+                    pan_pos = read_pos(C.PAN_ID)
+                    tilt_pos = read_pos(C.TILT_ID)
+                    last_sent_pan, last_sent_tilt = pan_pos, tilt_pos
+                last_mode = current_mode
+
+            if current_mode == 'tracking':
+                if res.face_landmarks:
+                    lm = res.face_landmarks[0][1]  # 코 끝 좌표
+                    raw_nx, raw_ny = int(lm.x * w), int(lm.y * h)
+
+                    smooth_nx = int(raw_nx * SMOOTH_FACTOR + smooth_nx * (1 - SMOOTH_FACTOR))
+                    smooth_ny = int(raw_ny * SMOOTH_FACTOR + smooth_ny * (1 - SMOOTH_FACTOR))
+
+                    nx, ny = smooth_nx, smooth_ny
+
+                    error_pan = nx - cx
+                    error_tilt = cy - ny
+
+                    if abs(error_pan) > C.DEAD_ZONE or abs(error_tilt) > C.DEAD_ZONE:
+                        integral_pan += error_pan
+                        integral_tilt += error_tilt
+                        integral_pan = io.clamp(integral_pan, -200, 200)
+                        integral_tilt = io.clamp(integral_tilt, -200, 200)
+                        derivative_pan = error_pan - last_error_pan
+                        derivative_tilt = error_tilt - last_error_tilt
+
+                        pan_delta = (error_pan * C.KP_PAN) + (integral_pan * C.KI_PAN) + (derivative_pan * C.KD_PAN)
+                        tilt_delta = (error_tilt * C.KP_TILT) + (integral_tilt * C.KI_TILT) + (derivative_tilt * C.KD_TILT)
+                    else:
+                        pan_delta, tilt_delta = 0, 0
+                        integral_pan, integral_tilt = 0, 0
+
+                    last_error_pan = error_pan
+                    last_error_tilt = error_tilt
+
+                    pan_pos  = int(io.clamp(pan_pos  + C.PAN_SIGN  * pan_delta,  C.SERVO_MIN, C.SERVO_MAX))
+                    tilt_pos = int(io.clamp(tilt_pos + C.TILT_SIGN * tilt_delta, C.SERVO_MIN, C.TILT_POS_MAX))
+
+                    move_threshold = 15
+
+                    should_move_pan = abs(pan_pos - last_sent_pan) > move_threshold
+                    should_move_tilt = abs(tilt_pos - last_sent_tilt) > move_threshold
+
+                    if should_move_pan or should_move_tilt:
+                        with lock:
+                            if should_move_pan:
+                                io.write4(pkt, port, C.PAN_ID, C.ADDR_GOAL_POSITION, pan_pos)
+                                last_sent_pan = pan_pos
+
+                            if should_move_tilt:
+                                io.write4(pkt, port, C.TILT_ID, C.ADDR_GOAL_POSITION, tilt_pos)
+                                last_sent_tilt = tilt_pos
+
+                    cv2.circle(frame, (cx, cy), 5, (255, 0, 0), -1)
+                    cv2.circle(frame, (nx, ny), 5, (0, 0, 255), -1)
+                    cv2.circle(frame, (raw_nx, raw_ny), 3, (0, 255, 255), -1)
+                    cv2.putText(frame, "Mode: Tracking (Smooth)", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2)
+
+            if draw_mesh and res.face_landmarks:
+                for landmark_list in res.face_landmarks:
+                    x_min = min([landmark.x for landmark in landmark_list])
+                    y_min = min([landmark.y for landmark in landmark_list])
+                    x_max = max([landmark.x for landmark in landmark_list])
+                    y_max = max([landmark.y for landmark in landmark_list])
+                    start_point = (int(x_min * w), int(y_min * h))
+                    end_point = (int(x_max * w), int(y_max * h))
+                    cv2.rectangle(frame, start_point, end_point, (0, 255, 0), 2)
+
+            _publish_frame(frame)
+
+    finally:
+        print(f"🤖 추적 모터(Pan/Tilt) 설정 초기화 (가속도 0, 속도 100)...")
+        try:
+            with lock:
+                default_velocity = 100
+                io.write4(pkt, port, C.PAN_ID, C.ADDR_PROFILE_VELOCITY, default_velocity)
+                io.write4(pkt, port, C.TILT_ID, C.ADDR_PROFILE_VELOCITY, default_velocity)
+
+                io.write4(pkt, port, C.PAN_ID, C.ADDR_PROFILE_ACCELERATION, 0)
+                io.write4(pkt, port, C.TILT_ID, C.ADDR_PROFILE_ACCELERATION, 0)
+        except Exception as e:
+            print(f"⚠️  추적 모터 설정 초기화 중 오류: {e}")
+
+        try: cap.release()
+        except Exception: pass
+        landmarker.close()
+
+
+def display_loop_main_thread(stop_event: threading.Event, window_name: str = "Auto-Track Face Center"):
+    cv2, _ = suppress.import_cv2_mp()
+
+    try:
+        cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+
+        MONITOR_INDEX_FOR_TRIPLE_SETUP = 2
+        x_pos, y_pos = 0, 0
+
+        if screeninfo:
+            try:
+                monitors = screeninfo.get_monitors()
+                num_monitors = len(monitors)
+
+                target_index = 0
+                if num_monitors >= 3:
+                    target_index = MONITOR_INDEX_FOR_TRIPLE_SETUP
+                    print(f"✅ 카메라: 모니터 {num_monitors}개 감지 -> #{target_index}에 배치 시도")
+                else:
+                    target_index = 0
+                    print(f"✅ 카메라: 모니터 {num_monitors}개 감지 -> 주 모니터(#{target_index})에 배치")
+
+                if num_monitors > target_index:
+                    target_monitor = monitors[target_index]
+                else:
+                    target_monitor = monitors[0]
+                    print(f"⚠️ 지정된 카메라 모니터 #{target_index}를 찾을 수 없음")
+
+                camera_width = 1280
+                x_pos = target_monitor.x + (target_monitor.width - camera_width) // 2
+                y_pos = target_monitor.y
+
+            except Exception as e:
+                print(f"❌ 카메라 모니터 확인 오류: {e}")
+        else:
+            print("⚠️ 'screeninfo' 라이브러리가 없어 카메라를 주 모니터에 배치합니다.")
+
+        cv2.moveWindow(window_name, x_pos, y_pos)
+        print(f"✅ 카메라 창을 좌표 ({x_pos}, {y_pos})에 배치합니다.")
+
+        while not stop_event.is_set():
+            try:
+                frame = _DISPLAY_Q.get(timeout=0.05)
+            except queue.Empty:
+                continue
+
+            cv2.imshow(window_name, frame)
+            key = cv2.waitKey(1) & 0xFF
+            if key == 27:  # ESC
+                stop_event.set(); break
+    finally:
+        try: cv2.destroyAllWindows()
+        except Exception: pass
