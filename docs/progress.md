@@ -2,7 +2,22 @@
 
 `docs/architecture.md`의 로드맵(§10) 대비 실제 구현 상태를 기록한다. 설계 자체가 바뀌면 architecture.md를, 무엇을 언제 어떻게 만들었는지는 이 문서를 갱신한다.
 
-## 5단계 — vision/face.py 포팅 (진행 중, 커밋 `4bf8e46`)
+## 로봇 없이 할 수 있는 작업들 (진행 중)
+
+로봇이 당장 연결 안 된 상태라, 로봇/모터가 필요 없는 작업부터 먼저 진행하기로 함. 순서: display/ → vision_brain.py → profile_manager 연결 → report_manager.py → `[대화종료]` 처리 → launcher.py 뼈대. 모터가 필요한 나머지(Layer 2 제스처, launcher.py의 모션 연결)는 로봇 연결 후로 미룸.
+
+### display/ 포팅 (완료, 커밋 `5c17dd7`)
+
+| 파일 | 내용 |
+|---|---|
+| `display/main.py` | `RobotFaceApp` — pygame 기반 얼굴 표정 렌더러. `emotion_queue`에서 명령을 꺼내 `change_emotion`으로 반영 |
+| `display/common_helpers.py`, `emotions/*.py`(12종: neutral/happy/excited/tender/scared/angry/sad/surprised/listening/thinking/close/scanning), `emotions/eyebrow.py`, `emotions/cheeks.py` | v2에서 변경 없이 그대로 포팅 — 전부 `..common_helpers`만 참조하는 자기완결형 모듈이라 하드웨어 의존성 없음. v2에 있던 `sleepy.py`/`wake.py`는 v2 main.py도 안 쓰길래 v3에도 안 가져옴 |
+| `display/subtitle.py` | tkinter 자막 창(별도 프로세스). 폰트는 `display/fonts/`에 파일만 번들되어 있고 런타임에 자동 등록되진 않음 — v2도 마찬가지였음(시스템에 폰트 미설치 시 tkinter가 조용히 기본 폰트로 대체, 에러 아님) |
+| `scripts/test_display.py` | 콘솔에 감정 이름을 입력하면 emotion_queue로 밀어넣는 독립 테스트 도구. 로봇도 카메라도 불필요 |
+
+**검증**: 자동 종료되는 스모크 테스트(HAPPY→SAD→SCANNING 순서로 큐에 명령 넣고 3초 후 종료)를 실제로 실행해 통과 확인함 — 실제 pygame 창이 뜨고 감정 전환이 정상 동작. `core/emotion_tools.py`는 수정 없이 그대로 연결됨(애초에 `emotion_queue` 파라미터로 설계돼 있었음).
+
+## 5단계 — vision/face.py 포팅 (완료, 커밋 `4bf8e46`)
 
 ### 만든 것
 

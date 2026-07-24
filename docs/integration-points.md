@@ -29,21 +29,21 @@
 - `build_persona_system_instruction`의 "5번 룰"에 `[대화종료]` 텍스트 태그를 출력하라는 지시가 v2 그대로 남아있다. 지금은 이걸 파싱해서 세션을 끝내는 코드가 어디에도 없다.
 - **할 일**: Cognition 루프(4단계 이후)를 만들 때 응답 텍스트에서 `[대화종료]`를 감지 → 발화 전에 태그를 잘라내고 → 세션 종료/플러시 트리거로 쓰는 로직이 필요하다. (v2 `gemini_api.py`의 처리 방식을 참고하되 batch/Live 어느 쪽이든 적용 가능하게 짤 것.)
 
-## core/emotion_tools.py — 콘솔 로그로만 동작 중
+## core/emotion_tools.py — display/ 포팅 완료로 연결 가능해짐
 
-- `make_set_emotion_tool(emotion_queue=None)`은 `emotion_queue`가 없으면 그냥 `print()`만 한다 (display가 없으므로 현재는 의도된 동작).
-- **할 일**: `display/main.py`를 포팅하면, 세션을 만들 때 실제 `queue.Queue()`를 `make_set_emotion_tool(emotion_queue)`에 넘기기만 하면 된다 — 그 외 수정 불필요.
+- `make_set_emotion_tool(emotion_queue=None)`은 코드 수정 없이 그대로 사용 가능. `display/main.py`(커밋 `5c17dd7`)의 `RobotFaceApp`이 정확히 같은 `emotion_queue` 인터페이스를 기대하도록 만들어져 있었다.
+- **할 일**: launcher.py를 만들 때 `queue.Queue()`를 만들어 `make_set_emotion_tool(emotion_queue)`와 `RobotFaceApp(emotion_queue=emotion_queue, ...)` 양쪽에 같은 인스턴스를 넘기기만 하면 된다.
 
-## vision/ — 통째로 비어 있음
+## vision/vision_brain.py — 아직 없음 (face.py는 포팅됨)
 
-- `vision/face.py`(얼굴추적 PID + 입모양 VAD), `vision/vision_brain.py`(art_brain FuzzyART 얼굴 인식)가 아직 없다.
-- **할 일**: architecture.md §07에 따르면 이 둘은 v1/v2와 설계 변경 없이 그대로 포팅 가능하다 — v2의 `core/suppress.py`(mediapipe/cv2 로그 억제 유틸)도 함께 필요하니 같이 가져올 것.
-- `shared_state['detected_user']`가 갱신되는 지점이 바로 위 profile_manager 연결 지점과 만나는 곳이다.
+- `vision/face.py`는 포팅 완료(커밋 `4bf8e46`, 팬/틸트 추적만). `vision/vision_brain.py`(art_brain FuzzyART 얼굴 인식)는 아직 없다.
+- **할 일**: architecture.md §07에 따르면 v1/v2와 설계 변경 없이 그대로 포팅 가능. 웹캠만 있으면 로봇 없이도 인식 자체는 테스트 가능(팬/틸트 서보 제어가 없는 부분이라).
+- `shared_state['detected_user']`가 갱신되는 지점이 아래 profile_manager 연결 지점과 만나는 곳이다.
 
-## display/ — 통째로 비어 있음
+## display/ — 포팅 완료
 
-- `display/main.py`, `display/emotions/*.py`(12종 표정), `display/subtitle.py`가 아직 없다.
-- **할 일**: architecture.md §06에 따르면 구조 변경 없이 포팅 가능. `emotion_queue`는 위 emotion_tools 항목과 연결.
+- `display/main.py`, `display/emotions/*.py`(12종 표정 + eyebrow/cheeks), `display/subtitle.py`, `display/fonts/` 전부 포팅됨(커밋 `5c17dd7`). v2에서 변경 없이 그대로 가져왔다 — 전부 자기완결형이라 하드웨어/core 의존성이 없었음.
+- `subtitle.py`는 tkinter가 `display/fonts/`에 번들된 폰트 파일을 런타임에 자동 등록하지 않는다 — 시스템에 해당 폰트가 설치되어 있지 않으면 조용히 기본 폰트로 대체된다(에러 아님, v2도 동일). 필요하면 폰트 파일을 수동 설치할 것.
 
 ## media/ — 통째로 비어 있음
 
