@@ -92,8 +92,8 @@ def rpm_to_unit(rpm: float) -> int:
 BASE_SPEED_UNITS = rpm_to_unit(BASE_RPM)
 TURN_SPEED_UNITS = rpm_to_unit(TURN_RPM)
 
-# 춤 시퀀스 전용 회전 속도 (평상시 TURN_RPM의 2배)
-DANCE_TURN_RPM = 50.0
+# 춤 시퀀스 전용 회전 속도 (평상시 TURN_RPM의 2배 — TURN_RPM을 .env로 바꿔도 비율 유지)
+DANCE_TURN_RPM = TURN_RPM * 2
 DANCE_TURN_SPEED_UNITS = rpm_to_unit(DANCE_TURN_RPM)
 
 # ---- 고개 끄덕임 ----

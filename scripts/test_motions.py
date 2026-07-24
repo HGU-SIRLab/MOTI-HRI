@@ -10,6 +10,7 @@ hardware/motion.py의 동작만 검증하는 용도.
 import os
 import sys
 import threading
+import time
 
 from dynamixel_sdk import PortHandler, PacketHandler
 
@@ -73,8 +74,13 @@ def main():
             else:
                 print("⚠️ 알 수 없는 입력입니다.")
     finally:
+        if M.is_dancing():
+            print("⏳ 춤이 끝날 때까지 대기 중... (강제 종료하면 로봇이 자세를 복구하지 못합니다)")
+            deadline = time.monotonic() + M.DANCE_DURATION + 5
+            while M.is_dancing() and time.monotonic() < deadline:
+                time.sleep(0.5)
         print("▶️  종료 — 모든 모터 토크 OFF")
-        I.shutdown_all_motors(pkt, port, lock)
+        I.shutdown_all_motors(port, pkt, lock)
         port.closePort()
 
 

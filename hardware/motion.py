@@ -215,7 +215,7 @@ def play_shy_motion(port: PortHandler, pkt: PacketHandler, lock: threading.Lock)
                 io.write4(pkt, port, motor_id, C.ADDR_PROFILE_ACCELERATION, 0)
 
 
-def _perform_shoulder_dance(pkt: PacketHandler, port: PortHandler, lock, duration_sec: float, frequency_hz: float, title: str):
+def _perform_shoulder_dance(port: PortHandler, pkt: PacketHandler, lock, duration_sec: float, frequency_hz: float, title: str):
     """사인파로 어깨를 흔드는 헬퍼. play_dance()의 오프닝/피날레에서 사용."""
     print(f"🎶 {title} 시작! ({duration_sec}초, {frequency_hz}Hz)")
     amplitude = C.SHOULDER_LEFT_POS - C.SHOULDER_CENTER_POS
@@ -259,8 +259,8 @@ def _dance_routine(port: PortHandler, pkt: PacketHandler, lock: threading.Lock, 
         pygame.mixer.music.play(start=_MUSIC_START_SECONDS)
         threading.Timer(DANCE_DURATION, pygame.mixer.music.stop).start()
 
-        _perform_shoulder_dance(pkt, port, lock, duration_sec=8.0, frequency_hz=0.5, title="오프닝 어깨 춤")
-        _perform_shoulder_dance(pkt, port, lock, duration_sec=4.5, frequency_hz=1, title="고조되는 어깨 춤")
+        _perform_shoulder_dance(port, pkt, lock, duration_sec=8.0, frequency_hz=0.5, title="오프닝 어깨 춤")
+        _perform_shoulder_dance(port, pkt, lock, duration_sec=4.5, frequency_hz=1, title="고조되는 어깨 춤")
         time.sleep(0.25)
 
         # [1단계] 몸 전체 왼쪽 회전
@@ -445,7 +445,7 @@ def _dance_routine(port: PortHandler, pkt: PacketHandler, lock: threading.Lock, 
 
         print("☕ [숨 고르기] 다음 동작 전 1.5초 휴식...")
         time.sleep(1.5)
-        _perform_shoulder_dance(pkt, port, lock, duration_sec=11.0, frequency_hz=1, title="피날레 어깨 춤")
+        _perform_shoulder_dance(port, pkt, lock, duration_sec=11.0, frequency_hz=1, title="피날레 어깨 춤")
         time.sleep(0.25)
 
         print("🤖 [마무리 준비] 양손 토크 ON 및 자세 복귀")
@@ -457,8 +457,14 @@ def _dance_routine(port: PortHandler, pkt: PacketHandler, lock: threading.Lock, 
         time.sleep(0.5)
 
     finally:
-        import pygame
-        pygame.mixer.music.stop()
+        # 음악 정지 자체가 실패해도(예: 믹서 초기화 전 조기 예외) 아래의 모드 복구/자세
+        # 복귀는 반드시 실행되어야 한다 — 로봇이 'dancing' 모드에 갇히는 걸 막기 위함.
+        try:
+            import pygame
+            pygame.mixer.music.stop()
+        except Exception as e:
+            print(f"⚠️ 음악 정지 중 오류(무시하고 계속 진행): {e}")
+
         with lock:
             io.write4(pkt, port, C.RIGHT_ARM_ID, C.ADDR_PROFILE_ACCELERATION, 0)
             io.write4(pkt, port, C.LEFT_ARM_ID, C.ADDR_PROFILE_ACCELERATION, 0)
@@ -482,11 +488,31 @@ def _dance_routine(port: PortHandler, pkt: PacketHandler, lock: threading.Lock, 
             print(f"⚠️ 춤 종료 후 모터 원위치 복귀 중 오류: {e}")
 
 
+_dance_running = threading.Event()
+
+
+def _dance_routine_guarded(*args, **kwargs):
+    try:
+        _dance_routine(*args, **kwargs)
+    finally:
+        _dance_running.clear()
+
+
+def is_dancing() -> bool:
+    return _dance_running.is_set()
+
+
 def play_dance(port: PortHandler, pkt: PacketHandler, lock: threading.Lock, shared_state: dict,
                 home_pan: int, home_tilt: int, emotion_queue=None) -> int:
-    """춤 시퀀스를 백그라운드 스레드로 시작하고, 예상 소요 시간(초)을 즉시 반환한다."""
+    """춤 시퀀스를 백그라운드 스레드로 시작하고, 예상 소요 시간(초)을 즉시 반환한다.
+    이미 춤을 추는 중이면 무시한다 — 음악 재생과 안무 스레드가 겹치는 걸 막기 위함."""
+    if _dance_running.is_set():
+        print("⚠️ 이미 춤을 추는 중입니다 — 새 요청을 무시합니다.")
+        return 0
+
+    _dance_running.set()
     threading.Thread(
-        target=_dance_routine,
+        target=_dance_routine_guarded,
         args=(port, pkt, lock, shared_state, home_pan, home_tilt, emotion_queue),
         daemon=True,
     ).start()

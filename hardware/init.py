@@ -53,7 +53,7 @@ def stop_all_wheels(pkt: PacketHandler, port: PortHandler, lock):
     wheel.set_wheel_speed(pkt, port, lock, C.RIGHT_ID, 0)
 
 
-def shutdown_all_motors(pkt: PacketHandler, port: PortHandler, lock):
+def shutdown_all_motors(port: PortHandler, pkt: PacketHandler, lock):
     """모든 모터의 토크를 끈다 — 프로세스 종료 시 호출."""
     stop_all_wheels(pkt, port, lock)
     with lock:
