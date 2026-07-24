@@ -2,6 +2,26 @@
 
 `docs/architecture.md`의 로드맵(§10) 대비 실제 구현 상태를 기록한다. 설계 자체가 바뀌면 architecture.md를, 무엇을 언제 어떻게 만들었는지는 이 문서를 갱신한다.
 
+## 2단계 — 메모리 계층 전환 (완료, 커밋 `41a4f6c`)
+
+### 만든 것
+
+| 파일 | 내용 |
+|---|---|
+| `bootstrap.py` | 계층에 속하지 않는 최상위 유틸리티. cp949 콘솔 크래시 방지(`ensure_utf8_console`)를 `hardware/config.py`에서 분리해 여기로 옮김 — hardware를 안 쓰는 스크립트(`test_memory.py`)에서도 같은 문제가 재현돼서 발견함 |
+| `core/profile_manager.py` | `user_profiles.json` 저장소. `{이름: {facts: [{field, value, confidence, updated_at}], created_at, last_seen}}` 스키마. 같은 field로 재호출하면 추가가 아니라 갱신(정정) |
+| `core/memory_tools.py` | `make_remember_fact_tool(name)` — Gemini function calling에 넘길 클로저를 만든다. 세션당 한 번 이름을 바인딩하므로 모델이 매번 "누구 얘기인지" 지정할 필요가 없다 |
+| `scripts/test_memory.py` | 1부: 저장소 단독 검증(정정 동작, 존재 여부 조회) — API 키 불필요, 실행 확인 완료. 2부: `GOOGLE_API_KEY` 있으면 실제 Gemini에 툴을 쥐어주고 스스로 호출하는지 검증(batch function calling, Live API 아님) |
+| `.env.example` | `GOOGLE_API_KEY`, `MODEL_NAME`, `DXL_PORT` 등 지금까지 코드에 등장한 환경변수 정리 |
+
+### 검증 상태
+
+1부(저장소 단독)는 이번 세션에서 실제로 실행해 통과 확인함 — 최초 저장, 정정(덮어쓰기, 중복 아님), 존재 여부 조회, cleanup까지 전부 정상 동작. 2부(실 Gemini 연동)는 이 환경에 `GOOGLE_API_KEY`가 없어 스킵됨 — 사용자가 `.env` 채운 뒤 실행 확인 필요.
+
+### 다음 단계
+
+§10 3단계 — 페르소나 시스템 인스트럭션 재작성(`core/utils.py`, STAGES 기반 프롬프트 제거하고 능동형 호기심 페르소나로). 아직 시작 안 함.
+
 ## 1단계 — Layer 1 매크로 이식 (완료, 커밋 `d0d9bea`, `1e673c6`)
 
 ### 만든 것
