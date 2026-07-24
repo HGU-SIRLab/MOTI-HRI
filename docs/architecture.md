@@ -232,9 +232,11 @@ set_emotion(
 
 ## 10. 마이그레이션 로드맵 (제안)
 
+> 각 단계에서 만든 코드가 이후 단계에 어떻게 연결되어야 하는지는 [`docs/integration-points.md`](integration-points.md)에 별도로 정리한다. 새 단계를 시작하기 전에 먼저 확인할 것 — "이미 만들어둔 걸 어디에 꽂아야 하는지" 다시 찾아 헤매지 않기 위한 문서다.
+
 1. **Layer 1 단독 이식** — v1 `dance.py` 모션 함수를 v2 `hardware/config.py`의 정식 명명(`LEFT_ARM_ID`, `SHOULDER_ID` 등)에 맞춰 `hardware/` 구조로 옮기고, 기존 키보드 트리거 등으로 독립 테스트 (대화 엔진과 무관하게 먼저 검증) — ✅ 코드 완료, 상세 내용과 발견된 버그는 [`docs/progress.md`](progress.md) 참고. 실물 로봇 검증은 아직 미완료.
-2. **메모리 계층 전환** — `user_profiles.json` 스키마를 facts 배열로 바꾸고, 기존 batch Gemini 호출에서도 `remember_fact` function calling으로 먼저 시험 (Live API 없이도 검증 가능)
-3. **페르소나 시스템 인스트럭션 재작성** — STAGES 기반 `build_*_prompt` 제거, 능동형 호기심 페르소나로 `core/utils.py` 재작성
+2. **메모리 계층 전환** — `user_profiles.json` 스키마를 facts 배열로 바꾸고, 기존 batch Gemini 호출에서도 `remember_fact` function calling으로 먼저 시험 (Live API 없이도 검증 가능) — ✅ 완료, `docs/progress.md` 참고.
+3. **페르소나 시스템 인스트럭션 재작성** — STAGES 기반 `build_*_prompt` 제거, 능동형 호기심 페르소나로 `core/utils.py` 재작성 — ✅ 완료, 실제 Gemini 대화로 검증됨. `docs/progress.md` 참고.
 4. **Live API PoC** — 별도 브랜치에서 barge-in·지연시간·function calling 안정성만 집중 검증, 실패 시 batch+Gemini TTS 경로로 확정
 5. **Layer 2 파라미터 제스처** — 안전 범위 실측 후 `express_gesture` 구현, 얼굴추적과의 모드 상호배제 검증
 6. **통합 및 시나리오 리허설** — §08 시나리오 A/B를 실제 로봇으로 반복 실행, 예외 상황(사람이 여러 명, 인식 실패 등) 보강
