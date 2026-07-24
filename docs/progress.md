@@ -26,9 +26,21 @@
 
 **검증**: `buffalo_l` 모델이 v2 사용 이력 덕분에 `~/.insightface/models/`에 이미 캐시되어 있어 재다운로드 없이 바로 로딩됨. `RobotBrain()` 실제 초기화 + 빈 프레임에 `recognize_face()` 호출까지 실행해 `(None, None)`이 정상 반환되는 것 확인. `art_brain.pkl`이 v3 루트에 아직 없어 "기억된 얼굴 수: 0"으로 시작 — v2의 학습된 얼굴 데이터와 분리된 깨끗한 상태(의도된 동작, v2 파일을 갖고 오지 않음).
 
+### report_manager.py 포팅 (완료, 커밋 `ddeef9e`)
+
+v2는 학년/전공/RC/MBTI 고정 슬롯(`user_info` dict)을 받았는데, v3는 슬롯이 없으므로(§04) `profile_manager.load_profile_for_chat(name)`이 만드는 자유형 facts_summary 문자열을 그대로 프롬프트에 넣는 것으로 교체. 그 외(마크다운 양식, batch Gemini 호출, `vitals_data`는 여전히 수동 입력값이라 launcher.py가 콘솔로 물어봐야 함) 변경 없음. `scripts/test_report.py`로 실제 Gemini 호출까지 실행해 대화록·결과지 파일 둘 다 정상 생성 확인함(내용 품질도 육안 확인 — 팀플 예시로 자연스러운 위로 편지 생성됨).
+
+### core/motion_tools.py 추가 (완료, 커밋 `05bf957`)
+
+`memory_tools.py`/`emotion_tools.py`와 같은 클로저 패턴으로 `make_play_motion_tool(...)` → `play_gesture(name)` 툴 작성. `play_manual_motion`이 dance 제외 나머지 매크로를 블로킹으로 실행하는데, Live 세션의 tool_call 처리가 동기적이라 그대로 두면 그동안 오디오가 멎는다 — 그래서 항상 백그라운드 스레드로 실행을 넘기고 툴 자체는 즉시 "시작했다"고만 응답하도록 설계. 로봇 없이 검증 가능한 부분(잘못된 제스처 이름이 하드웨어 접근 전에 걸러지는지, `port=None`으로도 안 죽는지)만 확인함 — 실제 모터 동작은 로봇 연결 후 검증 필요.
+
+### extract_exit_tag() 추가 (완료, 커밋 `941704f`)
+
+`core/utils.py`에 `EXIT_TAG = "[대화종료]"`와 `extract_exit_tag(text) -> (cleaned_text, should_end)` 추가. 페르소나 시스템 인스트럭션은 처음부터 이 태그를 내보내라고 지시해왔지만 소비하는 코드가 없었음(integration-points.md). 스트리밍 청크가 아니라 한 턴이 끝난 뒤 누적 텍스트에 대해 호출하는 계약 — 청크 경계에서 태그가 잘리는 문제는 launcher.py(Cognition 루프)가 다룰 몫으로 남겨둠. 태그 있음/없음/trailing whitespace 3가지 케이스 inline assertion으로 검증.
+
 ### 다음 단계
 
-`core/profile_manager.py`와 연결 — art_brain이 이름을 확정하는 지점에서 `profiles.load_profile_for_chat(name)`을 호출해 `build_persona_system_instruction`에 넘기는 코드 작성.
+launcher.py 뼈대 — 로봇 없이도 되는 부분(웹캠 얼굴인식→profile_manager 연결 포함해서) 전부 실제로 이어붙여서 오늘 대화까지 되는 상태로 만들기. 모터 관련(motion_tools 툴 등록)은 로봇 연결 후로 미룸.
 
 ## 5단계 — vision/face.py 포팅 (완료, 커밋 `4bf8e46`)
 
