@@ -2,6 +2,33 @@
 
 `docs/architecture.md`의 로드맵(§10) 대비 실제 구현 상태를 기록한다. 설계 자체가 바뀌면 architecture.md를, 무엇을 언제 어떻게 만들었는지는 이 문서를 갱신한다.
 
+## 3단계 — 페르소나 시스템 인스트럭션 재작성 (완료, 커밋 `cfc05b3`)
+
+### 만든 것
+
+| 파일 | 내용 |
+|---|---|
+| `core/utils.py` | v2의 STAGES/`build_opening_prompt`/`build_extract_prompt`/`build_retry_prompt`/`build_next_prompt`/`build_hidden_first_prompt`를 전부 제거. `build_persona_system_instruction(name, facts_summary)` 하나로 첫 만남과 재회를 동일하게 처리 — 차이는 facts_summary에 뭐가 들어있는지뿐. 한동대 용어사전·학사 캘린더 인지·MBTI 톤 분기·상담 툴킷·동아리 리스트 등 도메인 지식은 v2에서 거의 그대로 이식(이건 인터뷰 구조와 무관한 내용이었음). §9 정체성 고정 규칙은 "학년을 안다면"처럼 조건부로 수정 |
+| `core/emotion_tools.py` | `make_set_emotion_tool(emotion_queue=None)` — v1/v2의 `[EMOTION]태그[/EMOTION]` 정규식 파싱을 없애고 function calling으로 대체(architecture.md §06). display/가 없어서 지금은 콘솔 로그만 남김 |
+| `scripts/test_persona.py` | 1부: 프롬프트 조립(이름 있음/없음) 검증, API 키 불필요 — 실행 확인 완료. 2부: 실제 Gemini에 remember_fact+set_emotion을 함께 쥐어주고 2턴 대화 — **실제로 GOOGLE_API_KEY가 설정되어 있어 실행됨** |
+
+### 검증 상태 (실제 실행 결과)
+
+1부, 2부 모두 이번 세션에서 실행되어 통과함. 2부 실제 대화 로그가 설계 의도를 그대로 보여줌:
+- 1턴: "혹시 어떻게 불러드리면 좋을까요? 대화하면서 사용자님에 대해 조금씩 더 알아가고 싶어요!" — 강요 없이 자연스럽게 이름을 물어봄 (인터뷰 질문지 아님), `set_emotion("happy")` 호출
+- 2턴: 사용자가 이름과 함께 "힘든 일이 있었다"고 하자, 남은 슬롯(학년/전공/MBTI)을 캐묻지 않고 감정에 먼저 반응, `remember_fact(field="name", value="김한동")`를 스스로 호출해 저장, `set_emotion("sad")`로 전환
+
+즉 "능동형 호기심, 슬롯 강제 없음" 설계가 실제 모델 행동으로 확인됨.
+
+### 의도적으로 범위 밖에 둔 것
+
+- `play_manual_motion`(Layer 1, 이미 구현됨)을 시스템 인스트럭션/툴 목록에 아직 연결하지 않음 — 제스처 트리거링은 Live API의 인터럽션 동작 검증(§10 4단계)과 함께 다루는 게 안전하다고 판단
+- display/가 없어 `set_emotion`은 로그만 남기고 실제 표정 반영은 안 됨 — display 포팅 시 emotion_queue만 연결하면 됨
+
+### 다음 단계
+
+§10 4단계 — Live API PoC (barge-in·지연시간·function calling 안정성 검증). 로봇 없이도 가능한 부분(연결, 툴 호출 안정성)과 실물이 필요한 부분(끼어들기 체감)을 나눠서 진행 필요.
+
 ## 2단계 — 메모리 계층 전환 (완료, 커밋 `41a4f6c`)
 
 ### 만든 것
