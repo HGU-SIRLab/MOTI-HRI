@@ -1,4 +1,7 @@
 # LLM / 대화 (Gemini Live API 주 경로, batch+TTS 폴백 — docs/architecture.md §03)
+# google-genai = Live API(client.aio.live.connect)에 필요한 신규 통합 SDK.
+# google-generativeai = batch 폴백 경로(genai.GenerativeModel)용 구 SDK. 둘 다 필요.
+google-genai
 google-generativeai
 
 # 얼굴 추적 / 인식

@@ -96,7 +96,7 @@ WebSocket 세션 하나를 열어 오디오 입력/출력을 양방향 스트리
 
 Live API의 인터럽션 처리가 검증에서 미흡하다고 판단되면, v2의 기존 패턴(마이크 녹음 → Gemini에 audio inline_data로 STT+대화 동시 처리 → 문장 단위 스트리밍 → TTS)을 유지하되 **Typecast를 Gemini 3.1 Flash TTS로 교체**한다. function calling 계약이 동일하므로 메모리/모션 로직은 손대지 않는다.
 
-> **검증 필요**: Live API의 barge-in(사용자가 응답 도중 끼어들기) 동작, TTS 모델의 스트리밍 지원 여부와 음성 커스터마이징 옵션, 두 모델 모두 preview 상태이므로 가격·안정성. §09에서 체크리스트로 정리.
+> **검증 상태**: barge-in 메커니즘(`interrupted` 필드, 서버 측 자동 VAD)과 function calling 배선은 `scripts/test_live_poc.py`·`test_live_audio.py`로 확인됨 — 상세는 §09, `docs/progress.md` 참고. 남은 건 사람이 직접 끼어들었을 때의 체감 자연스러움과 preview 상태의 가격·안정성.
 
 ---
 
@@ -221,9 +221,9 @@ set_emotion(
 
 ## 09. 검증 필요 / 오픈 이슈
 
-- [ ] Gemini Live API의 barge-in(끼어들기) 실제 동작 — 문서에 명시 안 됨, PoC로 직접 확인 필요
-- [ ] Gemini 3.1 Flash TTS의 스트리밍 지원 여부, 음성 목록/커스터마이징 옵션, 가격
-- [ ] Live API function calling이 동기 방식뿐이라 툴 응답 지연이 대화 흐름을 끊지 않을지 (모터 이동처럼 수 초 걸리는 동작은 "시작만 확인, 완료는 비동기 신호"로 설계 필요)
+- [x] Gemini Live API의 barge-in 메커니즘 자체는 SDK에 존재함이 확인됨(`google-genai` 1.61.0) — `LiveServerContent.interrupted: bool` 필드로 서버가 끼어들기를 알려주고, `RealtimeInputConfig.automatic_activity_detection`이 서버 측 VAD를 자동 처리해 v1/v2가 쓰던 커스텀 입모양 VAD가 필요 없어짐. `scripts/test_live_audio.py`로 배선까지는 확인(연결·마이크·스피커 스트림 12초 무오류 동작), 단 **사람이 실제로 끼어들었을 때 체감이 자연스러운지는 아직 미확인** — 사용자가 직접 실행해서 확인 필요.
+- [ ] Gemini 3.1 Flash TTS의 스트리밍 지원 여부, 음성 목록/커스터마이징 옵션, 가격 — Live API가 barge-in까지 자체 해결하므로 우선순위 낮아짐(배터리 폴백 경로에서만 필요)
+- [x] Live API function calling은 예상대로 수동 처리(`tool_call` 이벤트 수신 → 직접 실행 → `send_tool_response`)가 필요했음 — `scripts/test_live_poc.py`에서 `remember_fact`/`set_emotion` 둘 다 정상 동작 확인, 첫 응답까지 지연시간 0.49~0.66초(텍스트 턴 기준). 모터처럼 수 초 걸리는 동작을 위한 "시작만 확인, 완료는 비동기 신호" 설계는 아직 미구현(§10 이후 단계).
 - [ ] 가위바위보·OX퀴즈 미니게임을 v3 범위에 포함할지 결정 (포함 시 v1의 `RPS_ARM_UP/DOWN_POS` 서브레인지를 `LEFT_ARM_ID` 이름으로 재사용)
 - [ ] Layer 2 안전 범위 표(§05)는 v1/v2 config.py 기록값 기준 — 실물 로봇 재캘리브레이션 여부를 `debug_motor_positions.py`로 재확인
 - [ ] 두 모델 모두 preview 상태 — 캡스톤 발표 일정 내 안정성 리스크 점검
@@ -237,7 +237,7 @@ set_emotion(
 1. **Layer 1 단독 이식** — v1 `dance.py` 모션 함수를 v2 `hardware/config.py`의 정식 명명(`LEFT_ARM_ID`, `SHOULDER_ID` 등)에 맞춰 `hardware/` 구조로 옮기고, 기존 키보드 트리거 등으로 독립 테스트 (대화 엔진과 무관하게 먼저 검증) — ✅ 코드 완료, 상세 내용과 발견된 버그는 [`docs/progress.md`](progress.md) 참고. 실물 로봇 검증은 아직 미완료.
 2. **메모리 계층 전환** — `user_profiles.json` 스키마를 facts 배열로 바꾸고, 기존 batch Gemini 호출에서도 `remember_fact` function calling으로 먼저 시험 (Live API 없이도 검증 가능) — ✅ 완료, `docs/progress.md` 참고.
 3. **페르소나 시스템 인스트럭션 재작성** — STAGES 기반 `build_*_prompt` 제거, 능동형 호기심 페르소나로 `core/utils.py` 재작성 — ✅ 완료, 실제 Gemini 대화로 검증됨. `docs/progress.md` 참고.
-4. **Live API PoC** — 별도 브랜치에서 barge-in·지연시간·function calling 안정성만 집중 검증, 실패 시 batch+Gemini TTS 경로로 확정
+4. **Live API PoC** — 별도 브랜치에서 barge-in·지연시간·function calling 안정성만 집중 검증, 실패 시 batch+Gemini TTS 경로로 확정 — 🟡 코드/자동 검증 완료(연결·지연시간·function calling), **사람이 직접 끼어드는 barge-in 체감 테스트만 남음**. `docs/progress.md` 참고.
 5. **Layer 2 파라미터 제스처** — 안전 범위 실측 후 `express_gesture` 구현, 얼굴추적과의 모드 상호배제 검증
 6. **통합 및 시나리오 리허설** — §08 시나리오 A/B를 실제 로봇으로 반복 실행, 예외 상황(사람이 여러 명, 인식 실패 등) 보강
 
