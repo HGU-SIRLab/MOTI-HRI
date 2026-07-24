@@ -1,14 +1,8 @@
 import os
-import sys
 
-# Windows 콘솔 기본 코드페이지(cp949)는 이모지(⚠️ 등)를 인코딩하지 못해
-# print()에서 그대로 크래시한다. 이 모듈이 가장 먼저 로드되므로 여기서 한 번 고쳐둔다.
-for _stream in (sys.stdout, sys.stderr):
-    if getattr(_stream, "encoding", "").lower() != "utf-8":
-        try:
-            _stream.reconfigure(encoding="utf-8")
-        except Exception:
-            pass
+from bootstrap import ensure_utf8_console
+
+ensure_utf8_console()
 
 try:
     import serial.tools.list_ports

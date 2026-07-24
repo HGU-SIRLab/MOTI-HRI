@@ -17,6 +17,10 @@ from dynamixel_sdk import PortHandler, PacketHandler
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, _REPO_ROOT)
 
+from bootstrap import ensure_utf8_console
+
+ensure_utf8_console()
+
 from hardware import config as C
 from hardware import init as I
 from hardware import motion as M
