@@ -232,7 +232,7 @@ set_emotion(
 
 ## 10. 마이그레이션 로드맵 (제안)
 
-1. **Layer 1 단독 이식** — v1 `dance.py` 모션 함수를 v2 `hardware/config.py`의 정식 명명(`LEFT_ARM_ID`, `SHOULDER_ID` 등)에 맞춰 `hardware/` 구조로 옮기고, 기존 키보드 트리거 등으로 독립 테스트 (대화 엔진과 무관하게 먼저 검증)
+1. **Layer 1 단독 이식** — v1 `dance.py` 모션 함수를 v2 `hardware/config.py`의 정식 명명(`LEFT_ARM_ID`, `SHOULDER_ID` 등)에 맞춰 `hardware/` 구조로 옮기고, 기존 키보드 트리거 등으로 독립 테스트 (대화 엔진과 무관하게 먼저 검증) — ✅ 코드 완료, 상세 내용과 발견된 버그는 [`docs/progress.md`](progress.md) 참고. 실물 로봇 검증은 아직 미완료.
 2. **메모리 계층 전환** — `user_profiles.json` 스키마를 facts 배열로 바꾸고, 기존 batch Gemini 호출에서도 `remember_fact` function calling으로 먼저 시험 (Live API 없이도 검증 가능)
 3. **페르소나 시스템 인스트럭션 재작성** — STAGES 기반 `build_*_prompt` 제거, 능동형 호기심 페르소나로 `core/utils.py` 재작성
 4. **Live API PoC** — 별도 브랜치에서 barge-in·지연시간·function calling 안정성만 집중 검증, 실패 시 batch+Gemini TTS 경로로 확정
