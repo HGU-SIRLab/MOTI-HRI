@@ -446,3 +446,24 @@ def _extract_text(resp) -> str:
             return fallback_text
         except Exception:
             return ""
+
+
+# =========================================================================
+# 7. [대화종료] 태그 처리 — Cognition 루프(launcher.py)가 세션 종료를 감지할 때 사용.
+# build_persona_system_instruction의 "5번 룰"이 모델에게 이 태그를 마지막에
+# 출력하라고 지시하지만, 지금까지는 이걸 소비하는 코드가 없었다(docs/integration-points.md).
+# =========================================================================
+
+EXIT_TAG = "[대화종료]"
+
+
+def extract_exit_tag(text: str) -> tuple[str, bool]:
+    """모델 응답에서 세션 종료 신호를 감지하고 태그를 제거한다.
+
+    Returns: (사용자에게 보여줄/재생할 텍스트, 세션을 종료해야 하면 True).
+    스트리밍 중간 청크가 아니라, 한 턴이 끝난 뒤 누적된 전체 텍스트에 대해 호출할 것 —
+    태그가 청크 경계에서 잘리면 여기서는 감지되지 않는다.
+    """
+    if EXIT_TAG in text:
+        return text.replace(EXIT_TAG, "").rstrip(), True
+    return text, False
