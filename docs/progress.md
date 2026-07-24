@@ -2,6 +2,35 @@
 
 `docs/architecture.md`의 로드맵(§10) 대비 실제 구현 상태를 기록한다. 설계 자체가 바뀌면 architecture.md를, 무엇을 언제 어떻게 만들었는지는 이 문서를 갱신한다.
 
+## 4단계 — Live API PoC (코드/자동 검증 완료, 사람 테스트 대기 — 커밋 `9561e21`)
+
+### 사용한 SDK
+
+`google-generativeai`(구, batch 전용)가 아니라 **`google-genai`(신규 통합 SDK, 1.61.0)**를 써야 Live API(`client.aio.live.connect`)에 접근할 수 있다. `client.models.list()`로 실제 `bidiGenerateContent`를 지원하는 모델을 확인: `models/gemini-3.1-flash-live-preview`, `models/gemini-3.5-live-translate-preview`.
+
+### 만든 것과 실행 결과
+
+| 파일 | 내용 | 검증 상태 |
+|---|---|---|
+| `scripts/test_live_poc.py` | 텍스트 2턴 대화를 Live 세션으로 실행, `remember_fact`+`set_emotion` 함께 부착 | **실행해서 통과함**: 연결 0.66초, 첫 응답 지연 0.49초/0.64초, 두 툴 모두 정상 호출 |
+| `scripts/test_live_audio.py` | 실제 마이크 입력(sounddevice) → Live 세션 → 스피커 출력, `interrupted` 감지 시 재생 큐 비우기 | **배선만 검증(12초 무오류 스모크 테스트)** — 실제 끼어들기 체감은 사람이 직접 실행해야 함 |
+
+### 핵심 발견
+
+1. **모델이 TEXT 단독 출력을 거부함**: `response_modalities=[TEXT]`로 연결 시도하면 서버가 "지원하지 않는 조합"이라며 연결을 끊는다. 이 모델은 오디오 출력이 기본이라, 텍스트 확인용으로는 `output_audio_transcription=AudioTranscriptionConfig()`를 켜고 `server_content.output_transcription.text`를 읽어야 한다.
+2. **function calling은 수동 처리**: batch 챗의 `enable_automatic_function_calling=True` 같은 자동 실행 기능이 Live 세션에는 없다. `message.tool_call.function_calls`를 직접 순회해 함수를 실행하고, `session.send_tool_response(function_responses=[...])`로 결과를 보내야 한다. (§09에서 "동기 방식뿐"이라 예상했던 것과 일치)
+3. **barge-in은 서버가 알아서 처리**: `LiveServerContent.interrupted: bool` 필드가 존재하고, `RealtimeInputConfig.automatic_activity_detection`이 서버 측 VAD를 자동 수행한다. 즉 **v1/v2가 썼던 입모양(jawOpen blendshape) 기반 커스텀 VAD가 v3에서는 필요 없어질 가능성이 높다** — 이건 아키텍처 문서에 없던 추가 단순화 기회다.
+4. `message.data`라는 편의 프로퍼티가 응답의 오디오 파트를 통째로 이어붙여 반환해줘서, 재생 코드가 파트를 직접 순회할 필요가 없었다.
+
+### 검증 안 된 것 (사람이 직접 해야 함)
+
+- `python scripts/test_live_audio.py` 실행 후 모티가 말하는 도중에 실제로 말을 걸어서 끼어들기가 자연스럽게 느껴지는지 (콘솔에 "🚨 interrupted=True — 재생 중단"이 뜨고 스피커가 바로 멈추면 배선은 정상, 그 다음은 체감 품질의 문제)
+- Live API/TTS 둘 다 preview 상태라 가격·요청 한도는 여전히 미확인
+
+### 다음 단계
+
+사용자가 `scripts/test_live_audio.py`로 barge-in을 직접 확인한 뒤, 결과에 따라 §10 5단계(Layer 2 파라미터 제스처)로 가거나, Live API가 기대에 못 미치면 아키텍처 문서의 폴백 경로(batch + Gemini TTS)로 전환.
+
 ## 3단계 — 페르소나 시스템 인스트럭션 재작성 (완료, 커밋 `cfc05b3`)
 
 ### 만든 것

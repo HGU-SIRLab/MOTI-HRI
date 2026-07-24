@@ -1,6 +1,10 @@
 # 통합 시 연결해야 할 지점 (Integration TODOs)
 
-지금까지(로드맵 §10 1~3단계) 만든 코드는 전부 **독립적으로 검증 가능하게** 일부러 서로 느슨하게 떨어뜨려 놓았다. 나중에 다음 단계(Live API, vision/, display/, launcher.py)를 만들 때 "이미 있는 것을 어디에 꽂아야 하는지" 매번 코드를 다시 뒤지지 않도록 여기 모아둔다. 무언가를 새로 만들 때 이 문서의 해당 항목도 같이 지워나가면 된다.
+지금까지(로드맵 §10 1~4단계) 만든 코드는 전부 **독립적으로 검증 가능하게** 일부러 서로 느슨하게 떨어뜨려 놓았다. 나중에 다음 단계(vision/, display/, launcher.py)를 만들 때 "이미 있는 것을 어디에 꽂아야 하는지" 매번 코드를 다시 뒤지지 않도록 여기 모아둔다. 무언가를 새로 만들 때 이 문서의 해당 항목도 같이 지워나가면 된다.
+
+## vision/face.py를 만들 때 — 커스텀 VAD가 필요 없어졌을 수 있음
+
+4단계(Live API PoC)에서 확인된 것: `RealtimeInputConfig.automatic_activity_detection`이 서버 측에서 음성 활동 감지(말 시작/끝, 끼어들기)를 자동으로 처리한다. v1/v2는 이걸 위해 mediapipe blendshape의 `jawOpen` 값으로 입모양 기반 VAD를 직접 구현했었다(§03 관련). **vision/face.py를 포팅할 때, 이 커스텀 VAD 로직을 그대로 가져올지 아니면 Live API의 서버 측 VAD로 대체하고 얼굴추적은 순수하게 팬/틸트 제어에만 쓸지 결정할 것** — 후자가 코드도 줄고 v1/v2보다 더 정확할 가능성이 높다.
 
 ## hardware/motion.py — `play_manual_motion`이 아직 아무 데도 안 붙어 있음
 
@@ -45,14 +49,15 @@
 
 ## Cognition 오케스트레이션 — 아직 launcher.py도, 세션 매니저도 없음
 
-가장 큰 공백. 지금까지 만든 `remember_fact`/`set_emotion`/`build_persona_system_instruction`은 전부 테스트 스크립트가 손으로 조립해서 쓰고 있다. 실제로는:
+가장 큰 공백. 지금까지 만든 `remember_fact`/`set_emotion`/`build_persona_system_instruction`은 전부 테스트 스크립트(`scripts/test_live_poc.py`, `test_live_audio.py`)가 손으로 조립해서 쓰고 있다. 실제로는:
 1. art_brain이 이름을 확정(또는 미확정)
 2. `profiles.load_profile_for_chat(name)` 호출
 3. `build_persona_system_instruction(name, facts_summary)`로 시스템 인스트럭션 생성
 4. `tools=[remember_fact, set_emotion, (미래의)play_gesture]`로 모델/세션 생성
-5. 오디오 in/out 연결
-6. `[대화종료]` 감지 시 세션 종료·리포트 생성
+5. 오디오 in/out 연결 (마이크→`send_realtime_input(audio=...)`, 스피커←`message.data`)
+6. `message.tool_call` 수신 시 직접 함수 실행 후 `send_tool_response` — **Live 세션은 batch의 `enable_automatic_function_calling`처럼 자동 실행을 해주지 않는다.** `scripts/test_live_poc.py`의 루프를 그대로 launcher 코드로 옮기면 됨.
+7. `[대화종료]` 감지 시 세션 종료·리포트 생성
 
-이 전체를 묶는 코드가 필요하다 — 이게 사실상 로드맵 4단계(Live API PoC)와 그 이후 launcher.py 작업의 본체다.
+이 전체를 묶는 코드가 필요하다 — 이게 사실상 launcher.py 작업의 본체다. 툴 실행 루프 자체는 4단계에서 이미 검증됐으니 그대로 재사용하면 된다.
 
-또한 `MODEL_NAME`(현재 batch 모델용, 기본값 `gemini-3.1-flash-lite`)과 Live API용 모델명(`gemini-3.1-flash-live-preview` 계열)은 서로 다른 모델이므로, Live API 작업 시작 시 별도 env var(예: `LIVE_MODEL_NAME`)로 분리할 것.
+모델명은 이미 분리해뒀다: batch 폴백용 `MODEL_NAME`(기본값 `gemini-3.1-flash-lite`), Live API용 `LIVE_MODEL_NAME`(기본값 `models/gemini-3.1-flash-live-preview`, `.env.example`에 기록됨). `client.models.list()`로 실제 `bidiGenerateContent` 지원 여부를 확인했음 — 모델명이 바뀌면 이 방법으로 재확인.
