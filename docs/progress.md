@@ -2,9 +2,22 @@
 
 `docs/architecture.md`의 로드맵(§10) 대비 실제 구현 상태를 기록한다. 설계 자체가 바뀌면 architecture.md를, 무엇을 언제 어떻게 만들었는지는 이 문서를 갱신한다.
 
-## 로봇 없이 할 수 있는 작업들 (진행 중)
+## 전체 코드베이스 리뷰 (완료, 커밋 `f4c4545`, `13257e1`)
 
-로봇이 당장 연결 안 된 상태라, 로봇/모터가 필요 없는 작업부터 먼저 진행하기로 함. 순서: display/ → vision_brain.py → profile_manager 연결 → report_manager.py → `[대화종료]` 처리 → launcher.py 뼈대. 모터가 필요한 나머지(Layer 2 제스처, launcher.py의 모션 연결)는 로봇 연결 후로 미룸.
+"로봇 없이 할 수 있는 작업들"을 다 끝낸 시점에 전체를 한 번 훑어서 버그 4건을 찾아 고쳤다.
+
+1. **`.env` 오버라이드가 프로젝트 전역에서 조용히 무시되고 있었음** — `hardware/config.py`(`DXL_PORT`/`DXL_BAUD`/`DXL_PROTO`/`BASE_RPM`/`TURN_RPM`)와 `core/report_manager.py`(`MODEL_NAME`)는 모듈이 import되는 시점에 `os.getenv(...)`를 읽는데, 모든 스크립트의 `load_dotenv()` 호출은 그 import보다 뒤(`main()`/개별 함수 안)에 있었다. 즉 `.env`를 아무리 고쳐도 하드코딩된 기본값만 항상 읽혔다. `.env`에 `BASE_RPM=99`를 넣고 실측해서 실제로 25.0(기본값)이 읽히는 걸 확인 → `bootstrap.py`(모든 진입 스크립트가 제일 먼저 import하는 파일)에서 import 시점에 `.env`를 로드하도록 옮겨서 해결, 다시 실측해서 99.0이 읽히는 것까지 확인함. **로봇을 연결해서 `DXL_PORT`를 강제 지정하려던 순간 조용히 안 먹혀서 헤맸을 버그** — 로봇 연결 전에 미리 잡힌 게 다행.
+2. **`vision/vision_brain.py`의 `art_brain.pkl` 경로가 cwd 상대경로였음** — v3의 다른 모든 파일(`profile_manager.py`, `report_manager.py`, `face.py`의 모델 경로 등)은 전부 `__file__` 기준 절대경로로 고쳐뒀는데 이것만 v2 그대로 남아있었다. 실행 위치가 바뀌면 엉뚱한 곳에 얼굴 데이터를 읽고 쓸 뻔함 — 절대경로로 통일.
+3. **`scripts/run_no_robot.py`의 세션종료 리포트가 대화 시작 전 facts 스냅샷을 재사용**하고 있었음 — 대화 중 `remember_fact`로 새로 알게 된 사실이 결과지에 반영이 안 되는 상태였다. 리포트 생성 직전에 `profiles.load_profile_for_chat(name)`을 다시 호출하도록 수정.
+4. `core/motion_tools.py` 독스트링이 존재하지 않는 `docs/progress.md §09`를 인용하고 있었음(실제로는 `docs/architecture.md §09`) — 인용 수정.
+
+**의도적으로 안 고친 것**: `core/utils.py`의 `_get_env` 헬퍼가 정의만 되고 어디서도 안 쓰인다 — v2 원본에도 이미 있던 죽은 코드라 v3에서 새로 생긴 문제가 아니고, 무해해서 그대로 둠.
+
+`docs/architecture.md` §09/§10도 이 시점에 최신 상태로 갱신함(barge-in 사람 테스트 완료 반영, 스피커→마이크 에코 오탐을 신규 오픈 이슈로 추가, §10에 "로봇 없이 가능한 나머지 조각" 5단계 추가).
+
+## 로봇 없이 할 수 있는 작업들 (완료)
+
+로봇이 당장 연결 안 된 상태라, 로봇/모터가 필요 없는 작업부터 먼저 진행하기로 함. 순서: display/ → vision_brain.py → report_manager.py → motion_tools.py → `[대화종료]` 처리 → 통합 데모(run_no_robot.py). §10 로드맵상 모터 불필요 작업은 이걸로 전부 소진됨 — 남은 건 전부 로봇 연결이 전제.
 
 ### display/ 포팅 (완료, 커밋 `5c17dd7`)
 
