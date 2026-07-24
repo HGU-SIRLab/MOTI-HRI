@@ -221,9 +221,10 @@ set_emotion(
 
 ## 09. 검증 필요 / 오픈 이슈
 
-- [x] Gemini Live API의 barge-in 메커니즘 자체는 SDK에 존재함이 확인됨(`google-genai` 1.61.0) — `LiveServerContent.interrupted: bool` 필드로 서버가 끼어들기를 알려주고, `RealtimeInputConfig.automatic_activity_detection`이 서버 측 VAD를 자동 처리해 v1/v2가 쓰던 커스텀 입모양 VAD가 필요 없어짐. `scripts/test_live_audio.py`로 배선까지는 확인(연결·마이크·스피커 스트림 12초 무오류 동작), 단 **사람이 실제로 끼어들었을 때 체감이 자연스러운지는 아직 미확인** — 사용자가 직접 실행해서 확인 필요.
+- [x] Gemini Live API의 barge-in 메커니즘 자체는 SDK에 존재함이 확인됨(`google-genai` 1.61.0) — `LiveServerContent.interrupted: bool` 필드로 서버가 끼어들기를 알려주고, `RealtimeInputConfig.automatic_activity_detection`이 서버 측 VAD를 자동 처리해 v1/v2가 쓰던 커스텀 입모양 VAD가 필요 없어짐. **사람이 직접 이어폰을 끼고 `scripts/test_live_audio.py`로 끼어들기 체감까지 확인 완료** — 정상 동작함. (이어폰 없이 스피커+마이크를 같이 쓰면 스피커 소리를 마이크가 되먹여 `interrupted=True`가 저절로 뜨는 음향 에코 오탐이 있었는데, 이어폰 착용 시 재현이 안 돼서 원인이 에코였음이 확정됨 — barge-in 로직 자체의 결함은 아님. 아래 신규 이슈로 분리.)
+- [ ] **(신규)** 스피커→마이크 음향 에코로 인한 barge-in 오탐 — 실제 로봇도 마이크/스피커가 물리적으로 붙어있어 같은 문제가 날 수 있음. `launcher.py`(현재는 `scripts/run_no_robot.py`) 오디오 루프에 AEC(에코 캔슬레이션) 또는 "TTS 재생 중 마이크 입력 무시" 중 하나를 넣어야 함 — 아직 미해결. (`docs/progress.md` 4단계 참고)
 - [ ] Gemini 3.1 Flash TTS의 스트리밍 지원 여부, 음성 목록/커스터마이징 옵션, 가격 — Live API가 barge-in까지 자체 해결하므로 우선순위 낮아짐(배터리 폴백 경로에서만 필요)
-- [x] Live API function calling은 예상대로 수동 처리(`tool_call` 이벤트 수신 → 직접 실행 → `send_tool_response`)가 필요했음 — `scripts/test_live_poc.py`에서 `remember_fact`/`set_emotion` 둘 다 정상 동작 확인, 첫 응답까지 지연시간 0.49~0.66초(텍스트 턴 기준). 모터처럼 수 초 걸리는 동작을 위한 "시작만 확인, 완료는 비동기 신호" 설계는 아직 미구현(§10 이후 단계).
+- [x] Live API function calling은 예상대로 수동 처리(`tool_call` 이벤트 수신 → 직접 실행 → `send_tool_response`)가 필요했음 — `scripts/test_live_poc.py`에서 `remember_fact`/`set_emotion` 둘 다 정상 동작 확인, 첫 응답까지 지연시간 0.49~0.66초(텍스트 턴 기준). 모터처럼 수 초 걸리는 동작을 위한 "시작만 확인, 완료는 비동기 신호" 설계는 `core/motion_tools.py`로 구현됨(백그라운드 스레드 실행) — 실제 모터로는 아직 미검증.
 - [ ] 가위바위보·OX퀴즈 미니게임을 v3 범위에 포함할지 결정 (포함 시 v1의 `RPS_ARM_UP/DOWN_POS` 서브레인지를 `LEFT_ARM_ID` 이름으로 재사용)
 - [ ] Layer 2 안전 범위 표(§05)는 v1/v2 config.py 기록값 기준 — 실물 로봇 재캘리브레이션 여부를 `debug_motor_positions.py`로 재확인
 - [ ] 두 모델 모두 preview 상태 — 캡스톤 발표 일정 내 안정성 리스크 점검
@@ -237,9 +238,10 @@ set_emotion(
 1. **Layer 1 단독 이식** — v1 `dance.py` 모션 함수를 v2 `hardware/config.py`의 정식 명명(`LEFT_ARM_ID`, `SHOULDER_ID` 등)에 맞춰 `hardware/` 구조로 옮기고, 기존 키보드 트리거 등으로 독립 테스트 (대화 엔진과 무관하게 먼저 검증) — ✅ 코드 완료, 상세 내용과 발견된 버그는 [`docs/progress.md`](progress.md) 참고. 실물 로봇 검증은 아직 미완료.
 2. **메모리 계층 전환** — `user_profiles.json` 스키마를 facts 배열로 바꾸고, 기존 batch Gemini 호출에서도 `remember_fact` function calling으로 먼저 시험 (Live API 없이도 검증 가능) — ✅ 완료, `docs/progress.md` 참고.
 3. **페르소나 시스템 인스트럭션 재작성** — STAGES 기반 `build_*_prompt` 제거, 능동형 호기심 페르소나로 `core/utils.py` 재작성 — ✅ 완료, 실제 Gemini 대화로 검증됨. `docs/progress.md` 참고.
-4. **Live API PoC** — 별도 브랜치에서 barge-in·지연시간·function calling 안정성만 집중 검증, 실패 시 batch+Gemini TTS 경로로 확정 — 🟡 코드/자동 검증 완료(연결·지연시간·function calling), **사람이 직접 끼어드는 barge-in 체감 테스트만 남음**. `docs/progress.md` 참고.
-5. **Layer 2 파라미터 제스처** — 안전 범위 실측 후 `express_gesture` 구현, 얼굴추적과의 모드 상호배제 검증
-6. **통합 및 시나리오 리허설** — §08 시나리오 A/B를 실제 로봇으로 반복 실행, 예외 상황(사람이 여러 명, 인식 실패 등) 보강
+4. **Live API PoC** — 별도 브랜치에서 barge-in·지연시간·function calling 안정성만 집중 검증, 실패 시 batch+Gemini TTS 경로로 확정 — ✅ 완료(연결·지연시간·function calling·사람이 직접 끼어드는 barge-in 체감까지 전부 검증됨). `docs/progress.md` 참고.
+5. **로봇 없이 가능한 나머지 조각 전부** — 로봇 연결이 계속 지연되어, §10에 원래 없던 단계지만 모터가 필요 없는 작업을 이 시점에 몰아서 진행함: `vision/face.py`(팬/틸트 추적, 커스텀 VAD 제거), `vision/vision_brain.py`(얼굴인식), `display/`(표정 UI), `core/report_manager.py`(세션종료 결과지), `core/motion_tools.py`(제스처 툴, 아직 로봇 미검증), `[대화종료]` 태그 처리, 그리고 이 전부를 실제로 이어붙인 `scripts/run_no_robot.py`(로봇 없는 launcher.py 격) — ✅ 완료, 상세는 `docs/progress.md`·`docs/integration-points.md` 참고.
+6. **Layer 2 파라미터 제스처** — 안전 범위 실측 후 `express_gesture` 구현, 얼굴추적과의 모드 상호배제 검증 — 로봇 연결 대기 중
+7. **통합 및 시나리오 리허설** — §08 시나리오 A/B를 실제 로봇으로 반복 실행, 예외 상황(사람이 여러 명, 인식 실패 등) 보강 — 로봇 연결 대기 중
 
 ---
 
