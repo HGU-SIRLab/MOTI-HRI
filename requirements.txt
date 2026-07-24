@@ -1,0 +1,24 @@
+# LLM / 대화 (Gemini Live API 주 경로, batch+TTS 폴백 — docs/architecture.md §03)
+google-generativeai
+
+# 얼굴 추적 / 인식
+opencv-python
+mediapipe
+insightface
+onnxruntime  # GPU 사용 시 onnxruntime-gpu로 교체
+
+# 모터 제어
+dynamixel-sdk
+pyserial
+
+# 오디오 입출력
+sounddevice
+numpy
+
+# 표정 UI
+pygame
+
+# 입력 / 설정
+pynput
+python-dotenv
+screeninfo

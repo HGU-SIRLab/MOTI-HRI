@@ -1,0 +1,18 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+.env
+.env.*
+!.env.example
+
+# 사용자 데이터 / 학습 데이터 — 코드가 아니라 실행 산출물
+user_profiles.json
+art_brain.pkl
+user_result/
+logs/
+
+# 대형 바이너리 모델 파일
+models/*.task
+models/*.onnx
