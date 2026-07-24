@@ -2,9 +2,12 @@
 
 지금까지(로드맵 §10 1~4단계) 만든 코드는 전부 **독립적으로 검증 가능하게** 일부러 서로 느슨하게 떨어뜨려 놓았다. 나중에 다음 단계(vision/, display/, launcher.py)를 만들 때 "이미 있는 것을 어디에 꽂아야 하는지" 매번 코드를 다시 뒤지지 않도록 여기 모아둔다. 무언가를 새로 만들 때 이 문서의 해당 항목도 같이 지워나가면 된다.
 
-## vision/face.py를 만들 때 — 커스텀 VAD가 필요 없어졌을 수 있음
+## vision/face.py — 포팅 완료(추적만), 얼굴인식은 아직
 
-4단계(Live API PoC)에서 확인된 것: `RealtimeInputConfig.automatic_activity_detection`이 서버 측에서 음성 활동 감지(말 시작/끝, 끼어들기)를 자동으로 처리한다. v1/v2는 이걸 위해 mediapipe blendshape의 `jawOpen` 값으로 입모양 기반 VAD를 직접 구현했었다(§03 관련). **vision/face.py를 포팅할 때, 이 커스텀 VAD 로직을 그대로 가져올지 아니면 Live API의 서버 측 VAD로 대체하고 얼굴추적은 순수하게 팬/틸트 제어에만 쓸지 결정할 것** — 후자가 코드도 줄고 v1/v2보다 더 정확할 가능성이 높다.
+**결정됨(더 이상 오픈 이슈 아님)**: barge-in을 사람이 직접 이어폰 끼고 검증한 결과 서버 측 VAD(`RealtimeInputConfig.automatic_activity_detection`)가 정상 동작함을 확인했다. 그래서 `vision/face.py`(커밋 `4bf8e46`)는 입모양(jawOpen) 커스텀 VAD를 전부 제거하고 팬/틸트 추적만 담당하도록 포팅했다.
+
+- **아직 안 된 것**: `vision/vision_brain.py`(`RobotBrain`, insightface+FuzzyART, `art_brain.pkl`)가 없어서 `face_tracker_worker(brain=None)`으로만 쓸 수 있다 — 얼굴 인식(누가 왔는지 식별)이 안 되므로 `shared_state['detected_user']`가 갱신되지 않는다. 포팅하려면 v2의 `vision/vision_brain.py`를 그대로 가져오면 됨(설계 변경 불필요, `docs/architecture.md` §07).
+- **새로 발견된 이슈**: 스피커+마이크를 이어폰 없이 같이 쓰면(=로봇의 실제 구성과 동일) 스피커 소리를 마이크가 되먹여서 서버 VAD가 오탐(`interrupted=True`가 저절로 뜸)한다. `launcher.py` 오디오 루프를 만들 때 AEC 또는 "TTS 재생 중 마이크 입력 무시" 처리가 필요할 것으로 보임 — 아직 코드 없음, `docs/progress.md` 4단계 항목 참고.
 
 ## hardware/motion.py — `play_manual_motion`이 아직 아무 데도 안 붙어 있음
 

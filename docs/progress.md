@@ -2,7 +2,35 @@
 
 `docs/architecture.md`의 로드맵(§10) 대비 실제 구현 상태를 기록한다. 설계 자체가 바뀌면 architecture.md를, 무엇을 언제 어떻게 만들었는지는 이 문서를 갱신한다.
 
-## 4단계 — Live API PoC (코드/자동 검증 완료, 사람 테스트 대기 — 커밋 `9561e21`)
+## 5단계 — vision/face.py 포팅 (진행 중, 커밋 `4bf8e46`)
+
+### 만든 것
+
+| 파일 | 내용 |
+|---|---|
+| `vision/face.py` | v2에서 포팅. `face_tracker_worker`(팬/틸트 PID 추적, brain 있으면 얼굴인식 연동) + `display_loop_main_thread`(모니터 배치). **입모양(jawOpen) 커스텀 VAD 관련 코드 전부 제거** — `mouth_event_queue` 파라미터, `MOUTH_OPEN_THRESHOLD`/`SPEAKING_TIMEOUT_SEC` 로직, `output_face_blendshapes=True` 전부 삭제(추적에 안 쓰므로 `False`로 꺼서 연산도 줄임). 모델 파일 경로도 cwd 상대경로 대신 `__file__` 기준 절대경로로 바꿔 실행 위치에 안 흔들리게 함 |
+| `core/suppress.py` | v2 그대로 포팅(cv2/mediapipe 로그 억제 유틸, 변경 없음) |
+| `scripts/test_vision.py` | `test_motions.py`와 같은 패턴의 독립 테스트 도구. 로봇+카메라 연결 후 실행하면 얼굴 추적만 단독 검증 가능 |
+| `models/face_landmarker.task` | v2에서 복사(바이너리, `.gitignore`의 `models/*.task` 규칙으로 커밋 대상 아님 — 새 환경에서는 v2에서 다시 복사해와야 함) |
+
+### 결정 근거
+
+4단계에서 barge-in이 서버 VAD로 실제 검증됐으므로([[project-moti-v3-design]] 참고), v1/v2가 입모양으로 녹음 시작/종료를 트리거하던 이유 자체가 사라짐 — `vision/face.py`는 이제 팬/틸트 제어(+선택적 얼굴인식)만 담당.
+
+### 검증 상태
+
+`python -c "import vision.face, scripts.test_vision"`로 임포트만 확인(로봇·카메라 미연결). **실제 추적 동작(카메라+서보)은 검증되지 않음** — 사용자가 로봇 연결 후 `python scripts/test_vision.py`로 확인 예정.
+
+### 의도적으로 범위 밖에 둔 것
+
+- `vision/vision_brain.py`(얼굴인식, insightface+FuzzyART, `art_brain.pkl`)는 이번 단계에 포함 안 함 — `face_tracker_worker(brain=None)`으로 추적만 우선 동작. 다음 단계 후보.
+- `profile_manager.load_profile_for_chat(name)`과의 연결(art_brain이 이름 확정 → 페르소나 시스템 인스트럭션에 반영)도 vision_brain 포팅 이후 과제 — `docs/integration-points.md` 참고.
+
+### 다음 단계
+
+vision_brain.py 포팅 여부 결정, 또는 display/ 포팅으로 먼저 전환(emotion_tools의 콘솔 로그를 실제 표정 UI로 연결).
+
+## 4단계 — Live API PoC (완료, barge-in 실사용 검증까지 완료 — 커밋 `9561e21`, `2292338`)
 
 ### 사용한 SDK
 
@@ -22,14 +50,17 @@
 3. **barge-in은 서버가 알아서 처리**: `LiveServerContent.interrupted: bool` 필드가 존재하고, `RealtimeInputConfig.automatic_activity_detection`이 서버 측 VAD를 자동 수행한다. 즉 **v1/v2가 썼던 입모양(jawOpen blendshape) 기반 커스텀 VAD가 v3에서는 필요 없어질 가능성이 높다** — 이건 아키텍처 문서에 없던 추가 단순화 기회다.
 4. `message.data`라는 편의 프로퍼티가 응답의 오디오 파트를 통째로 이어붙여 반환해줘서, 재생 코드가 파트를 직접 순회할 필요가 없었다.
 
-### 검증 안 된 것 (사람이 직접 해야 함)
+### barge-in 실사용 검증 결과 (완료)
 
-- `python scripts/test_live_audio.py` 실행 후 모티가 말하는 도중에 실제로 말을 걸어서 끼어들기가 자연스럽게 느껴지는지 (콘솔에 "🚨 interrupted=True — 재생 중단"이 뜨고 스피커가 바로 멈추면 배선은 정상, 그 다음은 체감 품질의 문제)
+`python scripts/test_live_audio.py`를 사용자가 직접 실행해 확인함. 첫 시도(스피커+마이크, 이어폰 없음)에서 **가만히 듣고만 있었는데도 `interrupted=True`가 떴다** — 원인 규명을 위해 이어폰을 끼고 재시도하자 문제없이 정상 동작(가만히 있을 땐 안 뜨고, 실제로 말을 걸었을 때만 뜸). 즉 첫 시도의 오탐은 barge-in 로직 결함이 아니라 **스피커 소리를 마이크가 되먹임(echo)해서 서버 VAD가 "사용자가 말했다"고 오인식한 것** — 헤드리스 환경에서 헤드폰 없이 스피커+마이크를 물리적으로 가까이 두면 재현되는 전형적인 음향 피드백 문제다.
+
+**실제 로봇에도 적용되는 시사점**: 로봇도 마이크와 스피커가 한 몸체에 붙어 있으므로 이어폰이라는 회피책을 쓸 수 없다. `launcher.py`의 오디오 루프를 만들 때 AEC(음향 에코 캔슬레이션)나 "TTS 재생 중 마이크 입력을 일시적으로 무시" 같은 처리가 필요할 가능성이 높음 — 아직 미해결, `docs/integration-points.md`에 추가 예정.
+
 - Live API/TTS 둘 다 preview 상태라 가격·요청 한도는 여전히 미확인
 
 ### 다음 단계
 
-사용자가 `scripts/test_live_audio.py`로 barge-in을 직접 확인한 뒤, 결과에 따라 §10 5단계(Layer 2 파라미터 제스처)로 가거나, Live API가 기대에 못 미치면 아키텍처 문서의 폴백 경로(batch + Gemini TTS)로 전환.
+barge-in 검증이 끝났으므로 §10 5단계(vision/face.py 포팅, 진행 중) 또는 Layer 2 파라미터 제스처로 진행. 스피커/마이크 에코 문제는 launcher.py 작업 시점에 별도로 다룰 것.
 
 ## 3단계 — 페르소나 시스템 인스트럭션 재작성 (완료, 커밋 `cfc05b3`)
 
