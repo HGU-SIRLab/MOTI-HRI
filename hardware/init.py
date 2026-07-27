@@ -3,20 +3,22 @@ from hardware import config as C
 from hardware import dxl_io as io
 import time
 
-# 팬/틸트·바퀴를 제외한 관절의 초기 목표 위치. v1/v2 실측값 그대로.
-# ID 10은 config.py 어디에도 이름이 없는 모터지만 v1/v2 모두 이 값(1001)으로
-# 초기화해왔다 — 용도가 불명확해도 미초기화 상태로 남기지 않기 위해 그대로 유지.
+# 팬/틸트·바퀴를 제외한 관절의 초기 목표 위치.
+# 2026-07-27 실물 로봇 재보정: 사용자가 토크 OFF 상태에서 손으로 자세를 다시
+# 잡은 뒤 scripts/read_positions.py로 실측해 v1/v2 값에서 갱신함(v1/v2 실측값은
+# git 이력 참고). ID 10은 config.py 어디에도 이름이 없는 모터지만 용도가
+# 불명확해도 미초기화 상태로 남기지 않기 위해 계속 초기화 대상에 포함.
 MOTOR_HOME_POSITIONS = {
-    C.HEAD_NOD_ID: 3862,
-    C.PAN_ID: 2081,
-    C.SHOULDER_ID: 2089,
-    C.AUX_ID: 2216,
-    C.RIGHT_ARM_ID: 3666,
-    C.RIGHT_HAND_ID: 1906,
-    C.TILT_ID: 2071,
-    10: 1001,
-    C.LEFT_ARM_ID: 1425,
-    C.LEFT_HAND_ID: 1956,
+    C.HEAD_NOD_ID: 4022,
+    C.PAN_ID: 2079,
+    C.SHOULDER_ID: 2113,
+    C.AUX_ID: 2061,
+    C.RIGHT_ARM_ID: 3660,
+    C.RIGHT_HAND_ID: 2139,
+    C.TILT_ID: 2074,
+    10: 1016,
+    C.LEFT_ARM_ID: 1387,
+    C.LEFT_HAND_ID: 2068,
 }
 
 
