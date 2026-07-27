@@ -17,6 +17,8 @@ pyserial
 # 오디오 입출력
 sounddevice
 numpy
+scipy  # media/audio_manager.py의 AEC 원단 리샘플링(24kHz->16kHz)에 사용
+aec-audio-processing  # 에코캔슬레이션(WebRTC AEC3 바인딩) — media/audio_manager.py
 
 # 표정 UI
 pygame
