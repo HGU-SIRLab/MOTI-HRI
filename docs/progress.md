@@ -2,6 +2,70 @@
 
 `docs/architecture.md`의 로드맵(§10) 대비 실제 구현 상태를 기록한다. 설계 자체가 바뀌면 architecture.md를, 무엇을 언제 어떻게 만들었는지는 이 문서를 갱신한다.
 
+## 6단계 — 실물 로봇 연결 및 통합 완료 (2026-07-27)
+
+**로봇이 처음으로 실제 연결된 세션.** §10 로드맵상 "로봇 연결 대기 중"이던 항목들(Layer 1 실물 검증, `vision/face.py` 실물 검증, Layer 2, `launcher.py` 승격, 얼굴인식↔추적 통합)을 이 한 세션에서 전부 끝냈다. 사용자가 직접 로봇으로 테스트하며 진행 — 그때그때 발견된 버그를 바로 고치는 식으로 진행됨.
+
+### Layer 1 실물 검증 및 재보정
+
+- `scripts/test_motions.py`로 실물 매크로 검증 → 초기 위치(HOME)가 부정확해서 사용자가 손으로 자세를 다시 잡음 → `scripts/read_positions.py`(신규, 읽기 전용) 작성해 관절별 새 영점 실측 → `hardware/init.py`의 `MOTOR_HOME_POSITIONS`와 `hardware/config.py`의 모든 관절별 절대 위치 상수(READY/ACTION/TOP/MIDDLE/DOWN 등)를 관절별 델타만큼 일괄 평행이동. 단, HEAD_NOD_ID(#1)는 첫 실측값이 `-77`(부호있는 32비트, 안전범위 밖)로 나와 통신 순간오류로 의심 → 재측정해 `4022`로 확정.
+- 실물 테스트로 hug 동작 시 왼팔이 살짝 과하게 올라가는 것 발견 → `LEFT_ARM_TOP_POS`를 862→902로 미세조정.
+- `docs/architecture.md` §05 안전범위 표를 실측값 기준으로 전부 갱신.
+
+### 버그 3건 발견 및 수정 (실물 테스트 중 발견)
+
+1. **`scripts/test_vision.py` 종료 시 레이스**: `stop_event.set()` 후 얼굴추적 스레드를 `join()` 없이 바로 `port.closePort()` 호출 → 워커 스레드가 루프를 아직 못 빠져나온 상태에서 이미 닫힌 포트에 쓰다가 `'NoneType' object has no attribute 'hEvent'` 에러. `t_face.join(timeout=5.0)` 추가로 해결(이후 `launcher.py`에도 처음부터 이 순서로 작성됨).
+2. **`run_no_robot.py`(당시) 카메라 기본값 불일치**: `vision/face.py`의 `face_tracker_worker`는 이미 `camera_index=1`이 기본값인데, 이걸 부르는 스크립트 3개(`run_no_robot.py`/`test_vision.py`/`test_vision_brain.py`)가 전부 인자 없을 때 `0`으로 덮어쓰고 있었음 — 로봇 카메라(1번) 대신 PC 내장캠(0번)을 보는 버그. 세 파일 다 기본값을 `1`로 수정.
+3. **`run_no_robot.py`(당시) 대화가 한 턴만 진행**: `recv_loop`가 `async for message in session.receive():`를 한 번만 돎 — Gemini Live API의 `session.receive()`는 턴 하나짜리 스트림이라 턴이 끝나면 이 for문 자체가 끝나버려 `recv_loop()`가 종료됨. 그 뒤로는 마이크 오디오는 계속 보내지는데 응답을 받을 사람이 없는 상태가 되어 "한 번 하고 안 이어짐" 증상. `while not stop_event.is_set(): async for message in session.receive(): ...`로 감싸서 턴마다 `receive()`를 다시 호출하도록 수정.
+
+### 전체 코드 재검토(사용자 요청)에서 발견해 고친 것
+
+- **제스처 동시실행 레이스**: `core/motion_tools.py`의 `play_gesture`가 매 호출마다 새 스레드를 띄우고 즉시 리턴하는데, `hardware/motion.py`의 Layer 1 매크로(hug/greeting/wave/shy)는 재진입 방지가 전혀 없었음(dance만 자체 `_dance_running`으로 막혀있었음). `test_motions.py`는 메뉴 입력이 사람 페이스라 문제가 안 드러났지만, 실시간 대화에서 모델이 연속 턴에 제스처를 두 번 부르면 두 매크로가 같은 팔 모터에 동시에 다른 목표 위치를 써서 예측 불가능한 움직임이 날 수 있었음. `busy` 이벤트 가드 추가(추후 Layer 2와도 공유하도록 확장).
+- `_REPO_ROOT` 계산이 파일 위치(scripts/ → 루트)에 종속적이었던 것, `core/suppress.py`의 로그 폴더가 cwd 기준인 것 등 경미한 항목도 점검(후자는 `python launcher.py`를 항상 루트에서 실행하는 한 문제없어 그대로 둠).
+
+### `run_no_robot.py` → `launcher.py` 승격
+
+`docs/integration-points.md`에 미리 적어뒀던 계획대로: 파일을 저장소 루트로 옮기고(`git mv`), `core/motion_tools.py`의 `play_gesture`와 `vision/face.py`의 `face_tracker_worker`를 실제로 대화 파이프라인에 연결. 종료 시 `t_face.join()` → `shutdown_all_motors()` → `port.closePort()` 순서를 처음부터 지키도록 작성(위 버그 1번 교훈 반영).
+
+### 자막 기능 — 미연결 상태로 확인, 더 이상 불필요 판정
+
+전체 기능 재점검 중 `display/subtitle.py`(v2에서 포팅됨, tkinter 자막 창)가 어디에도 연결되어 있지 않은 걸 발견(코드 전체에서 `subtitle_window_process`를 호출하는 곳이 없었음). 사용자 확인 결과 자막 기능 자체가 더 이상 필요 없다고 판단 — 연결 작업 없이 그대로 둠(`docs/integration-points.md`에 기록).
+
+### Layer 2 — `express_gesture` 구현
+
+`hardware/motion.py`에 `play_express_gesture(joint, intensity, speed, repeat)` 추가. 팔/고개는 "쉬는 자세 ↔ 안전범위 끝"을 intensity로 선형보간하는 한 방향 동작, 어깨는 안전범위가 중앙 기준 좌우 대칭이라 좌우로 흔드는 wiggle 동작으로 다르게 구현. 보간 양 끝이 이미 안전범위 안쪽 값이라 intensity 0~1 전 구간에서 안전범위를 못 벗어나는 구조. `core/motion_tools.py`를 `make_motion_tools()`로 재구성해 `play_gesture`(Layer 1)와 `express_gesture`(Layer 2)가 하나의 `busy` 가드를 공유하도록 함(둘이 서로 겹쳐 실행되는 것도 막힘). `test_motions.py`에 `6) express` 메뉴 추가해 관절/intensity/speed/repeat을 직접 입력하며 독립 검증 가능하게 함.
+
+### 얼굴인식 ↔ 팬/틸트 실시간 통합
+
+기존에는 대화 시작 전 `identify_user_via_webcam()`이 카메라를 따로 열어 한 번만 인식하고, `face_tracker_worker`는 `brain=None`으로 추적만 담당하는 두 단계 구조였음. 이걸 하나로 합쳐 `face_tracker_worker(..., brain=brain)`이 인식과 추적을 같은 스레드/카메라 세션에서 함께 하도록 변경, `wait_for_identification()`이 `shared_state['detected_user']`를 폴링. 세션 시작 시 확정된 이름은 세션 내내 고정하고 이후 다른 사람이 감지돼도 무시(사용자 결정) — `vision/face.py`에 이미 있던 `is_initial_recognition_active`(이름이 한 번 확정되면 재인식 자체를 멈추는 로직)를 그대로 활용해서 새로 구현할 필요가 없었음.
+
+### 로봇이 먼저 인사 + 처음 보는 사람 자동 등록
+
+사용자 요청: "launcher 실행 시 모터 켜지고 로봇이 먼저 인사, 아는 사람이면 이름 부르며 인사, 모르는 사람이면 이름을 물어보고 학습".
+
+- **먼저 말 걸기**: Live API는 기본적으로 사용자 입력을 기다렸다가 응답하므로, 연결 직후 `session.send_client_content(turns=..., turn_complete=True)`로 "사용자가 말하기를 기다리지 말고 먼저 인사하라"는 텍스트 턴을 보내 말문을 열게 함(공식 문서 권장 패턴 — `ai.google.dev/gemini-api/docs/live-guide` 확인). `core/utils.py`의 페르소나에도 "먼저 말을 거세요" 지시를 상시 포함하도록 추가.
+- **처음 보는 사람 자동 등록**: `core/memory_tools.py`의 `make_remember_fact_tool`을 `name: str`이 아니라 `name_state: dict`(예: `{"name": None}`)를 받도록 재설계. Live API는 세션 도중 tools 목록을 바꿀 수 없어서, 이름을 몰라도 `remember_fact` 툴을 처음부터 항상 붙여두고 **모델이 처음으로 `remember_fact(field="name", value=...)`를 호출하는 순간** 그 값으로 이름을 확정(+ `shared_state['detected_user']` 갱신 + 그 시점 `shared_state['current_face_embedding']`으로 `brain.register_face()` 호출)하는 "자가부트스트랩" 방식 채택. 이름 확정 전에 다른 field를 먼저 부르면 저장하지 않고 이름부터 물어보라고 안내. 이 인터페이스 변경으로 기존 테스트 스크립트 4개(`test_live_poc/persona/live_audio/memory.py`)의 호출부도 `make_remember_fact_tool(name)` → `make_remember_fact_tool({"name": name})`로 같이 수정.
+- 오프라인 유닛 테스트(가짜 brain으로 `remember_fact` 시퀀스 직접 호출)로 부트스트랩 로직 자체는 사전 검증함 — 실제 Live API 붙여서 사용자가 확인, "다 너무 잘된다"로 통과.
+
+### 에코/AEC 조사 (구현은 보류)
+
+barge-in은 v3를 만든 핵심 이유 중 하나라 포기 불가로 확정(사용자 결정) — "TTS 재생 중 마이크 무시" 같은 회피책은 배제.
+
+- Windows WASAPI "통신(Communications)" 카테고리로 OS 자체 AEC를 타는 방법을 조사 후 실제로 코드로 시도 → **이 환경에서 실패 확인**: `sounddevice`가 잡는 기본 입출력 장치가 WASAPI가 아니라 MME 호스트API라, 카테고리 값과 무관하게 `WasapiSettings`를 붙이기만 해도 `Incompatible host API specific stream info` 에러가 남. 이 경로 폐기.
+- ChatGPT/Gemini 등 실제 서비스가 에코 없이 잘 되는 이유를 분석 — 결국 웹은 브라우저 내장 AEC3(`getUserMedia echoCancellation:true`), 데스크톱 앱은 대부분 Electron이라 크로미움의 AEC3 그대로 사용, 모바일은 OS AEC 편차가 커서 WebRTC AEC3를 직접 쓰는 경우가 많음 — **셋 다 결국 WebRTC AEC3 하나로 수렴**.
+- `pip install aec-audio-processing` — Windows(Python 3.11)에서 prebuilt wheel로 깔끔히 설치 확인(컴파일 불필요), 실제 WebRTC APM(AEC3 포함)을 SWIG로 감싼 진짜 엔진. `process_reverse_stream()`이 자기가 설정한 레이트가 아니라 근단(마이크) 프레임 크기를 그대로 요구하는 함정 발견(스피커 24kHz → 마이크 16kHz로 리샘플링해서 먹여야 함). 합성 신호(원단 사인파+에코+별도 목소리 성분)로 300프레임 시뮬레이션 → 적응 필터 수렴 후 **에코 성분 약 30~36dB 감쇠** 확인 — 실사용 가능한 수준.
+- 결론: `aec-audio-processing`으로 구현 가능성은 확정됐고, 실제 `launcher.py`의 `MicStreamer`/`Speaker`에 연결하는 작업만 남음(사용자가 나중으로 보류, `docs/integration-points.md`에 상세 기록).
+
+### AEC 실제 연결 (같은 세션에 이어서 완료)
+
+`launcher.py`에 인라인이던 `MicStreamer`/`Speaker`를 `media/audio_manager.py`(신규)로 분리하면서 `EchoCanceller` 클래스로 AEC를 실제로 연결. 마이크 콜백은 캡처 오디오를 `process_stream`에 통과시켜 정제된 오디오만 Gemini로 보내고, 스피커 콜백은 재생 중인 오디오를 24kHz→16kHz로 리샘플링해서 `process_reverse_stream`(에코 참조)에 동시 투입. `.env`에 `ENABLE_AEC`(켜기/끄기), `AEC_STREAM_DELAY_MS`(왕복지연 추정치, 기본 100ms) 추가. `requirements.txt`에 `aec-audio-processing`·`scipy` 반영.
+
+**검증 2단계**: ①로봇 없이 실제 오디오 장치(PC 마이크/스피커)로 마이크·스피커 콜백을 2초간 동시에 구동하는 스모크 테스트 — 크래시 없음, 예상 바이트 수(64000 = 2초×16kHz×2바이트) 정확히 일치. ②**사용자가 이어폰을 빼고 실제 로봇으로 대화 — 최종 검증 성공**("성공이야! 진짜 대박이다"). 왕복지연 추정치(100ms)를 튜닝 없이 그대로 썼는데도 잘 작동함.
+
+### 검증 상태 / 다음 단계
+
+Layer 1 재보정, Layer 2, 얼굴인식↔추적 통합, 먼저 인사+자동등록, AEC까지 **§10 로드맵 핵심 기능 전부 사용자가 실제 로봇으로 테스트 완료 — v3 완성**. 남은 건 낮은 우선순위 항목뿐(`docs/integration-points.md` 참고 — Layer 3 폴백, ID 10 모터 정체, facts 정리 로직).
+
 ## 전체 코드베이스 리뷰 (완료, 커밋 `f4c4545`, `13257e1`)
 
 "로봇 없이 할 수 있는 작업들"을 다 끝낸 시점에 전체를 한 번 훑어서 버그 4건을 찾아 고쳤다.

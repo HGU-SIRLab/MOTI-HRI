@@ -17,4 +17,4 @@ docs/       설계 문서
 
 ## 상태
 
-스캐폴딩 단계. 로드맵은 `docs/architecture.md` §10 참고.
+2026-07-27 실물 로봇 연결 후 핵심 기능 전부 완성 — 얼굴인식(처음 보는 사람은 이름을 물어보고 자동 등록), 팬/틸트 추적, Layer 1/2 제스처, 로봇이 먼저 인사하는 대화 시작, 에코캔슬레이션(AEC, 이어폰 없이 실제 대화로 최종 검증)까지 전부 실제 로봇으로 검증됨. 진입점은 `launcher.py`(`python launcher.py`). 남은 건 우선순위 낮은 항목뿐(`docs/integration-points.md` 참고) — 로드맵은 `docs/architecture.md` §10.

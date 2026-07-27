@@ -166,14 +166,16 @@ express_gesture(
 )
 ```
 
+**2026-07-27 구현 완료**(`hardware/motion.py`의 `play_express_gesture`, `core/motion_tools.py`의 `express_gesture` 툴): 팔/고개는 "쉬는 자세 ↔ 안전범위 끝"을 intensity로 선형보간하는 한 방향(raise) 동작, 어깨는 안전범위가 중앙 기준 좌우 대칭이라 좌우로 흔드는 wiggle 동작으로 다르게 구현했다. intensity가 0~1을 벗어날 수 없게 clamp하고, 보간 양 끝이 이미 안전범위 안쪽 값이라 어떤 intensity를 넣어도 안전범위를 벗어나지 않는다. `play_gesture`(Layer 1)와 `busy` 가드를 공유해 서로 겹쳐 실행되지 않는다(`core/motion_tools.py` 참고).
+
 | 관절 | 안전 최소 | 안전 최대 | 근거 |
 |---|---|---|---|
-| 오른팔 (ID 7) | 3400 | 4050 | v1 `RIGHT_ARM_ACTION_POS`~`RIGHT_ARM_TOP_POS` 실측값 (준비자세 3685) |
-| 왼팔 (ID 11) | 900 | 1700 | v1 `LEFT_ARM_TOP_POS`~`LEFT_ARM_ACTION_POS` 실측값 (준비자세 1402) |
-| 어깨 (ID 5) | 1846 | 2200 | v1 `SHOULDER_RIGHT_POS`~`SHOULDER_LEFT_POS` 실측값 (중앙 2073) |
-| 고개 끄덕 (ID 1) | 3800 | 4030 | v2 `HEAD_NOD_DOWN_POS`~`HEAD_NOD_MAX_POS` 실측값 (홈 4000) |
+| 오른팔 (ID 7) | 3394 | 4044 | `RIGHT_ARM_ACTION_POS`~`RIGHT_ARM_TOP_POS` 실측값 (준비자세 3679, 2026-07-27 실물 재보정) |
+| 왼팔 (ID 11) | 902 | 1662 | `LEFT_ARM_TOP_POS`~`LEFT_ARM_ACTION_POS` 실측값 (준비자세 1364, 2026-07-27 실물 재보정. TOP_POS는 포옹 동작 육안 확인 후 +40 미세조정) |
+| 어깨 (ID 5) | 1870 | 2224 | `SHOULDER_RIGHT_POS`~`SHOULDER_LEFT_POS` 실측값 (중앙 2097, 2026-07-27 실물 재보정) |
+| 고개 끄덕 (ID 1) | 3822 | 4052 | `HEAD_NOD_DOWN_POS`~`HEAD_NOD_MAX_POS` 실측값 (홈 4022, 2026-07-27 실물 재보정) |
 
-위 값은 v1 config.py·v2 hardware/config.py에 실제로 기록된 실측값이다. 다만 모터가 물리적으로 재조립/재캘리브레이션되었을 가능성이 있으므로, v3 구현 착수 전 `debug_motor_positions.py`로 현재 로봇 기준 재검증은 여전히 권장한다.
+위 값은 2026-07-27에 실물 로봇 기준으로 재보정됨(`scripts/read_positions.py`로 관절별 새 영점을 실측하고, 이전 v1/v2 값에서의 델타만큼 이 표의 모든 절대값을 평행이동). 이전 v1/v2 원본 실측값은 git 이력 참고. 로봇이 다시 재조립/재캘리브레이션되면 동일한 방식으로 재검증할 것.
 
 ### Layer 3 — 폴백
 
@@ -222,11 +224,11 @@ set_emotion(
 ## 09. 검증 필요 / 오픈 이슈
 
 - [x] Gemini Live API의 barge-in 메커니즘 자체는 SDK에 존재함이 확인됨(`google-genai` 1.61.0) — `LiveServerContent.interrupted: bool` 필드로 서버가 끼어들기를 알려주고, `RealtimeInputConfig.automatic_activity_detection`이 서버 측 VAD를 자동 처리해 v1/v2가 쓰던 커스텀 입모양 VAD가 필요 없어짐. **사람이 직접 이어폰을 끼고 `scripts/test_live_audio.py`로 끼어들기 체감까지 확인 완료** — 정상 동작함. (이어폰 없이 스피커+마이크를 같이 쓰면 스피커 소리를 마이크가 되먹여 `interrupted=True`가 저절로 뜨는 음향 에코 오탐이 있었는데, 이어폰 착용 시 재현이 안 돼서 원인이 에코였음이 확정됨 — barge-in 로직 자체의 결함은 아님. 아래 신규 이슈로 분리.)
-- [ ] **(신규)** 스피커→마이크 음향 에코로 인한 barge-in 오탐 — 실제 로봇도 마이크/스피커가 물리적으로 붙어있어 같은 문제가 날 수 있음. `launcher.py`(현재는 `scripts/run_no_robot.py`) 오디오 루프에 AEC(에코 캔슬레이션) 또는 "TTS 재생 중 마이크 입력 무시" 중 하나를 넣어야 함 — 아직 미해결. (`docs/progress.md` 4단계 참고)
+- [x] **(신규)** 스피커→마이크 음향 에코로 인한 barge-in 오탐 — 2026-07-27 `launcher.py`(당시 `run_no_robot.py`) 실물 테스트로 실제 재현 확인됨(이어폰 사용 시 정상, 없으면 오탐). barge-in은 포기 불가로 확정(사용자 결정) → `aec-audio-processing`(WebRTC AEC3)를 `media/audio_manager.py`에 배선해 해결 — 합성 신호 30~36dB 감쇠 검증 + 실제 오디오 장치 스모크 테스트 통과 + **이어폰 없이 실제 대화로 최종 검증 완료**(왕복지연 기본값 100ms 그대로 잘 작동, 튜닝 불필요). (`docs/progress.md` 6단계, `docs/integration-points.md` 참고)
 - [ ] Gemini 3.1 Flash TTS의 스트리밍 지원 여부, 음성 목록/커스터마이징 옵션, 가격 — Live API가 barge-in까지 자체 해결하므로 우선순위 낮아짐(배터리 폴백 경로에서만 필요)
-- [x] Live API function calling은 예상대로 수동 처리(`tool_call` 이벤트 수신 → 직접 실행 → `send_tool_response`)가 필요했음 — `scripts/test_live_poc.py`에서 `remember_fact`/`set_emotion` 둘 다 정상 동작 확인, 첫 응답까지 지연시간 0.49~0.66초(텍스트 턴 기준). 모터처럼 수 초 걸리는 동작을 위한 "시작만 확인, 완료는 비동기 신호" 설계는 `core/motion_tools.py`로 구현됨(백그라운드 스레드 실행) — 실제 모터로는 아직 미검증.
+- [x] Live API function calling은 예상대로 수동 처리(`tool_call` 이벤트 수신 → 직접 실행 → `send_tool_response`)가 필요했음 — `scripts/test_live_poc.py`에서 `remember_fact`/`set_emotion` 둘 다 정상 동작 확인, 첫 응답까지 지연시간 0.49~0.66초(텍스트 턴 기준). 모터처럼 수 초 걸리는 동작을 위한 "시작만 확인, 완료는 비동기 신호" 설계는 `core/motion_tools.py`로 구현됨(백그라운드 스레드 실행) — 2026-07-27 `launcher.py` 통합 후 실제 모터로 검증 완료.
 - [ ] 가위바위보·OX퀴즈 미니게임을 v3 범위에 포함할지 결정 (포함 시 v1의 `RPS_ARM_UP/DOWN_POS` 서브레인지를 `LEFT_ARM_ID` 이름으로 재사용)
-- [ ] Layer 2 안전 범위 표(§05)는 v1/v2 config.py 기록값 기준 — 실물 로봇 재캘리브레이션 여부를 `debug_motor_positions.py`로 재확인
+- [x] Layer 2 안전 범위 표(§05)는 v1/v2 config.py 기록값 기준이었으나, 2026-07-27 실물 로봇 재보정으로 갱신 완료(`scripts/read_positions.py`로 실측)
 - [ ] 두 모델 모두 preview 상태 — 캡스톤 발표 일정 내 안정성 리스크 점검
 
 ---
@@ -235,13 +237,17 @@ set_emotion(
 
 > 각 단계에서 만든 코드가 이후 단계에 어떻게 연결되어야 하는지는 [`docs/integration-points.md`](integration-points.md)에 별도로 정리한다. 새 단계를 시작하기 전에 먼저 확인할 것 — "이미 만들어둔 걸 어디에 꽂아야 하는지" 다시 찾아 헤매지 않기 위한 문서다.
 
-1. **Layer 1 단독 이식** — v1 `dance.py` 모션 함수를 v2 `hardware/config.py`의 정식 명명(`LEFT_ARM_ID`, `SHOULDER_ID` 등)에 맞춰 `hardware/` 구조로 옮기고, 기존 키보드 트리거 등으로 독립 테스트 (대화 엔진과 무관하게 먼저 검증) — ✅ 코드 완료, 상세 내용과 발견된 버그는 [`docs/progress.md`](progress.md) 참고. 실물 로봇 검증은 아직 미완료.
+1. **Layer 1 단독 이식** — v1 `dance.py` 모션 함수를 v2 `hardware/config.py`의 정식 명명(`LEFT_ARM_ID`, `SHOULDER_ID` 등)에 맞춰 `hardware/` 구조로 옮기고, 기존 키보드 트리거 등으로 독립 테스트 (대화 엔진과 무관하게 먼저 검증) — ✅ 코드 완료, 상세 내용과 발견된 버그는 [`docs/progress.md`](progress.md) 참고. **2026-07-27 실물 로봇 검증도 완료**(`scripts/test_motions.py`) — 관절 영점 재보정, hug 왼팔 높이 미세조정까지 반영됨(§05 안전범위 표 갱신).
 2. **메모리 계층 전환** — `user_profiles.json` 스키마를 facts 배열로 바꾸고, 기존 batch Gemini 호출에서도 `remember_fact` function calling으로 먼저 시험 (Live API 없이도 검증 가능) — ✅ 완료, `docs/progress.md` 참고.
 3. **페르소나 시스템 인스트럭션 재작성** — STAGES 기반 `build_*_prompt` 제거, 능동형 호기심 페르소나로 `core/utils.py` 재작성 — ✅ 완료, 실제 Gemini 대화로 검증됨. `docs/progress.md` 참고.
 4. **Live API PoC** — 별도 브랜치에서 barge-in·지연시간·function calling 안정성만 집중 검증, 실패 시 batch+Gemini TTS 경로로 확정 — ✅ 완료(연결·지연시간·function calling·사람이 직접 끼어드는 barge-in 체감까지 전부 검증됨). `docs/progress.md` 참고.
-5. **로봇 없이 가능한 나머지 조각 전부** — 로봇 연결이 계속 지연되어, §10에 원래 없던 단계지만 모터가 필요 없는 작업을 이 시점에 몰아서 진행함: `vision/face.py`(팬/틸트 추적, 커스텀 VAD 제거), `vision/vision_brain.py`(얼굴인식), `display/`(표정 UI), `core/report_manager.py`(세션종료 결과지), `core/motion_tools.py`(제스처 툴, 아직 로봇 미검증), `[대화종료]` 태그 처리, 그리고 이 전부를 실제로 이어붙인 `scripts/run_no_robot.py`(로봇 없는 launcher.py 격) — ✅ 완료, 상세는 `docs/progress.md`·`docs/integration-points.md` 참고.
-6. **Layer 2 파라미터 제스처** — 안전 범위 실측 후 `express_gesture` 구현, 얼굴추적과의 모드 상호배제 검증 — 로봇 연결 대기 중
-7. **통합 및 시나리오 리허설** — §08 시나리오 A/B를 실제 로봇으로 반복 실행, 예외 상황(사람이 여러 명, 인식 실패 등) 보강 — 로봇 연결 대기 중
+5. **로봇 없이 가능한 나머지 조각 전부** — 로봇 연결이 계속 지연되어, §10에 원래 없던 단계지만 모터가 필요 없는 작업을 이 시점에 몰아서 진행함: `vision/face.py`(팬/틸트 추적, 커스텀 VAD 제거), `vision/vision_brain.py`(얼굴인식), `display/`(표정 UI), `core/report_manager.py`(세션종료 결과지), `core/motion_tools.py`(제스처 툴), `[대화종료]` 태그 처리, 그리고 이 전부를 실제로 이어붙인 `scripts/run_no_robot.py`(로봇 없는 launcher.py 격) — ✅ 완료, 상세는 `docs/progress.md`·`docs/integration-points.md` 참고.
+5.5. **로봇 연결 및 통합** (2026-07-27) — 실물 로봇 연결 후 `scripts/test_motions.py`(모터)·`scripts/test_vision.py`(팬/틸트)로 개별 검증, `core/motion_tools.py`의 `play_gesture`와 `vision/face.py`의 `face_tracker_worker`를 대화 파이프라인에 연결해 `scripts/run_no_robot.py`를 `launcher.py`로 승격 — ✅ 완료, `docs/integration-points.md` 참고.
+6. **Layer 2 파라미터 제스처** — 안전 범위 실측 후 `express_gesture` 구현, 얼굴추적과의 모드 상호배제 검증 — ✅ 완료(2026-07-27). §05 참고.
+6.5. **얼굴인식↔팬틸트추적 실시간 통합** (2026-07-27) — `identify_user_via_webcam()`의 별도 카메라 세션을 없애고, `vision.face.face_tracker_worker`에 `brain`을 넘겨 얼굴인식과 추적이 같은 스레드에서 함께 돌도록 통합 — ✅ 완료. 이름은 세션 시작 시 확정되면 고정하고 이후 다른 사람이 감지돼도 무시하도록 결정(대화 도중 사람이 바뀌는 경우의 페르소나 전환은 범위 밖으로 명시적으로 보류) — `docs/integration-points.md` 참고.
+6.75. **로봇이 먼저 인사 + 처음 보는 사람 자동 등록** (2026-07-27) — Live API 연결 직후 `send_client_content`로 모델이 먼저 말을 걸도록 트리거(사용자 결정: 사용자가 말할 때까지 기다리지 않음). `core/memory_tools.py`의 `remember_fact`를 이름을 몰라도 항상 붙이고, 첫 `remember_fact(field="name", ...)` 호출이 이름 확정 + 얼굴 등록(`RobotBrain.register_face`)까지 같이 처리하도록 재설계 — ✅ 완료, 실제 로봇으로 검증됨. `docs/integration-points.md`·`docs/progress.md` 6단계 참고.
+7. **통합 및 시나리오 리허설** — §08 시나리오 A/B를 실제 로봇으로 반복 실행, 예외 상황(사람이 여러 명, 인식 실패 등) 보강 — 아직 시작 안 함
+8. **에코/AEC 실제 연결** — `aec-audio-processing`(WebRTC AEC3) 라이브러리를 `media/audio_manager.py`(신규, `launcher.py`의 `MicStreamer`/`Speaker`를 분리하며 AEC를 함께 연결)에 배선 완료 — ✅ (2026-07-27). 실제 오디오 장치 스모크 테스트에 이어 **이어폰 없이 실제 대화로 최종 검증까지 완료**(사용자 확인: "성공, 대박") — 기본 왕복지연 추정치(100ms) 그대로 잘 작동해 튜닝도 불필요했음. **§10 로드맵상 핵심 기능 전부 완성 — v3 완료.**
 
 ---
 
