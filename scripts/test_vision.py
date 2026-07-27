@@ -38,7 +38,7 @@ def open_port() -> tuple[PortHandler, PacketHandler]:
 
 
 def main():
-    camera_index = int(sys.argv[1]) if len(sys.argv) > 1 else 0
+    camera_index = int(sys.argv[1]) if len(sys.argv) > 1 else 1
 
     port, pkt = open_port()
     lock = threading.Lock()
@@ -62,6 +62,7 @@ def main():
         print("\n🛑 KeyboardInterrupt 감지 → 종료 신호 보냄")
     finally:
         stop_event.set()
+        t_face.join(timeout=5.0)
         print("▶️  종료 — 모든 모터 토크 OFF")
         I.shutdown_all_motors(port, pkt, lock)
         port.closePort()

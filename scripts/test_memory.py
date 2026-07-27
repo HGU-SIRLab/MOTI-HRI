@@ -70,7 +70,7 @@ def run_live_function_calling_test():
     model_name = os.getenv("MODEL_NAME", "gemini-3.1-flash-lite")
 
     profiles.forget_user(TEST_USER)
-    remember_fact = make_remember_fact_tool(TEST_USER)
+    remember_fact = make_remember_fact_tool({"name": TEST_USER})
 
     model = genai.GenerativeModel(model_name, tools=[remember_fact])
     chat = model.start_chat(enable_automatic_function_calling=True)

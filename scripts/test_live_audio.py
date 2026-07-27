@@ -122,7 +122,7 @@ async def run():
     client = genai.Client(api_key=api_key)
 
     profiles.forget_user(TEST_USER)
-    remember_fact = make_remember_fact_tool(TEST_USER)
+    remember_fact = make_remember_fact_tool({"name": TEST_USER})
     set_emotion = make_set_emotion_tool()
     tool_fns = {"remember_fact": remember_fact, "set_emotion": set_emotion}
 

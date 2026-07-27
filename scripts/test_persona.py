@@ -66,7 +66,7 @@ def run_live_conversation_test():
     model_name = os.getenv("MODEL_NAME", "gemini-3.1-flash-lite")
 
     profiles.forget_user(TEST_USER)
-    remember_fact = make_remember_fact_tool(TEST_USER)
+    remember_fact = make_remember_fact_tool({"name": TEST_USER})
     set_emotion = make_set_emotion_tool()  # display 없음 → 콘솔 로그로 대체
 
     system_instruction = build_persona_system_instruction(name=None, facts_summary=None)

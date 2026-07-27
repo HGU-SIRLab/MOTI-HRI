@@ -24,7 +24,7 @@ from vision.vision_brain import RobotBrain
 
 
 def main():
-    camera_index = int(sys.argv[1]) if len(sys.argv) > 1 else 0
+    camera_index = int(sys.argv[1]) if len(sys.argv) > 1 else 1
 
     cv2, _ = suppress.import_cv2_mp()
 
