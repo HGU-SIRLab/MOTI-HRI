@@ -32,6 +32,7 @@ MENU = """
  3) shy       (부끄부끄)
  4) dance     (춤, 약 {duration}초 — 백그라운드 재생)
  5) head_nod  (고개 끄덕임)
+ 6) express   (Layer 2 파라미터 제스처: 관절/intensity/speed/repeat 직접 입력)
  q) 종료
 ──────────────────────────────
 """.format(duration=M.DANCE_DURATION)
@@ -75,6 +76,19 @@ def main():
                 print(f"🎵 춤 시작됨 — 약 {eta}초간 재생됩니다 (백그라운드).")
             elif choice == "5":
                 M.perform_head_nod(port, pkt, lock, shared_state)
+            elif choice == "6":
+                joint = input(f"  관절 {M.EXPRESS_JOINTS} > ").strip()
+                if joint not in M.EXPRESS_JOINTS:
+                    print(f"⚠️ 알 수 없는 관절: {joint}")
+                    continue
+                try:
+                    intensity = float(input("  intensity (0.0~1.0) > ").strip() or "0.5")
+                    repeat = int(input("  repeat (1~3) > ").strip() or "1")
+                except ValueError:
+                    print("⚠️ 숫자로 입력해주세요.")
+                    continue
+                speed = input("  speed (slow/normal/fast) > ").strip() or "normal"
+                M.play_express_gesture(joint, intensity, speed, repeat, port, pkt, lock, shared_state)
             else:
                 print("⚠️ 알 수 없는 입력입니다.")
     finally:

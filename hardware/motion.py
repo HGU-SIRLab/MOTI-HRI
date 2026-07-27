@@ -543,3 +543,85 @@ def play_manual_motion(name: str, port: PortHandler, pkt: PacketHandler, lock: t
 
     motion_fn(port, pkt, lock)
     return None
+
+
+# ---- Layer 2 진입점 — docs/architecture.md §05 express_gesture(joint, intensity, speed, repeat) ----
+# LLM은 "무엇을(관절)/얼마나(intensity)/얼마나 빨리(speed)/몇 번(repeat)"만 고르고, 실제 좌표는
+# hardware/config.py의 안전범위 실측값(2026-07-27 재보정)에서 코드가 계산한다 — Layer 1과 같은 원칙.
+# 팔/고개는 "쉬는 자세 <-> 가장 크게 움직인 자세" 한 방향으로만(raise), 어깨는 안전범위가
+# 중앙 기준 좌우 대칭이라 좌우로 흔드는 wiggle로 다르게 취급한다.
+EXPRESS_JOINTS = ("right_arm", "left_arm", "shoulder", "head_nod")
+
+_EXPRESS_RAISE_JOINTS = {
+    "right_arm": dict(motor_id=C.RIGHT_ARM_ID, rest=C.RIGHT_ARM_READY_POS, extreme=C.RIGHT_ARM_TOP_POS),
+    "left_arm": dict(motor_id=C.LEFT_ARM_ID, rest=C.LEFT_ARM_READY_POS, extreme=C.LEFT_ARM_TOP_POS),
+    "head_nod": dict(motor_id=C.HEAD_NOD_ID, rest=C.HEAD_NOD_HOME_POS, extreme=C.HEAD_NOD_DOWN_POS),
+}
+_EXPRESS_SHOULDER = dict(motor_id=C.SHOULDER_ID, rest=C.SHOULDER_CENTER_POS,
+                          left=C.SHOULDER_LEFT_POS, right=C.SHOULDER_RIGHT_POS)
+
+_EXPRESS_SPEED_VELOCITY = {"slow": 150, "normal": 350, "fast": 600}
+_EXPRESS_ACCEL = 30
+_EXPRESS_HOLD_SEC = 0.3
+_EXPRESS_RETURN_SEC = 0.3
+
+
+def play_express_gesture(joint: str, intensity: float, speed: str, repeat: int,
+                          port: PortHandler, pkt: PacketHandler, lock: threading.Lock, shared_state: dict):
+    """관절 하나를 intensity(0~1)만큼, speed로, repeat번 움직이고 쉬는 자세로 복귀한다.
+    블로킹 호출 — core/motion_tools.py가 백그라운드 스레드로 감싼다(Layer 1과 동일한 이유)."""
+    intensity = io.clamp(intensity, 0.0, 1.0)
+    repeat = int(io.clamp(repeat, 1, 3))
+    velocity = _EXPRESS_SPEED_VELOCITY.get(speed, _EXPRESS_SPEED_VELOCITY["normal"])
+
+    # head_nod는 팬/틸트와 물리적으로 가까워 추적 중 같이 움직이면 어색해 보인다 —
+    # perform_head_nod와 동일하게 잠깐 추적을 멈춘다.
+    pause_tracking = joint == "head_nod"
+    if pause_tracking and shared_state:
+        shared_state['mode'] = 'nodding'
+        time.sleep(0.1)
+
+    motor_id = None
+    try:
+        if joint == "shoulder":
+            cfg = _EXPRESS_SHOULDER
+            motor_id = cfg['motor_id']
+            left_target = int(round(cfg['rest'] + intensity * (cfg['left'] - cfg['rest'])))
+            right_target = int(round(cfg['rest'] + intensity * (cfg['right'] - cfg['rest'])))
+            with lock:
+                io.write4(pkt, port, motor_id, C.ADDR_PROFILE_ACCELERATION, _EXPRESS_ACCEL)
+                io.write4(pkt, port, motor_id, C.ADDR_PROFILE_VELOCITY, velocity)
+            for _ in range(repeat):
+                with lock:
+                    io.write4(pkt, port, motor_id, C.ADDR_GOAL_POSITION, left_target)
+                time.sleep(_EXPRESS_HOLD_SEC)
+                with lock:
+                    io.write4(pkt, port, motor_id, C.ADDR_GOAL_POSITION, right_target)
+                time.sleep(_EXPRESS_HOLD_SEC)
+            with lock:
+                io.write4(pkt, port, motor_id, C.ADDR_GOAL_POSITION, cfg['rest'])
+            time.sleep(_EXPRESS_RETURN_SEC)
+            return
+
+        cfg = _EXPRESS_RAISE_JOINTS.get(joint)
+        if cfg is None:
+            print(f"⚠️ 알 수 없는 관절 '{joint}' — 무시합니다.")
+            return
+        motor_id = cfg['motor_id']
+        target = int(round(cfg['rest'] + intensity * (cfg['extreme'] - cfg['rest'])))
+        with lock:
+            io.write4(pkt, port, motor_id, C.ADDR_PROFILE_ACCELERATION, _EXPRESS_ACCEL)
+            io.write4(pkt, port, motor_id, C.ADDR_PROFILE_VELOCITY, velocity)
+        for _ in range(repeat):
+            with lock:
+                io.write4(pkt, port, motor_id, C.ADDR_GOAL_POSITION, target)
+            time.sleep(_EXPRESS_HOLD_SEC)
+            with lock:
+                io.write4(pkt, port, motor_id, C.ADDR_GOAL_POSITION, cfg['rest'])
+            time.sleep(_EXPRESS_RETURN_SEC)
+    finally:
+        if motor_id is not None:
+            with lock:
+                io.write4(pkt, port, motor_id, C.ADDR_PROFILE_ACCELERATION, 0)
+        if pause_tracking and shared_state:
+            shared_state['mode'] = 'tracking'
