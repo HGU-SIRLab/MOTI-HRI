@@ -9,6 +9,7 @@ import asyncio
 import os
 import queue
 import threading
+import time
 
 import numpy as np
 import sounddevice as sd
@@ -101,8 +102,18 @@ class Speaker:
         # 큐가 말라서 무음으로 메꾼 횟수/총 길이 — 실시간 콜백 안에서는 print 같은 블로킹
         # I/O를 하면 안 되므로(그 자체가 다음 콜백을 더 지연시켜 언더런을 악화시킬 수 있음)
         # 그냥 카운터만 늘리고, 세션이 끝난 뒤 launcher.py가 요약해서 한 번만 출력한다.
+        #
+        # 콜백 자체는 스트림이 열려있는 내내 계속 돈다 — 모티가 말을 안 하고 사용자가
+        # 말하는 중이거나 대화 사이 공백일 때도 큐는 당연히 비어있다. 그걸 전부 "언더런"으로
+        # 세면 숫자가 크게 부풀려진다(실측: 실제 대화에서 1764회/175초로 찍혔는데 체감
+        # 문제는 거의 없었음 — 대부분 그냥 "말 안 하는 시간"이었던 것). 그래서 마지막
+        # play() 호출 후 SILENCE_GAP_SEC 이내에 큐가 마른 경우만 진짜 언더런으로 센다
+        # (한창 재생 중인데 다음 조각이 안 와서 비는 경우) — 그보다 오래 조용했으면
+        # "원래 할 말이 없는 시간"으로 보고 세지 않는다.
         self.underrun_count = 0
         self.underrun_ms_total = 0.0
+        self._last_play_time = 0.0
+        self.SILENCE_GAP_SEC = 2.0
         self._stream = sd.OutputStream(
             samplerate=OUTPUT_RATE, channels=1, dtype="int16",
             blocksize=2400, callback=self._callback,
@@ -118,7 +129,7 @@ class Speaker:
                 break
         chunk, self._leftover = buf[:need], buf[need:]
         shortfall = need - len(chunk)
-        if shortfall > 0:
+        if shortfall > 0 and (time.monotonic() - self._last_play_time) < self.SILENCE_GAP_SEC:
             self.underrun_count += 1
             self.underrun_ms_total += (shortfall / 2) / OUTPUT_RATE * 1000
         chunk = chunk + b"\x00" * shortfall
@@ -127,6 +138,7 @@ class Speaker:
         outdata[:] = np.frombuffer(chunk, dtype="int16").reshape(-1, 1)
 
     def play(self, pcm_bytes: bytes):
+        self._last_play_time = time.monotonic()
         self._q.put(pcm_bytes)
 
     def stop_immediately(self):

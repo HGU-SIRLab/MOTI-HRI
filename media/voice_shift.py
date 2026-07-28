@@ -33,10 +33,13 @@ MIN_SHIFT_SAMPLES = 2400  # 24kHz 기준 100ms
 
 # 로봇 실사용(얼굴추적/모터/표정 UI가 전부 같이 도는 상황)에서 "지직거림"·"대화가 먹힘"
 # 제보 발생(2026-07-28) — 개발 PC 단독 벤치마크(500ms 청크 평균 156ms)로는 여유 있었지만,
-# 실제 로봇은 다른 스레드들과 CPU를 나눠 써서 harvest 처리가 500ms를 넘기면 Speaker의
+# 실제 로봇은 다른 스레드들과 CPU를 나눠 써서 harvest 처리가 버퍼 크기를 넘기면 Speaker의
 # 재생 큐가 말라 무음으로 메꿔지는 언더런이 생길 수 있다(Speaker.underrun_count 참고).
-# 버퍼를 넉넉하게 잡아 여유를 늘린다 — 그만큼 발화 시작 지연도 조금 늘어남(트레이드오프).
-VOICE_SHIFT_BUFFER_MS = int(os.getenv("VOICE_SHIFT_BUFFER_MS", "700"))
+# 500ms → 700ms로 한 번 올렸는데도 실측(Speaker.underrun_count의 "말하는 중" 오탐 버그를
+# 고친 뒤 재측정)으로 80회/7.8초(실제 발화 시간의 25~35%)가 나와 여전히 부족함을 확인 →
+# 700 → 1200으로 재상향. 그만큼 발화 시작 지연도 늘어남(트레이드오프) — 안 좋아지면
+# 700으로 롤백.
+VOICE_SHIFT_BUFFER_MS = int(os.getenv("VOICE_SHIFT_BUFFER_MS", "1200"))
 
 
 def shift_pcm(pcm_bytes: bytes, sample_rate: int,
