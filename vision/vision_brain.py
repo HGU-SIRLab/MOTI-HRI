@@ -2,6 +2,7 @@
 
 import os
 import pickle
+import threading
 import numpy as np
 from collections import deque, Counter
 from insightface.app import FaceAnalysis
@@ -87,7 +88,14 @@ class RobotBrain:
         # Fuzzy ART (뇌)
         self.art = FuzzyART()
         self.load_brain()
-        
+
+        # face_tracker_worker(추적 스레드)의 recognize_face()와 remember_fact/forget_me
+        # 툴(메인 스레드의 asyncio 이벤트 루프)의 register_face()/forget_face()가 self.art.W/
+        # labels를 동시에 건드릴 수 있다. learn()은 리스트를 늘리기만 해서 원래도 안전했지만,
+        # forget_face()는 리스트를 새로 만들어 통째로 교체하므로(줄어듦) 그 사이에 다른 스레드가
+        # predict()에서 읽던 인덱스가 어긋날 수 있다 — 세 메서드를 전부 이 락으로 직렬화한다.
+        self._lock = threading.Lock()
+
         self.buffer = deque(maxlen=BUFFER_SIZE)
         print(f"✅ Vision Brain 준비 완료. (기억된 얼굴 수: {self.art.num_categories})")
 
@@ -130,7 +138,8 @@ class RobotBrain:
         embedding = target.embedding
 
         # 뇌에 물어보기
-        raw_name, _ = self.art.predict(embedding)
+        with self._lock:
+            raw_name, _ = self.art.predict(embedding)
         self.buffer.append(raw_name)
 
         # 투표 (안정화)
@@ -145,6 +154,24 @@ class RobotBrain:
     def register_face(self, embedding, name):
         """외부에서 이름이 확인되면 기억에 등록"""
         if embedding is None: return "No face"
-        msg = self.art.learn(embedding, name)
-        self.save_brain() # 즉시 저장
+        with self._lock:
+            msg = self.art.learn(embedding, name)
+            self.save_brain() # 즉시 저장
         return msg
+
+    def forget_face(self, name: str) -> int:
+        """해당 이름으로 기억된 얼굴 카테고리를 전부 지운다(사용자 삭제 요청용).
+
+        같은 사람이 인식 임계값을 살짝 벗어나 여러 카테고리로 나뉘어 저장돼 있을 수
+        있어(W/labels는 병렬 리스트, 한 이름당 항목이 여럿일 수 있음) 이름이 일치하는
+        전부를 제거한다. 반환값은 제거된 카테고리 수(0이면 애초에 기억이 없었던 것).
+        """
+        with self._lock:
+            keep = [i for i, label in enumerate(self.art.labels) if label != name]
+            removed = len(self.art.labels) - len(keep)
+            if removed:
+                self.art.W = [self.art.W[i] for i in keep]
+                self.art.labels = [self.art.labels[i] for i in keep]
+                self.art.num_categories = len(self.art.labels)
+                self.save_brain()
+        return removed
