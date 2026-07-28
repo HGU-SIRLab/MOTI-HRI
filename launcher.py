@@ -38,17 +38,22 @@ ensure_utf8_console()
 from core import profile_manager as profiles
 from core import report_manager
 from core.emotion_tools import make_set_emotion_tool
-from core.memory_tools import make_remember_fact_tool
+from core.memory_tools import make_forget_me_tool, make_remember_fact_tool
 from core.motion_tools import make_motion_tools
 from core.utils import build_persona_system_instruction, extract_exit_tag
 from display.main import RobotFaceApp
 from hardware import config as C
 from hardware import init as I
-from media.audio_manager import ENABLE_AEC, INPUT_RATE, EchoCanceller, MicStreamer, Speaker
+from media.audio_manager import ENABLE_AEC, INPUT_RATE, OUTPUT_RATE, EchoCanceller, MicStreamer, Speaker
+from media.voice_shift import ENABLE_VOICE_SHIFT, VoiceShifter
 from vision import face as F
 from vision.vision_brain import RobotBrain
 
 LIVE_MODEL = os.getenv("LIVE_MODEL_NAME", "models/gemini-3.1-flash-live-preview")
+# 30종 프리셋 중 Fenrir + 피치/포먼트 시프트(media/voice_shift.py)가 "귀엽고 하찮은" 톤에
+# 제일 가깝다고 실제로 들어보고 결정했었으나(voice_picker 실험), 교수님 피드백으로 Zephyr로
+# 교체함(2026-07-28, docs/progress.md 참고).
+LIVE_VOICE_NAME = os.getenv("LIVE_VOICE_NAME", "Zephyr")
 IDENTIFY_TIMEOUT_SEC = 8.0
 
 
@@ -107,6 +112,10 @@ async def run_conversation(name_state: dict, facts_summary: str | None, emotion_
     tools.append(remember_fact)
     tool_fns["remember_fact"] = remember_fact
 
+    forget_me = make_forget_me_tool(name_state, shared_state=shared_state, brain=brain)
+    tools.append(forget_me)
+    tool_fns["forget_me"] = forget_me
+
     set_emotion = make_set_emotion_tool(emotion_queue)
     tools.append(set_emotion)
     tool_fns["set_emotion"] = set_emotion
@@ -121,6 +130,11 @@ async def run_conversation(name_state: dict, facts_summary: str | None, emotion_
         input_audio_transcription=types.AudioTranscriptionConfig(),
         system_instruction=build_persona_system_instruction(name=name_state["name"], facts_summary=facts_summary),
         tools=tools,
+        speech_config=types.SpeechConfig(
+            voice_config=types.VoiceConfig(
+                prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name=LIVE_VOICE_NAME)
+            )
+        ),
     )
 
     session_history: list[str] = []
@@ -135,6 +149,13 @@ async def run_conversation(name_state: dict, facts_summary: str | None, emotion_
 
     async with client.aio.live.connect(model=LIVE_MODEL, config=config) as session:
         with MicStreamer(loop, echo_canceller=echo_canceller) as mic, Speaker(echo_canceller=echo_canceller) as speaker:
+            # Fenrir 프리셋은 여전히 성인 성우 음색이라, 재생 직전에 피치+포먼트를 시프트해
+            # 더 앳된 톤으로 바꾼다(media/voice_shift.py). 버퍼링 때문에 발화 시작마다
+            # ~0.5~0.8초 지연이 추가되지만, 스트리밍 자체가 계속 밀리지는 않는다.
+            shifter = VoiceShifter(speaker.play, sample_rate=OUTPUT_RATE) if ENABLE_VOICE_SHIFT else None
+            if shifter:
+                shifter.start()
+
             turn_user, turn_moti = [], []
 
             # Live API는 기본적으로 사용자 입력을 기다렸다가 응답한다 — 로봇이 먼저 인사를
@@ -166,9 +187,14 @@ async def run_conversation(name_state: dict, facts_summary: str | None, emotion_
                         sc = message.server_content
                         if sc and sc.interrupted:
                             speaker.stop_immediately()
+                            if shifter:
+                                shifter.reset()
 
                         if message.data:
-                            speaker.play(message.data)
+                            if shifter:
+                                shifter.feed(message.data)
+                            else:
+                                speaker.play(message.data)
 
                         if sc and sc.input_transcription and sc.input_transcription.text:
                             turn_user.append(sc.input_transcription.text)
@@ -187,6 +213,10 @@ async def run_conversation(name_state: dict, facts_summary: str | None, emotion_
                             await session.send_tool_response(function_responses=responses)
 
                         if sc and sc.turn_complete:
+                            if shifter:
+                                # 버퍼 임계값(기본 500ms) 미만으로 남은 발화 꼬리를 흘려보낸다
+                                # — 안 하면 매 턴 마지막 조각이 조용히 잘려나간다.
+                                shifter.flush()
                             u = "".join(turn_user).strip()
                             m_raw = "".join(turn_moti).strip()
                             m_clean, should_end = extract_exit_tag(m_raw)
@@ -203,12 +233,17 @@ async def run_conversation(name_state: dict, facts_summary: str | None, emotion_
                             break
 
             await asyncio.gather(send_loop(), recv_loop())
+            if shifter:
+                shifter.close()
+            if speaker.underrun_count:
+                print(f"⚠️ 스피커 언더런 {speaker.underrun_count}회, 총 {speaker.underrun_ms_total:.0f}ms 무음 재생됨 "
+                      f"— VoiceShifter 처리가 실시간을 못 따라간 신호. VOICE_SHIFT_BUFFER_MS를 늘려볼 것.")
 
     return session_history
 
 
 def main():
-    camera_index = int(sys.argv[1]) if len(sys.argv) > 1 else 1
+    camera_index = int(sys.argv[1]) if len(sys.argv) > 1 else 0
 
     try:
         from dotenv import load_dotenv
@@ -283,6 +318,13 @@ def main():
         port.closePort()
 
         final_name = name_state["name"]
+        if final_name:
+            # facts가 너무 많이 쌓였으면(v2의 batch_update_summary에 대응 — v3엔 없었음,
+            # docs/integration-points.md) 세션 종료마다 유사 항목을 병합/압축한다. forget_me로
+            # 이름 자체가 사라진 경우(final_name은 남아있어도 프로필은 이미 삭제됨) get_facts가
+            # 빈 리스트를 반환해 조용히 스킵된다.
+            profiles.consolidate_facts(final_name)
+
         if final_name and session_history:
             print("💾 대화 결과지를 생성합니다...")
             # 대화 중 remember_fact로 새로 저장된 사실을 반영하려면 세션 시작 전에

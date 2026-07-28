@@ -2,6 +2,61 @@
 
 `docs/architecture.md`의 로드맵(§10) 대비 실제 구현 상태를 기록한다. 설계 자체가 바뀌면 architecture.md를, 무엇을 언제 어떻게 만들었는지는 이 문서를 갱신한다.
 
+## (시도했다가 되돌림) 대화 중 팔/바퀴 배경 idle 움직임 (2026-07-28)
+
+"손이 너무 가만히 있다"는 요청으로 `hardware/idle_motion.py`(배경 스레드, Layer 1/2와 busy 공유)를 만들고, 이어서 "순수 확률 말고 판단에 맞게"라는 피드백으로 `set_emotion` 신호에 연동시키는 보강까지 했으나, **사용자가 최종적으로 전체 되돌림을 요청**해 커밋 전에 전부 제거함(`hardware/idle_motion.py` 삭제, `core/motion_tools.py`의 `busy` 파라미터·`core/emotion_tools.py`의 `shared_state` 파라미터·`launcher.py`의 관련 배선 전부 원상복구). 오프라인 로직 검증까지는 통과했었지만 실물 로봇에서 판단할 기회 전에 되돌려졌음 — 나중에 다시 시도한다면 이 기록과 `[[project-moti-v3-design]]` 참고.
+
+## 11단계 — 피치/포먼트 값 확정 + 실사용 언더런 대응 (2026-07-28)
+
+- **최종 파라미터 확정**: 10단계에서 준비한 4종 비교 페이지에 "살짝만 약화"(+3.5st/×1.12, 프로덕션과 같은 청크 방식) 버전을 추가해 사용자가 청취 후 확정. `media/voice_shift.py`의 `VOICE_PITCH_SEMITONES`/`VOICE_FORMANT_RATIO` 기본값과 `.env.example`을 4.0/1.15 → 3.5/1.12로 갱신.
+- **⚠️ 작업 중 사고**: 스모크 테스트 후 `user_profiles.json`을 "테스트 데이터 정리" 명목으로 `d.clear()`로 통째로 비웠다가, 그 안에 실제 사용자("조형민", 2026-07-28 13:14 실물 로봇 대화 — 마침 이 세션에서 다루던 카메라 문제를 실제로 겪은 대화였음)의 프로필이 섞여 있었음을 뒤늦게 발견. `.gitignore`라 git 복구 불가, 원본 대화록(`user_result/`)은 남아있어 복구 제안했으나 사용자가 복구는 안 해도 된다고 함. **교훈**: 이후로는 알고 있는 테스트 키(`__unit_test_user__` 등)만 골라서 제거하고, 절대 전체를 비우지 않기로 함.
+- **실사용 중 지직거림/음성 드롭 제보**: "심하진 않지만 가끔 한 번씩" 지직거림과 대화가 "먹히는"(순간 끊기는) 증상 발생. 진단: `media/voice_shift.py`의 500ms 청크 분석에서 청크 경계 자체는 이상 없음(10단계에서 실측 완료)을 이미 확인했었고, 이번엔 다른 가설(포먼트 워핑의 파이썬 루프가 GIL을 오래 잡아 지연을 유발하는가)을 벡터화 버전과 속도 비교로 검증 → **아니었음**(포먼트 워핑 자체는 전체 처리시간의 1% 미만, 벡터화해도 오히려 근소하게 느려짐 — 되돌림). 실제 원인으로 더 유력한 가설: 개발 PC 단독 벤치마크(500ms 청크 평균 156ms)와 달리, **실물 로봇은 얼굴추적(mediapipe/insightface)·모터·표정 UI 스레드가 CPU를 나눠 쓰므로 harvest 처리가 가끔 500ms를 넘겨 `Speaker`의 재생 큐가 마르는(언더런) 상황이 생길 수 있음** — 이게 "지직거림"과 "먹힘" 둘 다 설명 가능(무음 패딩 자체가 클릭처럼 들리고, 패딩 구간 자체가 "먹히는" 소리로 들림).
+  - `media/audio_manager.py`의 `Speaker`에 `underrun_count`/`underrun_ms_total` 카운터 추가(콜백 안에서는 `print` 같은 블로킹 I/O를 하면 안 되므로 카운터만 증가, `launcher.py`가 세션 종료 후 한 번에 요약 출력).
+  - `media/voice_shift.py`에 `VOICE_SHIFT_BUFFER_MS`(신규, 기본 500→**700**으로 상향) 추가 — 버퍼를 넉넉히 잡아 harvest가 가끔 느려져도 재생이 안 마르게 여유를 늘림(대신 발화 시작 지연이 조금 더 늘어남: 스모크 테스트로 3.53s→3.88s 확인, 트레이드오프 감수).
+  - **아직 실물 로봇(풀 로드 상황)에서 언더런 로그가 실제로 찍히는지, 700ms로 충분한지는 미확인** — 다음 실사용 때 세션 종료 시 "⚠️ 스피커 언더런 N회" 로그가 뜨는지 확인 필요. 뜨면 `VOICE_SHIFT_BUFFER_MS`를 더 올릴 것.
+
+## 10단계 — 카메라 인덱스 재수정 + 기계음 원인 진단 (2026-07-28)
+
+- **카메라 인덱스**: 사용자가 PC 본체 카메라를 꺼두기로 결정 → 로봇 카메라만 남으면서 실측(`cv2.VideoCapture`로 인덱스별 open 시도) 결과 index 1은 아예 안 열리고 index 0만 열림(예전엔 반대였음 — 그때는 본체 카메라가 살아있어서 로봇 카메라가 1번이었음). `vision/face.py`의 `face_tracker_worker` 기본값, `launcher.py`/`scripts/test_vision.py`/`scripts/test_vision_brain.py`의 기본 `camera_index`를 전부 1→0으로 되돌림. **하드웨어 연결 구성이 바뀌면(본체 캠을 다시 켜는 등) 또 달라질 수 있으니 재확인 필요.**
+- **목소리 기계음 진단**: 사용자가 "약간 기계음이 섞여있다"고 보고 → `media/voice_shift.py`의 500ms 청크 경계가 원인인지 실측(청크 경계 지점의 파형 진폭 점프를 전형적 인접샘플 변화량과 비교) → 경계 23곳 전부 점프 비율이 평균 1.14배로 정상 범위, 클릭성 이음매 아님을 확인. 즉 청크 나누는 방식 자체의 버그는 아님 — WORLD 보코더 재합성 자체의 특성이거나 포먼트 워핑 강도(×1.15) 때문일 가능성. 23초짜리 실제 발화로 원본/현재 설정(청크)/현재 설정(통짜)/약화 버전(+2st, ×1.08) 4종 비교 페이지를 만들어 사용자 청취 판단 대기 중 — **아직 결론 안 남, 사용자 피드백 필요**.
+
+## 9단계 — 목소리를 더 앳되게: Fenrir + 피치/포먼트 시프트 (2026-07-28)
+
+**배경**: Gemini Live TTS(옛 Typecast 대체)의 반응속도/응답 품질은 만족스러웠지만 목소리가 전부 성인 성우 음색이라 아쉬움 → 이 세션에서 실제 청취 비교를 거쳐 해결.
+
+- **탐색**: SDK(`google.genai.types`)에서 `SpeechConfig`/`VoiceConfig`/`PrebuiltVoiceConfig`(30종 프리셋) 확인, 공식 문서로 각 목소리의 톤 설명(Bright/Youthful/Upbeat 등) 확보. `ReplicatedVoiceConfig`(음성 복제)도 스키마에 있으나 실제로는 아직 출시 전 기능(Google AI Studio에 "Create Your Voice" 숨은 옵션 발견됐지만 미작동)이라 이번엔 배제.
+- **1차 시도(프롬프트 스타일 지시)**: 시스템 인스트럭션에 "귀엽고 하찮게" 톤 지시 추가 → 텍스트 자체는 애교스럽게 바뀌었으나(예: "공감 요정"), 맞춤법을 늘려쓰는 부작용 발견("모야아", "싶어어" — 사용자가 오히려 어색하다고 판단) → 맞춤법은 유지하고 톤/속도만 지시하도록 수정. 그래도 목소리 자체(성대 특성)는 프롬프트로 못 바꾼다는 한계 확인 — 어느 프리셋을 골라도 "성인이 애교 부리는" 인상에서 못 벗어남.
+- **2차 시도(오디오 후처리, 최종 채택)**: `pyworld`(WORLD 보코더)로 피치와 포먼트(성도 길이감)를 **동시에** 조작 — 피치만 올리면 속도까지 빨라진 "다람쥐 소리"가 되므로 반드시 둘 다 필요. 처리 속도 실측(개발 PC 기준, 500ms 청크): `pw.dio`는 평균 47ms/최악 65ms로 여유 있었지만, 실제 음성에서 "특별한" 같은 파열음 구간에서 피치를 잘못 검출해(짧고 모호한 유성음 구간에서 480~587Hz로 들쭉날쭉) 지글거리는 잡음이 생김 → 더 정확한 `pw.harvest`로 교체(평균 156ms/최악 280ms, 500ms 청크 기준으로도 여전히 실시간 예산 안). 재합성 결과물 피크가 원본보다 커지는 경향(관찰치 최대 +36%)이 있어 정규화(피크 0.98 이하로 스케일) 필수 — 안 하면 파열음 구간에서 하드클리핑 발생, 처음엔 이걸 놓쳐서 "특별한"에서 깨지는 문제가 재현됐었음.
+- **9개 프리셋 A/B 비교**(같은 문장, 같은 시프트 파라미터로 재캡처): Autonoe/Leda/Puck/Fenrir/Achird/Sadachbia/Zephyr/Laomedeia/Aoede. 사용자가 직접 들어보고 **Fenrir(원래 "Excitable" 톤) + 피치 +4반음 + 포먼트 ×1.15**를 1차로 선택 → **교수님 피드백으로 Zephyr(원래 "Bright" 톤)로 최종 교체**(같은 피치/포먼트 파라미터 유지, 2026-07-28). `launcher.py`의 `LIVE_VOICE_NAME` 기본값과 `.env.example` 둘 다 갱신, 스모크 테스트로 Zephyr 기준 재검증(첫 오디오 지연 3.74s로 Fenrir 때와 동일 수준).
+- **실제 통합**: `media/voice_shift.py`(신규) — `shift_pcm()`(단발 변환)과 `VoiceShifter`(스트리밍용, 전용 스레드에서 버퍼링 후 처리) 추가. Gemini는 아주 작은 청크로 오디오를 스트리밍하는데, 그 크기 그대로 harvest에 넣으면 이전의 DIO 지글거림과 같은 종류의 문제가 재발할 위험이 있어 500ms 단위로 버퍼링 후 처리(`buffer_ms` 파라미터화). pyworld 처리는 CPU 바운드 블로킹 작업이라 asyncio 이벤트 루프에서 직접 돌리면 recv_loop의 다른 이벤트 처리가 밀리므로, MicStreamer/Speaker와 같은 패턴으로 전용 스레드+큐를 씀. `launcher.py`에 연결: `speech_config`로 `LIVE_VOICE_NAME`(기본 Fenrir) 지정, `message.data` 수신 시 `speaker.play()` 대신 `shifter.feed()`, `sc.interrupted`(barge-in) 시 `speaker.stop_immediately()`와 함께 `shifter.reset()`(버퍼링 중이던 미처리 오디오 폐기 — 안 하면 끼어들기 후에도 이전 발화가 뒤늦게 나옴), `sc.turn_complete` 시 `shifter.flush()`(버퍼 임계값 미만 꼬리 조각 유실 방지).
+- **지연 실측**: `launcher.run_conversation()`을 로봇 없이 직접 호출하는 오프라인 스모크 테스트(motion_tools=[]/brain=None)로 실제 API를 통해 검증 — 시프트 끄면 첫 오디오까지 2.97s, 켜면 3.76s로 **약 0.79초 추가 지연**(예상했던 0.5~0.8초 범위와 일치). 스트리밍 자체가 계속 밀리는 건 아니고 발화 시작 시 한 번만 추가되는 지연.
+- `.env.example`에 `LIVE_VOICE_NAME`(기본 Fenrir), `ENABLE_VOICE_SHIFT`(기본 true), `VOICE_PITCH_SEMITONES`(4.0), `VOICE_FORMANT_RATIO`(1.15) 추가. `requirements.txt`에 `pyworld` 추가.
+- **검증 상태**: 오프라인(가짜 사인파)으로 `shift_pcm`/`VoiceShifter` 버퍼링·스레딩 로직 단위 테스트 통과, 실제 Gemini API로 `launcher.run_conversation()` 전체 경로(속도 로직 포함) 스모크 테스트 통과. **로봇 스피커로 실제 들어보는 최종 확인은 아직 필요** — 사용자가 다음에 실물로 확인 예정.
+
+## 8단계 — facts 정리 + 사용자 삭제 요청("내 정보 지워줘") 지원 (2026-07-28)
+
+ID 10 모터는 사용자가 "그냥 안 쓰는 모터"라고 확인해 조사 종료(`docs/integration-points.md` 참고). 남은 두 저우선순위 항목 중 facts 정리를 진행하면서, 사용자가 지적한 관련 문제를 함께 해결함: "유저프로필만 지우면 art_brain(얼굴인식)엔 얼굴이 남아서, 나중에 아는 얼굴인데 정보가 없는 상황이 생길 것 같다."
+
+- `core/profile_manager.py`에 `consolidate_facts(name, max_facts=20)` 추가. v2의 `batch_update_summary`처럼 LLM 1회 호출로 유사 field를 병합(예: "고민"/"요즘고민" → 하나)하고 개수를 압축한다. field가 자유형이라 이름만 다른 중복이 쌓이는 게 근본 원인이었음. 파싱 실패 등 어떤 이유로도 신뢰 못 할 결과가 나오면 원본을 그대로 두고 `False`를 반환 — 정리 실패가 데이터 손실로 이어지지 않게 방어. `launcher.py`가 세션 종료 시(`final_name`이 있으면 항상) 호출하도록 연결.
+  - 검증: 실제 Gemini API로 25개(의도적 중복 8개 + 필러 17개) facts를 넣고 실행 → 6개로 압축, "고민"/"요즘고민"과 "취미"/"hobby"가 정확히 하나씩으로 합쳐지고 name/grade/major/mbti 같은 신원 정보는 그대로 보존되는 것 확인.
+- **얼굴 데이터 삭제 동기화**: `vision/vision_brain.py`의 `RobotBrain`에 `forget_face(name)` 추가 — `FuzzyART`의 `W`/`labels`는 병렬 리스트라 인식 임계값(`RHO`) 드리프트로 같은 사람이 여러 카테고리로 나뉘어 저장돼 있을 수 있음(실제로 이런 상황이 생길 수 있다는 걸 사용자가 미리 짚어냄) → 이름이 일치하는 카테고리를 전부 필터링해서 제거하도록 구현(하나만 지우는 게 아님).
+- `core/memory_tools.py`에 `make_forget_me_tool(name_state, shared_state, brain)` 추가 — `remember_fact`와 같은 `name_state`를 공유해서, `profile_manager.forget_user(name)`(프로필 삭제)과 `brain.forget_face(name)`(얼굴 삭제)를 원자적으로 함께 호출하고 `name_state`/`shared_state`도 리셋(다음부터 다시 낯선 사람 취급). Gemini 툴 인자는 0개(현재 세션 상대가 곧 삭제 대상이므로 누구인지 명시할 필요 없음 — `remember_fact`와 같은 설계 원칙).
+- `launcher.py`의 `tools=[...]`에 `forget_me` 연결. `core/utils.py` 페르소나에 "삭제 요청을 받으면 되돌릴 수 없다고 한 번은 확인받고 나서 호출" 지시 추가 — 지나가는 말/농담으로 삭제되는 사고 방지.
+- 검증: 오프라인 유닛 테스트(가짜 `RobotBrain`)로 `remember_fact` → `forget_me` 흐름 전체(프로필 삭제, `name_state["name"]`/`shared_state['detected_user']` 리셋, 이름 미확정 상태에서 호출 시 안전한 no-op) 확인. `FuzzyART` 필터 로직도 별도로, 같은 이름의 중복 카테고리 2개가 동시에 제거되고 나머지 1명은 안전하게 남는 것 확인. 실제 로봇 없이 검증 가능한 부분은 전부 확인함 — 실제 대화에서 "내 정보 지워줘" 발화로 트리거되는지는 사용자가 로봇으로 확인 필요.
+
+### 8단계 코드 리뷰 — 동시성 버그 발견 및 수정 (같은 날, 2026-07-28)
+
+사용자 요청으로 방금 작성한 코드를 전체 재점검, 실제 버그 1건을 재현·수정하고 안정성 1건을 보강함.
+
+1. **`RobotBrain.forget_face`의 스레드 레이스(실제로 재현됨)**: `face_tracker_worker`(백그라운드 스레드)가 1초에 한 번 `recognize_face()`→`self.art.predict()`로 `self.art.W`/`labels`를 계속 읽는데, `forget_face`는 이 두 리스트를 새 리스트로 통째로 교체(축소)한다. 기존 `learn()`은 리스트를 append만 해서 안전했지만(인덱스가 항상 유효하게 유지됨), `forget_face`는 처음으로 리스트를 줄이는 연산이라 그 사이에 다른 스레드가 `predict()` 중이면 `IndexError`가 날 수 있음 — 실제로 4개 스레드가 `predict()`를 반복 호출하는 동안 `forget_face()`를 호출해 `IndexError: list index out of range`를 100% 재현함. `RobotBrain.__init__`에 `self._lock = threading.Lock()`을 추가하고 `recognize_face`/`register_face`/`forget_face` 세 메서드 전부(FuzzyART를 건드리는 부분만) 이 락으로 감싸 직렬화 — 같은 스트레스 테스트(4스레드 동시 predict + 동시 forget_face)를 다시 돌려 에러 없음을 재확인함.
+   - **이 테스트 중 실제 `art_brain.pkl`을 테스트 데이터로 덮어쓴 사고 발생** — `forget_face`가 `save_brain()`으로 즉시 디스크에 쓰기 때문에, 테스트에 쓴 가짜 라벨(`race_test_user`/`other_user`)이 실제 파일에 남았음. 다행히 테스트 시작 시점 `RobotBrain()` 초기화 로그가 "기억된 얼굴 수: 0"이었던 것으로 실 데이터가 없었음을 확인할 수 있어, 파일을 `{'W': [], 'labels': []}` 빈 상태로 되돌려 원상복구함(실 데이터 손실 없음, 로그로 확인된 사실에 근거). **교훈**: 다음에 `RobotBrain`/`art_brain.pkl`을 실제 인스턴스로 테스트할 땐 반드시 파일을 백업하거나 격리된 경로로 리다이렉트할 것.
+2. **`consolidate_facts`의 JSON 파싱 보강**: 코드펜스 제거(```` ``` ````) 뒤에도 모델이 여분의 설명을 덧붙이면 `json.loads`가 실패할 수 있었음(실패해도 원본을 지키는 안전장치는 이미 있었지만, 정리 자체가 매번 스킵될 위험) — 1차 파싱 실패 시 첫 `[`부터 마지막 `]`까지만 잘라 한 번 더 시도하는 폴백 추가.
+- `google.generativeai`가 `genai.configure()` 없이도 `.env`의 `GOOGLE_API_KEY`를 자동으로 읽는지(`report_manager.py`가 이미 그렇게 쓰고 있어 `consolidate_facts`도 같은 패턴을 그대로 따름) 실제 API 호출로 재확인함 — 문제 없음.
+
+## 7단계 — 고아 코드 정리 (2026-07-28)
+
+전체 코드베이스 재분석 중 `display/subtitle.py`(tkinter 자막 창)와 `display/fonts/`(번들 폰트 4종)가 `launcher.py`를 비롯한 어떤 코드에서도 import되지 않는 완전한 고아 코드임을 확인(자막 기능 자체는 2026-07-27에 이미 불필요 판정됐지만 코드는 삭제하지 않고 남아있었음). 삭제함. `requirements.txt`의 `screeninfo`는 `vision/face.py`(카메라 미리보기 창 배치)가 별도로 쓰고 있어 그대로 둠 — `display/common_helpers.py`는 12개 감정 모듈이 모두 참조하는 활성 코드라 고아 아님(초기 분석에서 오분류했다가 재확인으로 정정).
+
 ## 6단계 — 실물 로봇 연결 및 통합 완료 (2026-07-27)
 
 **로봇이 처음으로 실제 연결된 세션.** §10 로드맵상 "로봇 연결 대기 중"이던 항목들(Layer 1 실물 검증, `vision/face.py` 실물 검증, Layer 2, `launcher.py` 승격, 얼굴인식↔추적 통합)을 이 한 세션에서 전부 끝냈다. 사용자가 직접 로봇으로 테스트하며 진행 — 그때그때 발견된 버그를 바로 고치는 식으로 진행됨.
