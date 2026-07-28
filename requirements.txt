@@ -19,6 +19,7 @@ sounddevice
 numpy
 scipy  # media/audio_manager.py의 AEC 원단 리샘플링(24kHz->16kHz)에 사용
 aec-audio-processing  # 에코캔슬레이션(WebRTC AEC3 바인딩) — media/audio_manager.py
+pyworld  # 목소리 피치/포먼트 시프트(WORLD 보코더) — media/voice_shift.py
 
 # 표정 UI
 pygame

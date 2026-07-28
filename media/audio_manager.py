@@ -98,6 +98,11 @@ class Speaker:
         self._aec = echo_canceller
         self._q: "queue.Queue[bytes]" = queue.Queue()
         self._leftover = b""
+        # 큐가 말라서 무음으로 메꾼 횟수/총 길이 — 실시간 콜백 안에서는 print 같은 블로킹
+        # I/O를 하면 안 되므로(그 자체가 다음 콜백을 더 지연시켜 언더런을 악화시킬 수 있음)
+        # 그냥 카운터만 늘리고, 세션이 끝난 뒤 launcher.py가 요약해서 한 번만 출력한다.
+        self.underrun_count = 0
+        self.underrun_ms_total = 0.0
         self._stream = sd.OutputStream(
             samplerate=OUTPUT_RATE, channels=1, dtype="int16",
             blocksize=2400, callback=self._callback,
@@ -112,7 +117,11 @@ class Speaker:
             except queue.Empty:
                 break
         chunk, self._leftover = buf[:need], buf[need:]
-        chunk = chunk + b"\x00" * (need - len(chunk))
+        shortfall = need - len(chunk)
+        if shortfall > 0:
+            self.underrun_count += 1
+            self.underrun_ms_total += (shortfall / 2) / OUTPUT_RATE * 1000
+        chunk = chunk + b"\x00" * shortfall
         if self._aec is not None:
             self._aec.push_far(chunk)
         outdata[:] = np.frombuffer(chunk, dtype="int16").reshape(-1, 1)
