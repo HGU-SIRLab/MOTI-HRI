@@ -49,7 +49,10 @@ def _as_int(v, default=None):
 def face_tracker_worker(port: PortHandler, pkt: PacketHandler, lock: threading.Lock,
                         stop_event: threading.Event, video_frame_q: queue.Queue,
                         shared_state: dict,
-                        camera_index: int = 1,
+                        # PC 내장캠을 꺼둔 뒤로는 로봇 카메라 하나만 남아 index 0으로 잡힘
+                        # (2026-07-28, cv2.VideoCapture로 실측 확인 — 내장캠이 다시 켜지면
+                        # 재확인 필요할 수 있음).
+                        camera_index: int = 0,
                         draw_mesh: bool = True,
                         print_debug: bool = True,
                         brain=None):

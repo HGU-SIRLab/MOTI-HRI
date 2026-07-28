@@ -38,7 +38,7 @@ def open_port() -> tuple[PortHandler, PacketHandler]:
 
 
 def main():
-    camera_index = int(sys.argv[1]) if len(sys.argv) > 1 else 1
+    camera_index = int(sys.argv[1]) if len(sys.argv) > 1 else 0
 
     port, pkt = open_port()
     lock = threading.Lock()
