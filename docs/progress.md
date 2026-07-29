@@ -2,6 +2,108 @@
 
 `docs/architecture.md`의 로드맵(§10) 대비 실제 구현 상태를 기록한다. 설계 자체가 바뀌면 architecture.md를, 무엇을 언제 어떻게 만들었는지는 이 문서를 갱신한다.
 
+### 16단계+15단계 재점검 3 — 직전 수정 재검토로 실제 버그 1건 + 놓쳤던 피드백 1건 반영 (같은 날)
+
+"재점검 2"에서 고친 것 자체를 다시 검증하다가 실제 버그 1건을 더 찾음 + 직전 대화 로그 끝에 붙어 있어서 놓쳤던 피드백 1건을 반영.
+
+1. **가드 메시지 개선이 죽은 코드였음**: `resolve_user_guess`의 새 가드를 `if not self.active or self.current_question is None: return "퀴즈가 진행 중이 아닙니다"` → `if self.mode is None: return "먼저 select_quiz_mode를 호출하세요"` 순서로 넣었는데, `mode is None`이면 `index`도 항상 `-1`(둘 다 `choose_mode()`가 같이 세팅)이라 `current_question`도 항상 `None`이 됨 — 즉 **정확히 고치려던 그 상황(모드 선택 없이 사진 나온 척한 경우)에서 새 메시지가 절대 도달하지 못하고 항상 앞의 일반 메시지에 먼저 걸림**. `mode is None` 체크를 `current_question is None` 체크보다 먼저 오도록 순서를 바꿔서 수정. `scripts/test_quiz_state.py`에 회귀 테스트 추가(select_quiz_mode를 의도적으로 건너뛰고 submit_guess를 호출해 "select_quiz_mode" 문자열이 포함된 구체적 메시지가 오는지 확인) — 순서를 되돌리면 이 테스트가 바로 실패함.
+2. **(놓쳤던 사용자 피드백) 척척박사 모드가 오답에 너무 따뜻하게/웃으며 반응함**: 직전 대화 로그 맨 끝에 사용자가 "척척박사 모드가 생각보다 공감을 너무 잘해(하하하 똥이라니 등). 딱딱하게 정답은 무엇무엇입니다 라고 말하게 세팅되면 좋겠어"라고 남긴 걸 로그 뒤에 붙어있어서 놓치고 답변 안 했었음 — 실제 로그에도 "하하, 갈색 똥이라니 재미있는 추측이네요!"가 찍혀 있었음. 이건 단순 톤 취향이 아니라 **모드 간 조작 대비(manipulation check)를 흐리는 문제**(척척박사가 하찮미처럼 따뜻하게 굴면 두 모드의 지각된 차이가 옅어짐) — `resolve_user_guess`의 all_knowing/annoying 공유 오답 피드백 문구에 "오답이 엉뚱해도 웃거나 공감하거나 놀리지 말고 담백하고 딱딱하게 정답만 전달"을 명시. **실 API로 확인**(척척박사 모드로 "갈색 똥"이라고 답한 시나리오): "정답은 '먼지떨이'입니다. 틀리셨네요. 퀴즈에 참여해주셔서 감사합니다." — 이전의 "하하, 재미있는 추측이네요!" 패턴 없이 담백하게 나옴.
+
+재검증: `test_quiz_bank/state/tools/idle_watcher/snore_clip.py` 오프라인 전부 재통과 + `test_quiz_live.py`(annoying 모드 지연 주입 회귀 확인, 여전히 정상) + all_knowing 톤 확인용 1회성 스크립트로 실 API 스팟체크(수치화된 assert는 아님 — LLM 출력이라 매번 문구가 다를 수 있어 회귀 스위트에는 안 넣음, 사람이 눈으로 확인하는 용도).
+
+### 16단계+15단계 재점검 2 — 실물 로봇 테스트에서 나온 버그 2건 + 사양 변경 1건 (2026-07-29)
+
+사용자가 실물 로봇으로 전체 기능을 테스트하다가 발견한 문제 3가지.
+
+1. **퀴즈 종료 후 재시작하면 화면이 먹통이 됨(가장 심각)** — 실제 대화 로그로 원인 특정: 모델이 첫 퀴즈를 다 끝낸 뒤 사용자가 "2번 모드로 다시 하고 싶어"라고 하자 "2번 모드로 시작해 볼게요! 화면에 첫 번째 사진이 나갑니다"라고 **말은 했지만 실제로는 `select_quiz_mode()`를 호출하지 않았음**(로그에 해당 tool 호출 자체가 없음). `core/quiz_state.py`는 정확히 설계대로 동작했음(모드가 없으니 화면에 아무것도 안 뜨고, 뒤이은 `submit_guess`도 전부 거부됨) — 버그는 코드가 아니라 **모델이 말로만 진행한 척하고 실제 툴 호출을 빼먹은 것**. 이후 사용자가 "정답 확인해줘"라고 요구하자 모델이 `submit_guess(speaker="robot", ...)`까지 지어내 말하고 실제로 호출했지만(`session.mode`가 여전히 None이라) 역시 거부됨. 두 가지로 대응: (a) `core/quiz_state.py`의 `resolve_user_guess`/`resolve_robot_guess`/`request_hint` 가드 메시지를 "무시하세요"류의 막연한 문구 대신 **"아직 모드가 선택되지 않았습니다 — 먼저 select_quiz_mode(mode=...)를 호출하세요"**로 구체화해서, 모델이 실수해도 다음 툴 응답을 보고 스스로 정정할 수 있는 발판을 마련. (b) `core/utils.py`의 퀴즈 지시 블록에 "모드 번호를 말할 때마다(재시작 포함) 반드시 실제로 호출, 호출 전에는 사진이 나왔다고 말하지 말 것 — 실제로 이 사고가 발생했었음"을 명시적으로 추가. 완전한 예방은 LLM 툴 호출 신뢰성의 한계상 보장 못 하지만, 재발 시 스스로 복구할 경로를 만들어둔 것.
+2. **퀴즈가 끝나자마자 곧바로 SLEEPY로 전환됨** — 원인: `idle_watcher()`가 퀴즈 진행 중엔 "sleep 판정"만 건너뛰고 `last_activity_time`은 갱신하지 않고 있었음 → 퀴즈 문제를 오래 들여다보며 대답을 고민하는 조용한 구간(사용자든 로봇이든 소리가 없는 시간)이 15초 넘게 누적돼도 퀴즈 중엔 무시되다가, 퀴즈가 끝나 `quiz_active`가 꺼지는 순간 그 누적된 `idle_for`가 그대로 드러나 곧바로 SLEEPY가 발동함(실제 로그로 재현: "이걸로 모든 문제가 끝났습니다" 직후 바로 "💤 ... sleepy 상태로 전환"). 수정: 퀴즈 진행 중엔 `last_activity_time`을 매 tick마다 계속 갱신하도록 변경(퀴즈 자체를 "활동 중"으로 취급) — 퀴즈가 끝난 시점부터 새로 IDLE_SLEEP_SEC초를 센다.
+3. **(버그 아님, 사양 변경) SLEEPY 진입 기준을 15초 → 40초로.** 사용자가 실사용해보니 15초는 너무 짧다고 판단, `core/idle_watcher.py`의 `IDLE_SLEEP_SEC` 상수만 변경(로직은 그대로).
+
+재검증: `scripts/test_idle_watcher.py`(임계값이 상수 참조라 자동으로 40초 기준 재검증됨) + `scripts/test_quiz_state.py`/`test_quiz_tools.py` 재통과(가드 메시지 문자열을 assert하는 테스트가 없어 안전하게 변경됨).
+
+### 16단계+15단계 재점검 — 실제 버그 2건 + 워크플로 개선 1건 (2026-07-29)
+
+사용자 요청으로 퀴즈 모드/정답공개/idle-sleep 전체를 다시 점검, 실제 버그 2건을 추가로 발견해 수정(`core/quiz_tools.py`).
+
+1. **`select_quiz_mode`를 두 번 부르면 index가 0으로 리셋됨**: 모델이 실수로(또는 사용자가 모드 번호를 재확인시켜서) `select_quiz_mode`를 두 번 호출하면 `QuizSession.choose_mode()`가 `index=0`으로 되돌리면서 이미 진행하던 문제들이 다시 나오고, 그 결과 같은 question_id가 연구 결과 로그(export_log)에 중복 기록될 위험이 있었음(연구 데이터 무결성 문제) — `start_quiz()`의 재시작 가드와 같은 패턴으로 `session.mode is not None`이면 재선택을 거부하도록 수정.
+2. **무효 호출에도 정답 공개(reveal) 화면이 잘못 뜸**: `resolve_user_guess`/`resolve_robot_guess`가 상황이 안 맞아(퀴즈 비활성, `pending_user_guess` 없음 등) 아무 기록도 안 남기고 안내문만 반환하는 경우에도, `submit_guess` 래퍼는 무조건 `_push_reveal()`+`_schedule_reveal_transition()`을 호출하고 있었음 — 아직 안 풀린 문제인데 "정답 공개" 화면이 뜨는 사고. `len(session.results)`가 실제로 늘었을 때만(진짜로 전진했을 때만) reveal을 띄우도록 수정.
+3. **(버그는 아니지만 워크플로 개선) `scripts/build_quiz_bank.py`가 이미 등록된 문제엔 원본 사진을 나중에 추가해도 못 채워 넣음** — 크롭 사진과 원본 사진을 항상 같이 준비한다는 전제였는데, 실제로는 원본을 나중에 챙기는 경우도 있을 수 있어 이미 등록된 id라도 `full_image_path`가 비어있고 `source_full/`에 그 사이 파일이 생겼으면 채워 넣도록 개선(`_process_full_image()` 헬퍼로 신규/백필 경로 공유).
+
+테스트 추가 중 **테스트 코드 자체의 버그**도 하나 발견: 기존 "advancing past a question cancels its pending stall injection" 테스트(`start4` 세그먼트)가 `submit4(...)` 호출 뒤 reveal 메시지 하나만 비우고 `REVEAL_HOLD_SEC` 경과로 밀려오는 다음-문제 메시지는 안 비운 채 다음 테스트 세그먼트로 넘어가서, 공유 큐(`quiz_ui_q`)에 메시지가 남아 이후 세그먼트("no spurious reveal" 등)를 오염시켰음 — 해당 세그먼트에서 전환 메시지까지 마저 비우도록 수정.
+
+재검증: `scripts/test_quiz_tools.py`에 케이스 5개 추가(모드 재선택 거부/유지, 무효 로봇추측 무시+reveal 안 뜸, 퀴즈 자연종료 후 재제출 무시) — 전부 통과. `scripts/build_quiz_bank.py`의 백필 로직은 임시 디렉터리로 직접 스모크 테스트(입력 프롬프트 없이 완료되는지까지 확인).
+
+## 16단계 — 기본 대화 상태 idle-sleep (2026-07-29)
+
+사용자 요청: 퀴즈 모드가 아닌 기본 대화 상태에서 사용자가 15초간 아무 말도 안 하면 모든 행동(팬/틸트 추적 포함)을 멈추고 SLEEPY로 전환, 사용자가 다시 말하면 AWAKENING을 거쳐 깨어나게. SLEEPY/AWAKENING(WAKE) 표정은 v1(`C:\cap_dev\capston_mk1\motirobotics\display\emotions\{sleepy,wake}.py`)에 이미 있었던 것을 재이식 — v3 포팅 당시 "불필요한 감정"이라 빠져 있었음.
+
+- **판단 로직 분리**: `core/idle_watcher.py`(신규, 순수 함수) — `decide_idle_action(idle_for, is_sleeping, quiz_active) -> "wake"|"sleep"|"none"`. `quiz_state.py`와 같은 이유로 asyncio/세션 몰라도 유닛테스트 가능하게 분리(`scripts/test_idle_watcher.py`로 8개 케이스 검증, API/로봇 불필요). **깨우기는 퀴즈 진행 여부와 무관하게 항상 최우선** — 자다가 바로 "퀴즈 풀자"로 시작해도 SLEEPY에 갇힌 채 퀴즈가 진행되는 사고를 막기 위함.
+- **`launcher.py`**: `run_conversation()`에 `idle_watcher()` 코루틴 추가(`asyncio.gather(send_loop(), recv_loop(), idle_watcher())`). `recv_loop()`가 이미 받고 있던 `sc.input_transcription.text`(사용자 발화 텍스트)를 그대로 재사용해 `last_user_speech_time`을 갱신 — 로컬 마이크 에너지 기반 VAD를 새로 만들 필요 없이 기존 신호에 얹었다. 매초 폴링해 `decide_idle_action()` 결과에 따라 `shared_state['mode']`를 `'sleeping'`/`'tracking'`으로 바꾸고(vision/face.py가 `'tracking'`이 아닌 모드는 추적을 자동으로 건너뜀 — 퀴즈 모드의 시선회피 모션과 완전히 같은 메커니즘, 신규 수정 없음) `emotion_queue`에 `"SLEEPY"`/`"AWAKENING"`을 push.
+- **AWAKENING을 명시적으로 NEUTRAL로 되돌리지 않음(의도적)**: `display/emotions/wake.py`의 애니메이션(약 2.5초)이 끝나면 내부적으로 `neutral.Emotion().draw()` + 높이 0인(보이지 않는) 눈꺼풀 오버레이만 남아 시각적으로 NEUTRAL과 동일해짐 — 굳이 되돌리는 코드를 추가하면, 마침 그 사이 모델이 `set_emotion`으로 진짜 감정(예: HAPPY)을 반영했는데 뒤늦게 도착한 "NEUTRAL" push가 그걸 덮어써버리는 경쟁 상태가 생길 뻔했음 — 애초에 안 만드는 쪽으로 설계.
+- **`display/main.py`**: `SLEEPY`/`AWAKENING` 감정 등록. 기존 "30초 지나면 자동으로 NEUTRAL로 복귀" 타이머에서 `SLEEPY`만 예외 처리(그 타이머를 안 뺐으면 몇 분이든 유지돼야 할 SLEEPY가 30초 만에 풀려버려 기능이 무력화됨). 블링크 오버레이도 `SCANNING`과 같이 `SLEEPY` 제외(sleepy.py가 이미 자체적으로 눈을 감은 아크만 그려서, 위에 깜빡임 사각형이 덧그려지면 어색해짐).
+- v1 원본엔 이 상태기계 자체가 표정 앱(main.py) 안에 자체 타이머 + 터치/핫워드로 깨우는 방식으로 내장돼 있었지만(v3엔 터치스크린도 로컬 핫워드 디텍터도 없음), v3는 이미 Live API의 `input_transcription`이라는 더 나은 신호가 있고 `run_conversation()`이 중앙에서 조율하는 구조라 판단 로직을 `launcher.py`/`core/idle_watcher.py`로 옮겨왔다(표정 앱은 순수하게 emotion_queue 명령을 그리기만 하는 기존 역할 그대로 유지).
+- 오프라인 검증: `scripts/test_idle_watcher.py`(순수 로직 8케이스) + `display/main.py`를 더미 SDL 드라이버로 직접 구동해 SLEEPY→AWAKENING 전환이 크래시 없이 렌더링되는지 확인. `scripts/test_display.py`에 `sleepy`/`awakening` 디버그 전용 입력 추가(모델이 직접 부를 수 있는 `core/emotion_tools.py`의 `VALID_EMOTIONS`엔 포함 안 시킴 — `CLOSE`와 같은 시스템 전용 상태로 취급).
+
+**아직 안 된 것**: 실물 로봇 통합 실행(마이크로 15초 침묵 만들어서 실제로 SLEEPY 진입/AWAKENING 복귀까지 확인), `scripts/test_display.py`로 실제 화면에서 SLEEPY(Zzz+침)/AWAKENING(눈뜨는 애니메이션) 눈으로 확인 — 둘 다 사용자가 다음에 확인 예정.
+
+**같은 날 추가(1) — "로봇이 뭔가 하고 있는 중"도 활동으로 인정.** 사용자 지적: 로봇이 말하거나 춤추거나 퀴즈 리액션 모션을 하는 동안은 사용자가 15초간 조용해도 SLEEPY가 되면 안 됨(원래는 `sc.input_transcription`, 즉 사용자 발화만 idle 타이머를 갱신하고 있었음 — 로봇이 긴 응답을 말하거나 춤을 추는 동안은 그 자체로 15초를 넘길 수 있어 사고 위험). `last_user_speech_time` → `last_activity_time`으로 개념 확장: (1) `recv_loop()`의 `message.data`(로봇 음성 청크 도착) 처리부에서도 갱신, (2) `idle_watcher()`가 매 tick마다 `quiz_busy`(Layer 1/2 제스처와 퀴즈 리액션이 공유하는 busy 게이트, `core/motion_tools.py`/`core/quiz_tools.py` 참고)가 set돼 있으면 갱신. `core/idle_watcher.py`의 `decide_idle_action()` 순수 함수 자체는 안 바뀜(입력값 `idle_for`를 계산하는 쪽만 더 정확해짐) — 기존 오프라인 테스트 그대로 재통과.
+
+**같은 날 추가(2) — SLEEPY 배경음("드르렁... 쿠우...").** 사용자 요청: SLEEPY 상태에서 1초 간격으로 코골이 소리를 반복 재생. 매번 실시간으로 Live API를 불러 말하게 하면 반복 간격이 API 응답 지연에 따라 들쭉날쭉해지고 낭비이기도 해서, `scripts/generate_snore_audio.py`(신규, GOOGLE_API_KEY 필요, 1회성)로 미리 한 번만 생성해 `assets/audio/snore.wav`에 캐싱하는 방식 채택 — launcher.py와 같은 `LIVE_VOICE_NAME`(Zephyr) + `media/voice_shift.py`의 같은 피치/포먼트 설정을 그대로 적용해 평소 목소리와 톤이 어긋나지 않게 함(실제로 생성해서 2.62초짜리 클립 확보, 사용자에게 미리듣기로 전달함). `launcher.py`의 `_load_snore_clip()`이 이 캐시 파일을 읽어(포맷 불일치/파일 없음이면 안전하게 스킵) `snore_player()` 코루틴이 SLEEPY인 동안 `speaker.play(snore_pcm)` → `SNORE_GAP_SEC`(1초) 대기 → 반복. 깨어나는 순간(`idle_watcher()`의 wake 분기)엔 `speaker.stop_immediately()`로 즉시 끊음(다음 폴링까지 기다리면 깬 직후에도 잠깐 더 들릴 수 있어서). `scripts/test_snore_clip.py`(신규, 오프라인)로 `_load_snore_clip()`의 파일없음/샘플레이트불일치/스테레오거부/정상로딩 케이스 검증.
+
+**아직 안 된 것(배경음)**: 실물 로봇에서 실제로 들어보고 타이밍/음량/톤이 자연스러운지 확인 — 사용자가 다음에 확인 예정.
+
+## 15단계 — 퀴즈 모드(하찮미 실험 2차: 부분 확대 사진 퀴즈) (2026-07-28)
+
+1차 논문(N=14, 가위바위보)이 표본이 작고 상관관계 수준이라 해외 학술지엔 근거가 약했음 → N=30, 3조건(척척박사/하찮미/짜증유발) 간 ANOVA 비교가 가능한 통제된 실험으로 재설계(`소셜 로봇 의도적 비완전성 실험 설계.docx`). "부분 확대 사진 퀴즈"를 과업으로 채택. 계획은 `C:\Users\goodj\.claude\plans\abstract-beaming-mountain.md`에 남아있음(Explore+Plan 서브에이전트로 코드베이스 검증 후 작성, 사용자 승인 후 구현). **기존 기본 대화 상태(페르소나/remember_fact/set_emotion/제스처/목소리 시프트/카메라/AEC)는 전혀 건드리지 않고 순수 추가만 했음** — 회귀 테스트로 확인.
+
+**핵심 아키텍처 통찰**: Gemini Live API의 `system_instruction`/`tools`는 `connect()` 시점에 한 번만 고정된다(SDK 소스로 직접 확인 — `AsyncSession`엔 이를 바꾸는 메서드가 없음). 그래서 모드별로 다른 툴/프롬프트를 쓰는 게 아니라, **고정된 툴 하나의 반환값을 `core/quiz_state.py`의 `QuizSession.mode`에 따라 런타임에 다르게 만든다** — `remember_fact`가 `name_state["name"]`에 따라 분기하는 것과 같은 패턴의 확장.
+
+**새 파일**:
+- `core/quiz_bank.py` — `QuizQuestion`, `judge_guess()`(조사 제거+유의어+`difflib` 퍼지 매칭, "모르겠어요"류 별도 구분).
+- `core/quiz_state.py` — `QuizSession` 상태 기계. 모든 참가자에게 같은 문제/순서(셔플 안 함, 5문제 기본). `start/choose_mode/resolve_user_guess/resolve_robot_guess/request_hint/end_early`가 각각 모델에게 줄 히든 지시문을 반환. `MODE3_REFUSAL_LINE` 상수("저는 AI 로봇이라 그런 답변은 할 수 없습니다.") 정의.
+- `core/quiz_tools.py` — `make_quiz_tools()`가 `start_quiz`/`select_quiz_mode`/`submit_guess`/`request_hint`/`end_quiz_early` 5개 Gemini 툴 생성. 짜증유발 모드의 10~12초 스톨+거절 대사는 `request_hint()`가 즉시 반환(동기 tool_call 제약) 후 `loop.create_task()`로 지연 예약, `inject_turn()` 콜백(`session_holder` 가변 딕셔너리로 아직 없는 session 객체를 나중에 참조)이 실제 발화 시점에 `session.send_client_content()`로 히든 턴 주입.
+- `display/quiz_window.py` — 삭제됐던 `display/subtitle.py`와 동일 패턴(별도 `multiprocessing.Process` + Tkinter + Queue + `screeninfo`)으로 확대사진 표시. `display/main.py`의 pygame 얼굴 UI와 완전히 다른 프로세스라 서로 안전.
+- `scripts/build_quiz_bank.py` — 연구자가 미리 크롭한 사진(`assets/quiz/source/`)에 정답/유의어/힌트를 대화형으로 입력해 `assets/quiz/questions.json` 생성(반자동 — 자동 크롭 아님, 공정성 때문에 크롭 지점은 연구자 판단 필요).
+- 테스트 5종: `test_quiz_bank.py`/`test_quiz_state.py`/`test_quiz_tools.py`(오프라인, API 불필요) + `test_quiz_live.py`(실 Gemini API, 로봇 불필요) + `test_quiz_window.py`(UI 눈으로 확인).
+
+**모션 추가(`hardware/motion.py`)**: `play_look_away_motion`(부끄러움 — 기존 `HEAD_PAN_OFFSET` 재사용), `play_thinking_stall`(짜증유발 스톨 — 기존 `_perform_shoulder_dance`를 느리고 작은 진폭으로 재사용, `amplitude_scale` 파라미터 신규 추가). "뿌듯함"은 신규 코드 없이 기존 `express_gesture(intensity=1.0)` 양팔 조합만 사용. `core/motion_tools.py`에 `busy` 파라미터 추가해 Layer 1/2와 퀴즈 리액션이 busy 게이트를 공유(충돌 방지).
+
+**페르소나(`core/utils.py`) 발견한 충돌**: 기존 "차가운 AI 말투 차단" 규칙이 "저는 AI라서..." 식 거절을 금지하는데, 짜증유발 모드의 필수 대사와 정면 충돌 — 새 블록에 이 특정 문장만 그 규칙의 예외로 명시.
+
+**실 API 검증(`test_quiz_live.py`) 완료**: "심심한데 퀴즈 풀자" → `start_quiz` 호출 → "3번 짜증유발" → `select_quiz_mode(annoying)` → "힌트 줘" → `request_hint()` → 필러만 말하고 대기 → **~10초 후 정확히 "저는 AI 로봇이라 그런 답변은 할 수 없습니다."를 토씨 하나 안 틀리고 발화** — 페르소나의 일반 규칙을 뚫고 예외가 정확히 작동함을 실측 확인. 이 계획에서 유일하게 "API 동작 자체가 불확실했던" 부분이 검증됨.
+
+**아직 안 된 것 / 사용자 확인 필요**:
+- `assets/quiz/questions.json`은 현재 임시 플레이스홀더 2문제(단색 이미지)뿐 — 실제 사물 사진으로 `scripts/build_quiz_bank.py`를 돌려 교체 필요.
+- 신규 모션(시선 회피, 생각 스톨) 실물 로봇 동작 확인 안 됨 — `scripts/test_motions.py`의 7/8번 메뉴로 확인 가능.
+- `display/quiz_window.py`의 실제 모니터 배치/이미지 스케일 눈으로 확인 안 됨 — `scripts/test_quiz_window.py`로 확인 가능(`QUIZ_WINDOW_MONITOR_INDEX` env var로 모니터 지정).
+- 로봇 연결 상태에서 `launcher.py` 전체 통합 실행(실제 음성으로 퀴즈 트리거→모드 선택→답변까지)은 미검증 — 사용자가 실물로 확인 예정.
+
+### 15단계 추가 — 정답 공개 때 원본(크롭 전) 사진 표시 (2026-07-29)
+
+사용자 피드백: "정답을 알려줄 때 원본 사진을 보여주면서 공개하는 게 좋을 거 같다" — 기존엔 정답 공개가 텍스트(음성)로만 이뤄지고 화면은 곧바로 다음 문제로 넘어갔음(사실 `display/quiz_window.py`엔 `"reveal"` 메시지 타입이 처음부터 정의돼 있었지만 **어디서도 실제로 전송되지 않고 있었음** — 텍스트만 세팅하고 이미지는 안 보여주는 미완성 상태였던 것도 이번에 같이 고침).
+
+- `core/quiz_bank.py`의 `QuizQuestion`에 `full_image_path: str | None = None` 추가(구형 데이터/원본 없는 문제는 `None` → fallback으로 크롭 사진 재사용). `load_question_bank()`도 상대경로 fallback 해석을 `image_path`와 동일하게 적용.
+- `core/quiz_tools.py`: `submit_guess()`가 `resolve_user_guess`/`resolve_robot_guess` 호출로 `session.current_question`이 다음 문제로 넘어가기 **전에** 방금 답한 문제를 붙잡아뒀다가(`answered_question`), 채점 직후 `{"type": "reveal", "image_path": ..., "text": "정답: ..."}`를 UI에 push. 곧바로 다음 문제를 보여주면 리빌이 화면에 뜨자마자(폴링 주기 150ms 안에) 다음 문제로 덮여버려 원본 사진을 볼 시간이 없으므로, `REVEAL_HOLD_SEC`(기본 4초) 뒤에 `loop.create_task()`로 다음 문제/hide 전환을 지연 예약 — 짜증유발 모드 스톨 지연 주입과 같은 패턴(`_pending_reveal_transition` 딕셔너리로 태스크 참조 유지 + `submit_guess`/`select_quiz_mode`/`start_quiz`/`end_quiz_early` 진입 시 취소, 스톨 취소 로직과 동일한 이유).
+- `display/quiz_window.py`: `"reveal"` 핸들러가 텍스트만 세팅하던 걸 이미지도 표시하도록 수정(`_show_question`과 이미지 로딩 로직을 `_display_image()` 헬퍼로 공유).
+- `scripts/build_quiz_bank.py`: 새 디렉터리 `assets/quiz/source_full/`(원본, 파일명은 크롭 사진과 동일해야 매칭됨)를 지원 — 있으면 리사이즈해 `assets/quiz/full/`에 저장하고 `full_image_path`로 기록, 없으면 경고만 출력하고 정답 공개 때 크롭 사진으로 대체.
+- `scripts/test_quiz_window.py`에 `v1~vN` 메뉴 추가 — 실물 UI에서 리빌 표시를 눈으로 확인 가능.
+- 오프라인 테스트(`test_quiz_bank/state/tools.py`) 전부 재통과 — `test_quiz_tools.py`에 리빌 메시지가 채점 직후 먼저 오고, `REVEAL_HOLD_SEC` 경과 후에야 다음 문제 메시지가 오는 것(패치값 0.05s로 단축)까지 검증하는 케이스 추가.
+
+**아직 안 된 것**: `assets/quiz/source_full/`에 원본 사진을 실제로 채워넣는 것(현재 플레이스홀더 2문제는 원본 없음 — 정답 공개 때도 크롭 사진 그대로 재생됨, 정상 fallback이지만 사진 준비 시 원본도 함께 챙겨야 함).
+
+### 15단계 코드 리뷰 — 실제 버그 3건 발견 및 수정 (같은 날)
+
+구현 완료 직후 사용자 요청으로 전체 재점검, 실제로 재현 가능한 버그 3건을 찾아 고침(전부 `core/quiz_tools.py`/`core/quiz_bank.py`).
+
+1. **asyncio 태스크 GC 위험**: `request_hint()`의 짜증유발 스톨 지연 태스크(`loop.create_task(_delayed_refusal())`)를 어디에도 참조로 안 붙잡고 있었음 — asyncio 공식 문서가 명시하는 경고("이벤트 루프는 태스크를 약한 참조로만 들고 있어서, 다른 곳에서 강한 참조를 안 갖고 있으면 도중에 가비지 컬렉션될 수 있다")에 정면으로 해당하는 상황. 실제 테스트에선 매번 우연히 살아남았지만, 운이 나쁘면 거절 대사가 통째로 사라질 위험이 있었음 — `_pending_stall` 딕셔너리로 태스크 참조를 붙잡아두도록 수정.
+2. **힌트 중복 요청 시 거절 대사 중복 발화**: 사용자가 짧은 간격으로 힌트를 두 번 요청하면 지연 태스크가 두 번 예약되어, ~10초 뒤 거절 대사가 두 번 겹쳐 나올 수 있었음 — `_schedule_stall_refusal()`이 이미 대기 중인 태스크가 있으면 새로 예약하지 않도록 가드 추가. 오프라인 테스트로 실제 두 번 호출해도 주입은 정확히 1회만 발생함을 확인.
+3. **문제/모드가 넘어간 뒤에도 이전 스톨이 뒤늦게 발화**: 힌트 요청으로 스톨을 걸어둔 직후 사용자가 곧바로 정답을 말해 다음 문제로 넘어가면, 원래 예약됐던 지연 태스크가 취소되지 않고 그대로 남아있다가 엉뚱한 타이밍(이미 다음 문제로 넘어간 뒤)에 거절 대사를 튀어나오게 할 수 있었음 — `submit_guess`/`select_quiz_mode`/`end_quiz_early`/`start_quiz` 진입 시 `_cancel_pending_stall()`을 호출하도록 수정(하찮미 모드의 "사용자 차례" 콜만 예외 — 그 경우엔 아직 문제가 안 넘어감). 오프라인 테스트로 확인.
+4. **(버그는 아니지만 함께 고침) image_path가 cwd에 의존하던 문제**: `scripts/build_quiz_bank.py`가 `questions.json`에 저장하는 `image_path`가 상대경로였는데, `core/quiz_bank.py`의 `load_question_bank()`는 이걸 그대로 썼다 — `display/quiz_window.py`가 별도 프로세스로 다른 작업 디렉터리에서 실행되면 이미지를 못 찾을 수 있었음(이전에 `vision/vision_brain.py`의 `art_brain.pkl` 경로에서 겪었던 것과 같은 종류의 문제). `load_question_bank()`가 상대경로면 저장소 루트 기준 절대경로로 풀어주도록 수정.
+
+**의도적으로 안 고친 것(알고 있는 낮은 위험)**: `submit_guess`가 같은 사용자 발화에 대해 모델이 실수로 두 번 호출하면 문제가 하나 건너뛰어질 수 있음(멱등성 가드 없음) — `remember_fact` 등 기존 툴들도 같은 수준의 신뢰를 모델에게 두고 있어 이 프로젝트의 기존 위험 허용 수준과 일치, 실제 실 API 테스트에서도 관찰된 적 없어 우선순위 낮음으로 보류.
+
+수정 후 오프라인 테스트 전부 재통과(신규 케이스 2개 추가: 중복 힌트 요청 1회만 주입, 문제 진행 시 이전 스톨 취소) + 실 API 시나리오 테스트(`test_quiz_live.py`) 재검증 통과.
+
 ## 14단계 — 버퍼 1200ms로 재상향, 문장 중간 끊김은 원인 오판 후 되돌리고 현상태 수용 (2026-07-28)
 
 - **버퍼 1200ms 실측**: 13단계 카운터 수정 후 다시 대화해보니 126회/12165ms(더 긴 대화라 절대값은 늘었지만, 사용자 체감상 "거의 다 고쳐진 것 같다"는 평가). 전반적으로 크게 개선됨 — **이 부분은 유지, 확정.**

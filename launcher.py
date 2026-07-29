@@ -20,11 +20,15 @@
     user_result/에 대화록+결과지가 남는다.
 """
 import asyncio
+import json
+import multiprocessing
 import os
 import queue
 import sys
 import threading
 import time
+import wave
+from datetime import datetime
 
 from dynamixel_sdk import PacketHandler, PortHandler
 
@@ -38,10 +42,13 @@ ensure_utf8_console()
 from core import profile_manager as profiles
 from core import report_manager
 from core.emotion_tools import make_set_emotion_tool
+from core.idle_watcher import IDLE_SLEEP_SEC, decide_idle_action
 from core.memory_tools import make_forget_me_tool, make_remember_fact_tool
 from core.motion_tools import make_motion_tools
+from core.quiz_tools import make_quiz_tools
 from core.utils import build_persona_system_instruction, extract_exit_tag
 from display.main import RobotFaceApp
+from display.quiz_window import quiz_window_process
 from hardware import config as C
 from hardware import init as I
 from media.audio_manager import ENABLE_AEC, INPUT_RATE, OUTPUT_RATE, EchoCanceller, MicStreamer, Speaker
@@ -55,6 +62,33 @@ LIVE_MODEL = os.getenv("LIVE_MODEL_NAME", "models/gemini-3.1-flash-live-preview"
 # 교체함(2026-07-28, docs/progress.md 참고).
 LIVE_VOICE_NAME = os.getenv("LIVE_VOICE_NAME", "Zephyr")
 IDENTIFY_TIMEOUT_SEC = 8.0
+# 기본 대화 상태(퀴즈 제외)에서 IDLE_SLEEP_SEC(core/idle_watcher.py)만큼 사용자가 조용하면
+# SLEEPY로 전환하고 팬/틸트 추적도 멈춘다 — 사용자 요청(2026-07-29). display/emotions/
+# sleepy.py·wake.py는 v1(capston_mk1/motirobotics)에서 재이식.
+IDLE_WATCHER_POLL_SEC = 1.0
+# SLEEPY 상태 배경음("드르렁... 쿠우...") — scripts/generate_snore_audio.py로 한 번 생성해
+# 캐싱해둔 파일을 읽기만 한다(런타임에 API를 다시 부르지 않음, 반복 간격도 그래야 안정적).
+SNORE_CLIP_PATH = os.path.join(_REPO_ROOT, "assets", "audio", "snore.wav")
+SNORE_GAP_SEC = 1.0
+SNORE_POLL_SEC = 0.2
+
+
+def _load_snore_clip() -> tuple[bytes, float] | tuple[None, None]:
+    """SNORE_CLIP_PATH를 읽어 (24kHz mono int16 PCM 바이트, 길이(초))를 반환한다.
+    파일이 없거나 포맷이 안 맞으면(scripts/generate_snore_audio.py를 아직 안 돌렸거나
+    포맷이 바뀐 경우) (None, None) — 호출부가 스누즈 배경음 없이 진행한다."""
+    if not os.path.exists(SNORE_CLIP_PATH):
+        print(f"ℹ️  {SNORE_CLIP_PATH}가 없어 SLEEPY 배경음 없이 진행합니다 "
+              f"(scripts/generate_snore_audio.py로 생성할 수 있습니다).")
+        return None, None
+    with wave.open(SNORE_CLIP_PATH, "rb") as wf:
+        if wf.getframerate() != OUTPUT_RATE or wf.getnchannels() != 1 or wf.getsampwidth() != 2:
+            print(f"⚠️ {SNORE_CLIP_PATH}의 포맷이 예상과 다릅니다"
+                  f"({OUTPUT_RATE}Hz mono int16 필요) — SLEEPY 배경음을 건너뜁니다.")
+            return None, None
+        pcm = wf.readframes(wf.getnframes())
+    duration_sec = len(pcm) / 2 / OUTPUT_RATE
+    return pcm, duration_sec
 
 
 def open_port() -> tuple[PortHandler, PacketHandler]:
@@ -90,12 +124,20 @@ def wait_for_identification(shared_state: dict, timeout: float) -> str | None:
 
 
 async def run_conversation(name_state: dict, facts_summary: str | None, emotion_queue: "queue.Queue",
-                            motion_tools: list | None = None, shared_state: dict | None = None, brain=None):
+                            motion_tools: list | None = None, shared_state: dict | None = None, brain=None,
+                            quiz_ui_q=None, quiz_busy: threading.Event | None = None,
+                            port=None, pkt=None, lock=None, home_pan: int | None = None, home_tilt: int | None = None,
+                            quiz_num_questions: int = 5, quiz_log_out: list | None = None):
     """Live 세션을 열고 대화가 끝날 때까지 실행한다. 종료 시 세션 로그를 반환.
 
     name_state: {"name": <세션 시작 시점 확정된 이름 또는 None>}. 처음 보는 사람이면
     remember_fact의 첫 호출(field="name")이 이 딕셔너리를 제자리에서 갱신한다 —
-    호출자는 이 함수가 끝난 뒤 name_state["name"]으로 최종 확정 이름을 읽을 수 있다."""
+    호출자는 이 함수가 끝난 뒤 name_state["name"]으로 최종 확정 이름을 읽을 수 있다.
+
+    quiz_ui_q가 None이면 퀴즈 모드 자체가 비활성(기존 호출부/테스트 스크립트와 호환) —
+    2026-07-28 하찮미 실험 2차용 기능이라 기본값은 항상 꺼져 있다. quiz_log_out을
+    넘기면(빈 리스트) 세션 종료 시 QuizSession.export_log() 결과로 채워 넣는다
+    (name_state와 같은 "가변 컨테이너로 결과 돌려받기" 패턴)."""
     api_key = os.getenv("GOOGLE_API_KEY")
     if not api_key:
         print("⏭️  GOOGLE_API_KEY가 없어 대화를 시작할 수 없습니다.")
@@ -105,6 +147,22 @@ async def run_conversation(name_state: dict, facts_summary: str | None, emotion_
     from google.genai import types
 
     client = genai.Client(api_key=api_key)
+    loop = asyncio.get_event_loop()
+
+    # 퀴즈 모드의 짜증유발(annoying) 힌트 거절이 10~12초 지연 후 히든 턴으로 도착해야
+    # 하는데, 그 시점엔 session 객체가 아직 없다(connect()가 tools=[...]를 요구하는데
+    # 그 tools 안에 이 콜백을 참조하는 퀴즈 툴이 들어있어야 함) — session_holder라는
+    # 가변 딕셔너리로 우회한다(remember_fact의 name_state와 같은 발상).
+    session_holder = {"session": None}
+
+    async def inject_turn(text: str):
+        s = session_holder["session"]
+        if s is None:
+            return
+        await s.send_client_content(
+            turns=types.Content(role="user", parts=[types.Part(text=text)]),
+            turn_complete=True,
+        )
 
     tools = []
     tool_fns = {}
@@ -124,6 +182,18 @@ async def run_conversation(name_state: dict, facts_summary: str | None, emotion_
         tools.append(tool_fn)
         tool_fns[tool_fn.__name__] = tool_fn
 
+    quiz_session = None
+    if quiz_ui_q is not None:
+        quiz_motion_ctx = (port, pkt, lock, shared_state, home_pan, home_tilt)
+        (start_quiz, select_quiz_mode, submit_guess, request_hint, end_quiz_early,
+         quiz_session) = make_quiz_tools(
+            quiz_ui_q, quiz_busy or threading.Event(), quiz_motion_ctx, inject_turn, loop,
+            emotion_queue=emotion_queue, num_questions=quiz_num_questions,
+        )
+        for quiz_tool_fn in (start_quiz, select_quiz_mode, submit_guess, request_hint, end_quiz_early):
+            tools.append(quiz_tool_fn)
+            tool_fns[quiz_tool_fn.__name__] = quiz_tool_fn
+
     config = types.LiveConnectConfig(
         response_modalities=[types.Modality.AUDIO],
         output_audio_transcription=types.AudioTranscriptionConfig(),
@@ -139,7 +209,6 @@ async def run_conversation(name_state: dict, facts_summary: str | None, emotion_
 
     session_history: list[str] = []
     stop_event = asyncio.Event()
-    loop = asyncio.get_event_loop()
 
     print(f"모델: {LIVE_MODEL} — 마이크에 대고 말해보세요. Ctrl+C로 언제든 종료.")
 
@@ -148,6 +217,7 @@ async def run_conversation(name_state: dict, facts_summary: str | None, emotion_
     echo_canceller = EchoCanceller() if ENABLE_AEC else None
 
     async with client.aio.live.connect(model=LIVE_MODEL, config=config) as session:
+        session_holder["session"] = session
         with MicStreamer(loop, echo_canceller=echo_canceller) as mic, Speaker(echo_canceller=echo_canceller) as speaker:
             # Fenrir 프리셋은 여전히 성인 성우 음색이라, 재생 직전에 피치+포먼트를 시프트해
             # 더 앳된 톤으로 바꾼다(media/voice_shift.py). 버퍼링 때문에 발화 시작마다
@@ -156,7 +226,19 @@ async def run_conversation(name_state: dict, facts_summary: str | None, emotion_
             if shifter:
                 shifter.start()
 
+            # SLEEPY 배경음 — API를 다시 부르지 않고 캐시된 클립만 읽는다(_load_snore_clip
+            # 참고). 파일이 없으면 (None, None)이라 snore_player()가 그냥 아무것도 안 함.
+            snore_pcm, snore_duration_sec = _load_snore_clip()
+
             turn_user, turn_moti = [], []
+            # idle_watcher()와 recv_loop() 둘 다 읽고/쓰는 공유 상태라 nonlocal 없이
+            # 클로저에서 갱신 가능하도록 리스트(가변 컨테이너)로 감싼다(core/quiz_tools.py의
+            # _pending_stall 딕셔너리 패턴과 같은 이유). "활동"은 사용자 발화뿐 아니라
+            # 로봇이 말하는 중(오디오 청크 도착)이거나 제스처/춤/퀴즈 리액션 모션을
+            # 실행 중인(quiz_busy가 곧 motion_busy) 경우도 포함한다 — 로봇이 뭔가
+            # 하고 있는 동안은 사용자가 IDLE_SLEEP_SEC만큼 조용해도 잠들면 안 된다는 요구사항.
+            last_activity_time = [time.monotonic()]
+            is_sleeping = [False]
 
             # Live API는 기본적으로 사용자 입력을 기다렸다가 응답한다 — 로봇이 먼저 인사를
             # 건네게 하려면 연결 직후 텍스트 턴을 하나 보내 말문을 열어줘야 한다(공식 가이드
@@ -195,9 +277,13 @@ async def run_conversation(name_state: dict, facts_summary: str | None, emotion_
                                 shifter.feed(message.data)
                             else:
                                 speaker.play(message.data)
+                            # 로봇이 말하는 중 — 사용자가 조용히 듣고만 있어도 idle-sleep이
+                            # 끼어들면 안 된다.
+                            last_activity_time[0] = time.monotonic()
 
                         if sc and sc.input_transcription and sc.input_transcription.text:
                             turn_user.append(sc.input_transcription.text)
+                            last_activity_time[0] = time.monotonic()
                         if sc and sc.output_transcription and sc.output_transcription.text:
                             turn_moti.append(sc.output_transcription.text)
 
@@ -232,12 +318,78 @@ async def run_conversation(name_state: dict, facts_summary: str | None, emotion_
                         if stop_event.is_set():
                             break
 
-            await asyncio.gather(send_loop(), recv_loop())
+            async def idle_watcher():
+                """기본 대화 상태(퀴즈 제외)에서 IDLE_SLEEP_SEC 동안 아무 활동도 없으면
+                SLEEPY로 전환하고 팬/틸트 추적을 멈춘다(shared_state['mode']='sleeping' —
+                vision/face.py가 'tracking'이 아닌 모드는 추적을 자동으로 건너뜀, 퀴즈 모드의
+                시선회피 모션과 같은 방식). "활동"은 사용자 발화뿐 아니라 로봇이 말하는 중
+                (recv_loop의 message.data 처리부에서 갱신)이거나 제스처/춤/퀴즈 리액션 모션을
+                실행 중인 경우도 포함 — 로봇이 뭔가 하고 있으면 사용자가 조용해도 잠들면 안
+                된다는 요구사항(quiz_busy는 core/motion_tools.py/core/quiz_tools.py가 공유하는
+                busy 게이트라 Layer 1/2 제스처든 퀴즈 리액션이든 전부 여기서 잡힌다).
+                판단 자체는 core/idle_watcher.py의 순수 함수가 하고, 여기서는 그 결과에 따라
+                emotion_queue/shared_state만 건드린다. 사용자가 다시 말하기 시작하면
+                (quiz_session 진행 중이든 아니든 우선 깨움) 즉시 추적을 재개하고 AWAKENING을
+                한 번 보여준다 — WAKE 애니메이션(약 2.5초)이 끝나면 시각적으로 NEUTRAL과
+                동일해지므로(display/emotions/wake.py) 별도로 되돌릴 필요 없음(모델이 이어서
+                set_emotion을 부르면 그게 그대로 반영됨)."""
+                while not stop_event.is_set():
+                    await asyncio.sleep(IDLE_WATCHER_POLL_SEC)
+                    quiz_active = quiz_session is not None and quiz_session.active
+                    # 퀴즈 진행 중엔(문제를 오래 들여다보며 생각하는 조용한 구간 포함) 그
+                    # 자체를 활동으로 본다 — 안 그러면 사용자/로봇 둘 다 조용한 "생각하는
+                    # 시간"이 누적되다가, 퀴즈가 막 끝난 시점에 그 누적된 idle_for가 그대로
+                    # 남아 있어 곧바로(대기하던 타이머가) SLEEPY로 튀어버리는 사고가 났었음
+                    # (실측으로 재현: 퀴즈 종료 직후 즉시 sleepy 전환).
+                    if quiz_active or (quiz_busy is not None and quiz_busy.is_set()):
+                        last_activity_time[0] = time.monotonic()
+                    idle_for = time.monotonic() - last_activity_time[0]
+                    action = decide_idle_action(idle_for, is_sleeping[0], quiz_active)
+
+                    if action == "wake":
+                        is_sleeping[0] = False
+                        print("👀 사용자 발화 감지 — 깨어납니다.")
+                        if shared_state is not None:
+                            shared_state['mode'] = 'tracking'
+                        emotion_queue.put("AWAKENING")
+                        # 코골이 소리가 재생/대기 중이었다면 즉시 끊는다 — snore_player()의
+                        # 다음 폴링을 기다리면(최대 SNORE_POLL_SEC) 깬 직후에도 잠깐 더
+                        # 들릴 수 있어서, 깨우는 시점에 확실하게 끊어준다.
+                        speaker.stop_immediately()
+                    elif action == "sleep":
+                        is_sleeping[0] = True
+                        print(f"💤 {IDLE_SLEEP_SEC:.0f}초간 조용해서 sleepy 상태로 전환합니다.")
+                        if shared_state is not None:
+                            shared_state['mode'] = 'sleeping'
+                        emotion_queue.put("SLEEPY")
+
+            async def snore_player():
+                """SLEEPY인 동안 캐시된 코골이 클립을 SNORE_GAP_SEC 간격으로 반복 재생한다
+                ("드르렁... 쿠우..." 1초 정적 반복, 사용자 요청). 큰 통짜 sleep 대신
+                SNORE_POLL_SEC 단위로 쪼개 대기해야, 자는 도중 깨어났을 때(is_sleeping[0]이
+                False로 바뀔 때) 다음 재생 전에 빠르게 멈출 수 있다(추가로 idle_watcher의
+                wake 분기가 speaker.stop_immediately()로 즉시 끊기도 함)."""
+                if snore_pcm is None:
+                    return
+                while not stop_event.is_set():
+                    if not is_sleeping[0]:
+                        await asyncio.sleep(SNORE_POLL_SEC)
+                        continue
+                    speaker.play(snore_pcm)
+                    remaining = snore_duration_sec + SNORE_GAP_SEC
+                    while remaining > 0 and is_sleeping[0] and not stop_event.is_set():
+                        await asyncio.sleep(SNORE_POLL_SEC)
+                        remaining -= SNORE_POLL_SEC
+
+            await asyncio.gather(send_loop(), recv_loop(), idle_watcher(), snore_player())
             if shifter:
                 shifter.close()
             if speaker.underrun_count:
                 print(f"⚠️ 스피커 언더런 {speaker.underrun_count}회, 총 {speaker.underrun_ms_total:.0f}ms 무음 재생됨 "
                       f"— VoiceShifter 처리가 실시간을 못 따라간 신호. VOICE_SHIFT_BUFFER_MS를 늘려볼 것.")
+
+    if quiz_session is not None and quiz_log_out is not None:
+        quiz_log_out.extend(quiz_session.export_log())
 
     return session_history
 
@@ -285,8 +437,11 @@ def main():
     name_state = {"name": name}
 
     emotion_queue: "queue.Queue" = queue.Queue()
+    # Layer 1/2(LLM이 부르는 제스처)와 퀴즈 모드 리액션 모션(core/quiz_tools.py)이 같은
+    # busy 게이트를 공유해야 서로 다른 관절이라도 동시에 실행되며 충돌하지 않는다.
+    motion_busy = threading.Event()
     play_gesture, express_gesture = make_motion_tools(
-        port, pkt, lock, shared_state, home_pan, home_tilt, emotion_queue
+        port, pkt, lock, shared_state, home_pan, home_tilt, emotion_queue, busy=motion_busy
     )
     display_stop = threading.Event()
 
@@ -297,19 +452,34 @@ def main():
     t_display = threading.Thread(target=run_display, name="display", daemon=True)
     t_display.start()
 
+    # 퀴즈 모드 사진 창 — display/main.py의 pygame 얼굴 UI와 완전히 별개 프로세스라
+    # 이 신규 기능의 버그가 검증된 얼굴 UI를 절대 건드리지 않는다(2026-07-28 하찮미
+    # 실험 2차, docs/progress.md 참고). quiz_ui_q가 항상 존재하므로 퀴즈 기능은 사실상
+    # 상시 활성 — 트리거되지 않으면(사용자가 "퀴즈 풀자" 등을 말하지 않으면) 그냥 안 쓰인다.
+    quiz_ui_q: "multiprocessing.Queue" = multiprocessing.Queue()
+    quiz_proc = multiprocessing.Process(target=quiz_window_process, args=(quiz_ui_q,), daemon=True)
+    quiz_proc.start()
+
     session_history: list[str] = []
+    quiz_log: list = []
     try:
         session_history = asyncio.run(
             run_conversation(
                 name_state, facts_summary, emotion_queue,
                 motion_tools=[play_gesture, express_gesture],
                 shared_state=shared_state, brain=brain,
+                quiz_ui_q=quiz_ui_q, quiz_busy=motion_busy,
+                port=port, pkt=pkt, lock=lock, home_pan=home_pan, home_tilt=home_tilt,
+                quiz_log_out=quiz_log,
             )
         )
     except KeyboardInterrupt:
         print("\n🛑 KeyboardInterrupt — 대화를 종료합니다.")
     finally:
         display_stop.set()
+
+        quiz_ui_q.put("__QUIT__")
+        quiz_proc.join(timeout=3.0)
 
         track_stop.set()
         t_face.join(timeout=5.0)
@@ -333,6 +503,18 @@ def main():
             report_manager.generate_and_save_reports(final_name, "\n".join(session_history), latest_facts_summary)
         elif session_history:
             print("ℹ️  이름을 몰라 결과지는 생성하지 않습니다 (대화 자체는 정상 진행됨).")
+
+        if quiz_log:
+            # 연구 데이터 — 문항별 모드/정답여부/힌트요청여부/타임스탬프(core/quiz_state.py
+            # export_log() 참고). report_manager.py를 건드리지 않고 여기서 직접 저장.
+            result_dir = os.path.join(_REPO_ROOT, "user_result")
+            os.makedirs(result_dir, exist_ok=True)
+            today_str = datetime.now().strftime("%Y-%m-%d")
+            quiz_log_name = final_name or "unknown"
+            quiz_log_path = os.path.join(result_dir, f"{today_str}_{quiz_log_name}_quiz.json")
+            with open(quiz_log_path, "w", encoding="utf-8") as f:
+                json.dump(quiz_log, f, ensure_ascii=False, indent=2)
+            print(f"📄 퀴즈 결과 로그 저장 완료: {quiz_log_path}")
 
 
 if __name__ == "__main__":

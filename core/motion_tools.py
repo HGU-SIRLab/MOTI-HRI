@@ -22,9 +22,15 @@ from hardware.motion import EXPRESS_JOINTS, is_dancing, play_express_gesture, pl
 VALID_GESTURES = ("greeting", "wave", "hug", "shy", "dance")
 
 
-def make_motion_tools(port, pkt, lock, shared_state, home_pan=2081, home_tilt=2071, emotion_queue=None):
-    """play_gesture, express_gesture 두 툴을 함께 만들어 반환한다(하나의 busy 가드 공유)."""
-    busy = threading.Event()
+def make_motion_tools(port, pkt, lock, shared_state, home_pan=2081, home_tilt=2071, emotion_queue=None,
+                       busy: threading.Event | None = None):
+    """play_gesture, express_gesture 두 툴을 함께 만들어 반환한다(하나의 busy 가드 공유).
+
+    busy를 외부에서 넘기면(예: core/quiz_tools.py의 퀴즈 리액션 모션과 공유) 그 이벤트를
+    그대로 쓴다 — LLM이 부르는 제스처와 퀴즈 리액션 모션이 서로 다른 관절이라도 동시에
+    실행되며 충돌하지 않게 하기 위함. 안 넘기면 이 함수 안에서 새로 만든다(기존 호출부 호환)."""
+    if busy is None:
+        busy = threading.Event()
 
     def _run_macro(name):
         try:

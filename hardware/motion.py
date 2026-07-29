@@ -71,6 +71,64 @@ def perform_head_nod(port: PortHandler, pkt: PacketHandler, lock: threading.Lock
         print("✅ 고개 끄덕이기 완료! (Face Tracking 재개)")
 
 
+# ---- 퀴즈 모드 전용 리액션(docs/architecture.md와 별개, 2026-07-28 하찮미 실험 2차) ----
+# 이름 있는 매크로(Layer 1)도, LLM이 파라미터를 고르는 express_gesture(Layer 2)도 아닌,
+# core/quiz_state.py가 판정한 결과에 딸려오는 전용 리액션이라 여기 따로 묶어둔다.
+
+LOOK_AWAY_ACCEL = 30
+LOOK_AWAY_VELOCITY = 300
+LOOK_AWAY_HOLD_SEC = 1.5
+
+THINKING_STALL_FREQUENCY_HZ = 0.12
+THINKING_STALL_AMPLITUDE_SCALE = 0.35
+
+
+def play_look_away_motion(port: PortHandler, pkt: PacketHandler, lock: threading.Lock, shared_state: dict, home_pan: int):
+    """하찮미 모드에서 로봇 자신의 추측이 틀렸을 때 부끄러워하며 잠깐 시선을 피하는 동작.
+    기존 _dance_routine이 쓰던 HEAD_PAN_OFFSET을 재사용해 팬을 살짝 틀었다 되돌린다.
+    perform_head_nod와 같은 관례로 실행 중 얼굴추적을 잠시 멈춘다 — 'tracking'이 아닌
+    모드 문자열이면 vision/face.py가 자동으로 PID 추적을 건너뛰므로 그쪽 수정은 불필요."""
+    print("🤖 [행동] 시선 회피(부끄러움) 동작 시작...")
+    if shared_state:
+        shared_state['mode'] = 'quiz_averted'
+        time.sleep(0.1)
+
+    try:
+        with lock:
+            io.write4(pkt, port, C.PAN_ID, C.ADDR_PROFILE_ACCELERATION, LOOK_AWAY_ACCEL)
+            io.write4(pkt, port, C.PAN_ID, C.ADDR_PROFILE_VELOCITY, LOOK_AWAY_VELOCITY)
+            io.write4(pkt, port, C.PAN_ID, C.ADDR_GOAL_POSITION, home_pan - C.HEAD_PAN_OFFSET)
+        time.sleep(LOOK_AWAY_HOLD_SEC)
+        with lock:
+            io.write4(pkt, port, C.PAN_ID, C.ADDR_GOAL_POSITION, home_pan)
+        time.sleep(0.5)
+    finally:
+        with lock:
+            io.write4(pkt, port, C.PAN_ID, C.ADDR_PROFILE_ACCELERATION, 0)
+        if shared_state:
+            shared_state['mode'] = 'tracking'
+        print("✅ [행동] 시선 회피 동작 완료.")
+
+
+def play_thinking_stall(port: PortHandler, pkt: PacketHandler, lock: threading.Lock, shared_state: dict,
+                         emotion_queue=None, duration_sec: float = 11.0):
+    """짜증유발 모드가 힌트 요청에 10초 이상 의미 없이 '고민'하는 척하는 연기.
+    기존 _perform_shoulder_dance(춤용 사인파 헬퍼, 이미 두 번 검증됨)를 훨씬 느리고
+    작은 진폭으로 재사용한다 — 새 하드웨어 제어 코드가 필요 없음."""
+    if emotion_queue:
+        emotion_queue.put("THINKING")
+    if shared_state:
+        shared_state['mode'] = 'quiz_thinking'
+    try:
+        _perform_shoulder_dance(
+            port, pkt, lock, duration_sec=duration_sec, frequency_hz=THINKING_STALL_FREQUENCY_HZ,
+            title="퀴즈 고민 스톨", amplitude_scale=THINKING_STALL_AMPLITUDE_SCALE,
+        )
+    finally:
+        if shared_state:
+            shared_state['mode'] = 'tracking'
+
+
 def play_greeting_motion(port: PortHandler, pkt: PacketHandler, lock: threading.Lock):
     """왼손을 흔들며 인사하는 동작."""
     print("🤖 [행동] 인사 동작 시작...")
@@ -215,10 +273,12 @@ def play_shy_motion(port: PortHandler, pkt: PacketHandler, lock: threading.Lock)
                 io.write4(pkt, port, motor_id, C.ADDR_PROFILE_ACCELERATION, 0)
 
 
-def _perform_shoulder_dance(port: PortHandler, pkt: PacketHandler, lock, duration_sec: float, frequency_hz: float, title: str):
-    """사인파로 어깨를 흔드는 헬퍼. play_dance()의 오프닝/피날레에서 사용."""
+def _perform_shoulder_dance(port: PortHandler, pkt: PacketHandler, lock, duration_sec: float, frequency_hz: float,
+                             title: str, amplitude_scale: float = 1.0):
+    """사인파로 어깨를 흔드는 헬퍼. play_dance()의 오프닝/피날레 + play_thinking_stall()에서 사용.
+    amplitude_scale은 기존 호출부(춤)와 호환되도록 기본값 1.0(원래 진폭 그대로)."""
     print(f"🎶 {title} 시작! ({duration_sec}초, {frequency_hz}Hz)")
-    amplitude = C.SHOULDER_LEFT_POS - C.SHOULDER_CENTER_POS
+    amplitude = (C.SHOULDER_LEFT_POS - C.SHOULDER_CENTER_POS) * amplitude_scale
 
     with lock:
         io.write4(pkt, port, C.SHOULDER_ID, C.ADDR_PROFILE_VELOCITY, 250)

@@ -23,6 +23,7 @@ pyworld  # 목소리 피치/포먼트 시프트(WORLD 보코더) — media/voice
 
 # 표정 UI
 pygame
+pillow  # 퀴즈 확대사진 표시(display/quiz_window.py의 Tkinter ImageTk)
 
 # 입력 / 설정
 pynput

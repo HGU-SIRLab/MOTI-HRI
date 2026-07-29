@@ -21,6 +21,8 @@ from .emotions.listening import Emotion as ListeningEmotion
 from .emotions.thinking import Emotion as ThinkingEmotion
 from .emotions.close import Emotion as CloseEmotion
 from .emotions.scanning import Emotion as ScanningEmotion
+from .emotions.sleepy import Emotion as SleepyEmotion
+from .emotions.wake import Emotion as AwakeningEmotion
 from .emotions import eyebrow
 from .emotions import cheeks
 
@@ -73,12 +75,14 @@ class RobotFaceApp:
         pygame.time.set_timer(pygame.USEREVENT + 1, random.randint(2000, 5000))
         pygame.time.set_timer(pygame.USEREVENT + 2, random.randint(2000, 5000))
         
-        # 불필요한 감정(SLEEPY, WAKE, RPS 등) 제거
+        # 불필요한 감정(RPS 등) 제거. SLEEPY/AWAKENING은 2026-07-29 idle-sleep 기능(launcher.py의
+        # idle_watcher)에서 다시 필요해져 v1(capston_mk1/motirobotics)에서 재이식함.
         self.emotions = {
             "NEUTRAL": NeutralEmotion(), "HAPPY": HappyEmotion(), "EXCITED": ExcitedEmotion(),
-            "TENDER": TenderEmotion(), "SCARED": ScaredEmotion(), "ANGRY": AngryEmotion(), 
+            "TENDER": TenderEmotion(), "SCARED": ScaredEmotion(), "ANGRY": AngryEmotion(),
             "SAD": SadEmotion(), "SURPRISED": SurprisedEmotion(), "LISTENING": ListeningEmotion(),
-            "THINKING": ThinkingEmotion(), "CLOSE": CloseEmotion(), "SCANNING": ScanningEmotion()
+            "THINKING": ThinkingEmotion(), "CLOSE": CloseEmotion(), "SCANNING": ScanningEmotion(),
+            "SLEEPY": SleepyEmotion(), "AWAKENING": AwakeningEmotion(),
         }
         self.current_emotion_key = "NEUTRAL"
 
@@ -143,7 +147,9 @@ class RobotFaceApp:
             if self.click_count >= 3:
                 self.change_emotion("ANGRY")
                 self.click_count = 0
-        else:
+        elif self.current_emotion_key != "SLEEPY":
+            # SLEEPY는 launcher.py의 idle_watcher가 사용자 발화를 감지할 때까지 계속
+            # 유지돼야 한다(몇 분이든) — 여기서 자동으로 풀려버리면 idle-sleep 기능이 무력화됨.
             if pygame.time.get_ticks() - self.emotion_timer_start_time >= 30000:
                 self.change_emotion("NEUTRAL")
 
@@ -180,7 +186,7 @@ class RobotFaceApp:
         current_emotion = self.emotions[self.current_emotion_key]
         current_emotion.draw(self.base_surface, self.common_data)
 
-        if self.is_blinking and self.current_emotion_key not in ["SCANNING"]:
+        if self.is_blinking and self.current_emotion_key not in ["SCANNING", "SLEEPY"]:
             progress = self.blink_progress if self.blink_progress <= 100 else 200 - self.blink_progress
             for eye_center in [self.common_data['left_eye'], self.common_data['right_eye']]:
                 top_rect = (eye_center[0]-100, eye_center[1]-150, 200, progress+50)

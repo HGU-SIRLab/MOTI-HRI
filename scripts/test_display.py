@@ -22,9 +22,15 @@ ensure_utf8_console()
 from core.emotion_tools import VALID_EMOTIONS
 from display.main import RobotFaceApp
 
+# sleepy/awakening은 set_emotion 툴(VALID_EMOTIONS)엔 없다 — launcher.py의 idle_watcher가
+# 시스템 판단으로만 트리거하는 상태라 모델이 직접 부를 수 없게 의도적으로 뺐다(CLOSE와 같은
+# 부류). 여기서는 눈으로 확인할 수 있게 디버그용으로만 별도 허용.
+DEBUG_ONLY_EMOTIONS = ("sleepy", "awakening")
+
 MENU = f"""
 ──────────────────────────────
  감정 입력: {', '.join(VALID_EMOTIONS)}
+ 디버그 전용(모델은 못 부름): {', '.join(DEBUG_ONLY_EMOTIONS)}
  q) 종료
 ──────────────────────────────
 """
@@ -40,7 +46,7 @@ def input_worker(emotion_queue: queue.Queue, stop_event: threading.Event):
         if line in ("q", "quit", "exit"):
             stop_event.set()
             break
-        elif line in VALID_EMOTIONS:
+        elif line in VALID_EMOTIONS or line in DEBUG_ONLY_EMOTIONS:
             emotion_queue.put(line.upper())
         elif line:
             print(f"⚠️ 알 수 없는 감정: {line}")

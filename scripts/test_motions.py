@@ -33,6 +33,8 @@ MENU = """
  4) dance     (춤, 약 {duration}초 — 백그라운드 재생)
  5) head_nod  (고개 끄덕임)
  6) express   (Layer 2 파라미터 제스처: 관절/intensity/speed/repeat 직접 입력)
+ 7) look_away (퀴즈 모드: 부끄러워하며 시선 회피)
+ 8) thinking  (퀴즈 모드: 짜증유발 모드의 생각 스톨, 약 11초)
  q) 종료
 ──────────────────────────────
 """.format(duration=M.DANCE_DURATION)
@@ -89,6 +91,10 @@ def main():
                     continue
                 speed = input("  speed (slow/normal/fast) > ").strip() or "normal"
                 M.play_express_gesture(joint, intensity, speed, repeat, port, pkt, lock, shared_state)
+            elif choice == "7":
+                M.play_look_away_motion(port, pkt, lock, shared_state, home_pan)
+            elif choice == "8":
+                M.play_thinking_stall(port, pkt, lock, shared_state)
             else:
                 print("⚠️ 알 수 없는 입력입니다.")
     finally:
