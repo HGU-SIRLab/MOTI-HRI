@@ -54,9 +54,13 @@ def make_motion_tools(port, pkt, lock, shared_state, home_pan=2081, home_tilt=20
 
         Call this when a gesture would naturally accompany what you're
         saying (e.g. "greeting"/"wave" when meeting someone, "hug" when
-        comforting someone, "shy" for a bashful reaction, "dance" when
-        celebrating). Don't call this every turn — only when it clearly
-        fits the moment.
+        comforting someone, "shy" for a bashful reaction). Don't call
+        this every turn — only when it clearly fits the moment.
+
+        "dance" is special: only call it if the user explicitly asked you
+        to dance. If you're happy/excited enough that you'd want to dance
+        but nobody asked, call "shy" instead — a bashful little reaction
+        reads as "happy but holding back" without dancing unprompted.
 
         Args:
             name: one of "greeting", "wave", "hug", "shy", "dance".
