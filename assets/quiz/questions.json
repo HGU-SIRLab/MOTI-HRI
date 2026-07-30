@@ -1,18 +1,108 @@
 [
   {
-    "id": "placeholder0",
-    "image_path": "assets/quiz/cropped/placeholder0.jpg",
-    "answer": "먼지떨이",
+    "id": "브로콜리",
+    "image_path": "assets/quiz/cropped/브로콜리.jpg",
+    "answer": "브로콜리",
     "alternates": [
-      "먼지털이"
+      "녹색 꽃양배추"
     ],
-    "hint": "청소할 때 쓰는 도구예요"
+    "hint": "채소",
+    "full_image_path": "assets/quiz/full/브로콜리.jpg"
   },
   {
-    "id": "placeholder1",
-    "image_path": "assets/quiz/cropped/placeholder1.jpg",
-    "answer": "키보드",
+    "id": "빨래집게",
+    "image_path": "assets/quiz/cropped/빨래집게.jpg",
+    "answer": "빨래집게",
+    "alternates": [
+      "빨래꽂이",
+      "집게"
+    ],
+    "hint": "생활용품",
+    "full_image_path": "assets/quiz/full/빨래집게.jpg"
+  },
+  {
+    "id": "사슴",
+    "image_path": "assets/quiz/cropped/사슴.jpg",
+    "answer": "사슴",
+    "alternates": [
+      "녹"
+    ],
+    "hint": "동물",
+    "full_image_path": "assets/quiz/full/사슴.jpg"
+  },
+  {
+    "id": "샤워볼",
+    "image_path": "assets/quiz/cropped/샤워볼.jpg",
+    "answer": "샤워볼",
+    "alternates": [
+      "거품망",
+      "목욕망",
+      "목욕 스펀지"
+    ],
+    "hint": "생활용품",
+    "full_image_path": "assets/quiz/full/샤워볼.jpg"
+  },
+  {
+    "id": "수달",
+    "image_path": "assets/quiz/cropped/수달.jpg",
+    "answer": "수달",
+    "alternates": [
+      "수달피",
+      "달"
+    ],
+    "hint": "동물",
+    "full_image_path": "assets/quiz/full/수달.jpg"
+  },
+  {
+    "id": "칫솔",
+    "image_path": "assets/quiz/cropped/칫솔.jpg",
+    "answer": "칫솔",
+    "alternates": [
+      "잇솔",
+      "양치솔"
+    ],
+    "hint": "생활용품",
+    "full_image_path": "assets/quiz/full/칫솔.jpg"
+  },
+  {
+    "id": "카메라",
+    "image_path": "assets/quiz/cropped/카메라.jpg",
+    "answer": "카메라",
+    "alternates": [
+      "사진기",
+      "촬영기"
+    ],
+    "hint": "전자기기",
+    "full_image_path": "assets/quiz/full/카메라.jpg"
+  },
+  {
+    "id": "크로와상",
+    "image_path": "assets/quiz/cropped/크로와상.jpg",
+    "answer": "크로와상",
     "alternates": [],
-    "hint": "타자 칠 때 써요"
+    "hint": "음식",
+    "full_image_path": "assets/quiz/full/크로와상.jpg"
+  },
+  {
+    "id": "파스타면",
+    "image_path": "assets/quiz/cropped/파스타면.jpg",
+    "answer": "파스타면",
+    "alternates": [
+      "스파게티면",
+      "파스타 국수"
+    ],
+    "hint": "음식",
+    "full_image_path": "assets/quiz/full/파스타면.jpg"
+  },
+  {
+    "id": "호두과자",
+    "image_path": "assets/quiz/cropped/호두과자.jpg",
+    "answer": "호두과자",
+    "alternates": [
+      "호두빵",
+      "호두풀빵"
+    ],
+    "hint": "음식",
+    "full_image_path": "assets/quiz/full/호두과자.jpg"
   }
 ]

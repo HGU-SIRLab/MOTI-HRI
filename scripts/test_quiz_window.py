@@ -8,6 +8,10 @@
 사용:
     python scripts/test_quiz_window.py
     (필요하면 QUIZ_WINDOW_MONITOR_INDEX=1 python scripts/test_quiz_window.py 처럼 모니터 지정)
+
+    창이 전체화면+항상 위(topmost)라 같은 화면에서 터미널에 명령을 입력할 수 없다면,
+    QUIZ_WINDOW_TOPMOST=0으로 꺼서 Alt+Tab/클릭으로 터미널을 앞으로 꺼내 쓸 수 있다.
+    PowerShell: $env:QUIZ_WINDOW_TOPMOST=0; python scripts/test_quiz_window.py
 """
 import multiprocessing
 import os
