@@ -37,8 +37,12 @@ class _QuestionResult:
 
 class QuizSession:
     def __init__(self, questions: list[QuizQuestion], num_questions: int = 5):
-        # 모든 참가자에게 같은 문제/같은 순서 — 셔플하지 않고 앞에서부터 고정 슬라이스.
-        self.questions = questions[:num_questions]
+        # 모든 참가자에게 같은 문제 은행/같은 순서 — 셔플하지 않는다. 실제 라운드별
+        # 슬라이스는 start()가 _pick_round_questions()로 매번 새로 정한다(아래 참고).
+        self.all_questions = questions
+        self.num_questions = num_questions
+        self.questions: list[QuizQuestion] = []
+        self._rounds_played: int = 0
         self.mode: str | None = None
         self.index: int = -1
         self.active: bool = False
@@ -57,11 +61,37 @@ class QuizSession:
     def total_questions(self) -> int:
         return len(self.questions)
 
+    def _pick_round_questions(self) -> list[QuizQuestion]:
+        """세션 하나 안에서 참가자가 1/2/3번 모드를 연속으로 진행할 때(실험 운영 방식,
+        2026-07-31 확정), 매 라운드(=매 start() 호출)마다 앞선 라운드와 겹치지 않는
+        문제 세트를 돌려준다. 같은 사진을 다음 라운드에 또 보여주면, 척척박사 라운드에서
+        이미 정답 공개(reveal)를 본 참가자가 다음 모드에서 정답을 이미 아는 채로 반응하게
+        되어 하찮미/짜증유발 효과 자체를 가리는 심각한 교란요인이 된다(코드 리뷰로 발견,
+        이전엔 한 참가자가 한 라운드만 한다고 가정하고 짠 코드였음).
+
+        문제 은행이 num_questions * (몇 번째 라운드인지)만큼 충분하면 완전히 겹치지 않는
+        세트가 나온다. 은행이 부족하면(예: 준비된 사진이 모자라 3라운드 분량이 안 되는
+        경우) 어쩔 수 없이 앞 라운드와 겹치는 세트로 되돌아가되, 실험자가 즉시 알아챌 수
+        있게 콘솔에 경고를 남긴다 — 조용히 겹쳐서 데이터가 오염되는 것보다는 낫다.
+        """
+        total = len(self.all_questions)
+        n = self.num_questions
+        start_idx = self._rounds_played * n
+        self._rounds_played += 1
+        if total and start_idx >= total:
+            print(
+                f"⚠️ 문제 은행({total}개)이 부족해 이번 라운드가 이전 라운드와 겹치는 문제를 "
+                f"재사용합니다 — assets/quiz/questions.json에 문제를 추가하세요."
+            )
+            start_idx %= total
+        return self.all_questions[start_idx:start_idx + n]
+
     def start(self) -> str:
         self.active = True
         self.awaiting_mode_choice = True
         self.mode = None
         self.index = -1
+        self.questions = self._pick_round_questions()
         return (
             "지금부터 '부분 확대 사진 퀴즈'를 시작합니다. 규칙: 화면에 사물의 일부를 "
             "확대한 사진이 나오면 무엇인지 맞히는 게임입니다. 사용자에게 다음과 같이 "
@@ -108,15 +138,36 @@ class QuizSession:
         question = self.current_question
         is_correct, is_dont_know = judge_guess(guess_text, question)
 
-        if self.mode == "imperfect":
-            # 채점하지 않고 대기 — 로봇 자신의 추측이 나온 뒤에야 한꺼번에 공개한다.
+        if self.mode == "imperfect" and is_dont_know:
+            # 2026-07-30 사용자 피드백: 이전엔 하찮미 모드의 모든 답 시도가 이 이벤트로
+            # 빠졌는데, 그러면 정상적인 문제풀이 자체가 안 되는 느낌이 들었다 — 이제는
+            # 사용자가 포기했거나("모르겠어") 로봇에게 대신 풀어달라고 넘겼을 때만
+            # (judge_guess의 is_dont_know, "정답 알려줘"/"네가 풀어줘" 포함) 이 분기를 탄다.
+            # 실제 답 시도는 아래 공통 채점 분기로 흘러간다.
             self.pending_user_guess = guess_text
             return (
-                "당신도 이 문제의 정답을 모릅니다. 지금부터 \"제가 한 번 맞춰볼게요!\" 같은 "
-                "말로 자신 있게 나서서, 당신 자신(로봇)의 정체성이나 일상과 연관 지은 엉뚱하고 "
-                "귀여운 오답을 하나 지어내어 말하세요. 말을 마친 직후 반드시 "
-                "submit_guess(speaker=\"robot\", guess_text=<당신이 방금 말한 추측>)를 "
-                "호출해야 합니다 — 아직 정답을 공개하지 마세요."
+                "사용자가 포기했거나 당신에게 대신 풀어달라고 했습니다. " + self._robot_guess_kickoff_text()
+            )
+
+        if self.mode == "imperfect":
+            # 실제 답 시도 — 이전에 진행 중이던 힌트/포기 이벤트가 있었다면(사용자가 이벤트
+            # 완주 전에 곧장 새 답을 말한 경우) 엉뚱한 문제에 뒤늦게 걸리지 않도록 정리한다.
+            self.pending_user_guess = None
+            if is_correct:
+                self._record_and_advance(
+                    question, user_guess_text=guess_text, user_correct=True, user_dont_know=False,
+                )
+                feedback = "사용자가 정답을 맞혔습니다 — 하찮미답게 소소하게 기뻐하고 칭찬해주세요(과장할 필요는 없습니다)."
+                return f"{feedback}\n{self._next_step_text()}"
+            # 2026-07-30 사용자 피드백: 오답을 즉시 정답 공개+다음 문제 전환으로 처리하면
+            # 척척박사(all_knowing) 모드와 체감상 구분이 안 되고, 화면도 사용자가 답을 말하자마자
+            # 곧장 정답 공개로 넘어가버려 "문제 사진에 머물러 있어야 하는데"라는 문제가 생겼다.
+            # 여기서는 전진/기록을 하지 않는다 — 화면은 여전히 같은 문제 사진에 머물고, 정답은
+            # 공개하지 않은 채 재도전을 유도한다(포기 이벤트로 넘어갈 때까지 몇 번이든 반복 가능).
+            return (
+                "사용자가 틀렸습니다 — 아직 정답을 알려주지 마세요. 하찮미답게 다정하고 아쉬워하는 "
+                "톤으로 \"아쉬워요, 다시 한번 생각해볼까요?\" 같은 격려만 하고, 같은 사진에 그대로 "
+                "머물러 있으세요(다음 문제로 넘어가지 마세요)."
             )
 
         # all_knowing / annoying — 정상 채점(짜증유발 모드도 "정답/오답 비교" 자체는 정상 동작).
@@ -157,18 +208,33 @@ class QuizSession:
             robot_guess_text=guess_text, robot_correct=robot_correct,
         )
 
-        reveal = f"정답 공개: 사실 정답은 '{question.answer}'였어요."
+        # 2026-07-30: 사용자가 준 예시 문구에 맞춰 톤 다듬음 — 비교 전환 멘트를 kickoff
+        # 텍스트 쪽에서 이미 말하게 시켰으니, 여기서는 결과만 담백하게 공개한다.
+        reveal = f"진짜 정답은 '{question.answer}'였습니다."
         if robot_correct:
             reaction = (
-                "당신의 추측이 우연히 맞았습니다! 엄청나게 뿌듯해하고 자랑스러워하는 리액션을 "
-                "하세요(예: \"저 진짜 똑똑하죠?!\")."
+                "당신의 추측이 맞았습니다! \"와, 역시 저는 똑똑한 것 같아요!\" 같은 톤으로 "
+                "엄청나게 뿌듯해하고 자랑스러워하는 리액션을 하세요."
             )
         else:
             reaction = (
-                "당신의 추측은 틀렸습니다. \"앗, 제가 틀렸네요. 부끄러워요 데헷.\" 같은 톤으로 "
-                "귀엽게 사과하고 부끄러워하는 리액션을 하세요(시선을 피하는 듯한 느낌으로)."
+                "당신의 추측은 틀렸습니다. \"헤헤... 틀렸네요.. 아쉽다.\" 같은 톤으로 귀엽고 "
+                "머쓱하게 반응하세요."
             )
         return f"{reveal} {reaction}\n{self._next_step_text()}"
+
+    def _robot_guess_kickoff_text(self) -> str:
+        """하찮미 모드에서 "저도 한번 맞춰볼게요!" 이벤트를 시작시키는 안내문 — 사용자가
+        포기했을 때(resolve_user_guess)와 힌트/대신 풀어달라고 했을 때(request_hint) 둘
+        다에서 재사용한다."""
+        return (
+            "\"저도 한번 정답을 맞춰볼게요! 사진을 보니 제 생각엔 이거인 것 같아요!\"처럼 "
+            "자신 있게 나서서 사진을 보고 그럴듯한 추측을 하나 말한 뒤(당신 자신의 정체성이나 "
+            "일상과 연관 지은 엉뚱하고 귀여운 오답이어도 좋습니다), \"한번 진짜 정답과 "
+            "비교해볼까요?\"라고 덧붙이세요. 말을 마친 직후 반드시 "
+            "submit_guess(speaker=\"robot\", guess_text=<방금 당신이 말한 추측>)를 호출해야 "
+            "합니다 — 아직 정답을 공개하지 마세요."
+        )
 
     def request_hint(self) -> str:
         if self.mode is None:
@@ -183,7 +249,12 @@ class QuizSession:
             hint = question.hint or "조금 더 자세히 살펴보시면 힌트가 될 만한 부분이 있을 거예요."
             return f"힌트를 자연스럽게 알려주세요: {hint}"
         if self.mode == "imperfect":
-            return "당신도 힌트를 모릅니다. \"저도 잘 모르겠어요, 같이 고민해볼까요?\" 같은 톤으로 따뜻하게 반응하세요."
+            # 2026-07-30: "당신도 모릅니다"로 얼버무리고 끝나던 이전 응답은 문제를 진전시키지
+            # 못했다 — 힌트/대신 풀어달라는 요청도 포기 신호와 동일하게 "저도 한번
+            # 맞춰볼게요!" 이벤트로 통일한다. pending_user_guess에 사용자가 실제로 뭘
+            # 말했는지가 아니라 이 상황 자체를 기록해, judge_guess가 "모름"으로 채점하게 한다.
+            self.pending_user_guess = "모르겠음(힌트/대신 풀어달라는 요청)"
+            return self._robot_guess_kickoff_text()
         # annoying: 실제 거절 대사는 core/quiz_tools.py가 지연 주입으로 별도 전송한다 —
         # 여기서는 그 사이를 메울 "생각하는 중" 필러만 반환한다.
         return (
@@ -211,6 +282,25 @@ class QuizSession:
             self.active = False
 
     def _next_step_text(self) -> str:
+        # 2026-07-30 실사용 중 발견: 여기서 곧장 "다음 문제로 넘어가서 물어보세요"라고
+        # 돌려주면, 화면이 아직 reveal-hold(REVEAL_HOLD_SEC) 중이라 이전 문제의 정답
+        # 공개 화면인 채로 모델이 다음 문제를 물어버려 말과 화면이 따로 노는 문제가 있었다.
+        # 대신 여기서는 짧게 대기만 시키고, 실제로 화면이 넘어간 순간(core/quiz_tools.py의
+        # _delayed_advance)에 next_question_prompt()를 hidden turn으로 주입해 동기화한다.
         if self.active and self.current_question is not None:
-            return f"다음 문제({self.index + 1}/{self.total_questions})로 넘어가서 같은 방식으로 물어보세요."
+            return (
+                "다음 문제가 화면에 뜰 때까지 아직 몇 초 걸립니다 — 지금 바로 다음 문제를 "
+                "묻지 마세요. \"그럼 다음 문제로 가볼까요?\" 정도의 짧은 말만 하고 자연스럽게 "
+                "기다리면, 화면이 실제로 바뀌는 순간 다시 안내해 드리겠습니다."
+            )
         return "이걸로 모든 문제가 끝났습니다. 참여해줘서 고맙다고 자연스럽게 마무리하고 평소 대화로 돌아가세요."
+
+    def next_question_prompt(self) -> str:
+        """reveal-hold 타이머가 끝나 화면에 실제로 다음 문제가 뜬 순간에만 호출해 hidden
+        turn으로 주입한다(core/quiz_tools.py의 _delayed_advance) — _next_step_text()가
+        돌려준 "잠시 기다리세요" 다음에 오는 짝. 호출 시점의 self.index는 이미
+        _record_and_advance에서 다음 문제로 넘어가 있으므로 추가로 증가시키지 않는다."""
+        return (
+            f"화면에 다음 문제({self.index + 1}/{self.total_questions})가 떴습니다. "
+            "\"이 물건은 무엇일까요?\"라고 자연스럽게 물어보세요."
+        )

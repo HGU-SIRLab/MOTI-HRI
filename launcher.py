@@ -17,10 +17,10 @@
 사용:
     python launcher.py [카메라 인덱스]
     Ctrl+C 또는 대화 중 자연스러운 작별 인사([대화종료])로 종료 — 이름을 아는 경우
-    user_result/에 대화록+결과지가 남는다.
+    user_result/에 대화록+결과지가 남고, 퀴즈를 진행했다면 core/quiz_export.py가
+    같은 폴더 아래 참가자+시각 단위 하위 폴더에 모드(1/2/3)별 결과 파일도 남긴다.
 """
 import asyncio
-import json
 import multiprocessing
 import os
 import queue
@@ -28,7 +28,6 @@ import sys
 import threading
 import time
 import wave
-from datetime import datetime
 
 from dynamixel_sdk import PacketHandler, PortHandler
 
@@ -45,6 +44,7 @@ from core.emotion_tools import make_set_emotion_tool
 from core.idle_watcher import IDLE_SLEEP_SEC, decide_idle_action
 from core.memory_tools import make_forget_me_tool, make_remember_fact_tool
 from core.motion_tools import make_motion_tools
+from core.quiz_export import save_quiz_results
 from core.quiz_tools import make_quiz_tools
 from core.utils import build_persona_system_instruction, extract_exit_tag
 from display.main import RobotFaceApp
@@ -52,11 +52,18 @@ from display.quiz_window import quiz_window_process
 from hardware import config as C
 from hardware import init as I
 from media.audio_manager import ENABLE_AEC, INPUT_RATE, OUTPUT_RATE, EchoCanceller, MicStreamer, Speaker
-from media.voice_shift import ENABLE_VOICE_SHIFT, VoiceShifter
+from media.voice_shift import ENABLE_VOICE_SHIFT, VOICE_SHIFT_BUFFER_MS, VoiceShifter
 from vision import face as F
 from vision.vision_brain import RobotBrain
 
 LIVE_MODEL = os.getenv("LIVE_MODEL_NAME", "models/gemini-3.1-flash-live-preview")
+# 퀴즈 모드가 히든 턴을 주입(inject_turn)할 때, 로봇이 아직 이전 턴을 말하는 도중이면 곧장
+# 보내지 말고 기다려야 한다 — 안 그러면 새 응답 생성이 이전 발화 위에 겹쳐서 음성이
+# 끊기거나 뭉개지는 사고가 난다(2026-07-30 실사용 중 발견, 하찮미 모드의 "저도 맞춰볼게요"
+# 이벤트처럼 발화가 길어질수록 REVEAL_HOLD_SEC 고정 지연만으로는 부족했음). turn_complete
+# 이후에도 VoiceShifter가 최대 VOICE_SHIFT_BUFFER_MS만큼 버퍼링한 오디오를 아직 재생 중일
+# 수 있어, 그 버퍼가 다 흘러나갈 시간을 넉넉히(2배) 더 기다린다.
+POST_SPEECH_DRAIN_SEC = (VOICE_SHIFT_BUFFER_MS * 2) / 1000
 # 30종 프리셋 중 Fenrir + 피치/포먼트 시프트(media/voice_shift.py)가 "귀엽고 하찮은" 톤에
 # 제일 가깝다고 실제로 들어보고 결정했었으나(voice_picker 실험), 교수님 피드백으로 Zephyr로
 # 교체함(2026-07-28, docs/progress.md 참고).
@@ -154,11 +161,20 @@ async def run_conversation(name_state: dict, facts_summary: str | None, emotion_
     # 그 tools 안에 이 콜백을 참조하는 퀴즈 툴이 들어있어야 함) — session_holder라는
     # 가변 딕셔너리로 우회한다(remember_fact의 name_state와 같은 발상).
     session_holder = {"session": None}
+    # recv_loop가 갱신한다: 오디오 데이터가 도착하는 동안은 clear, 턴이 끝나면(sc.turn_complete
+    # 또는 sc.interrupted) set — inject_turn()이 "로봇이 지금 말하는 중인가"를 알 수 있는
+    # 유일한 신호. 초기값은 set(아직 아무도 말하지 않음).
+    speaking_done = asyncio.Event()
+    speaking_done.set()
 
     async def inject_turn(text: str):
         s = session_holder["session"]
         if s is None:
             return
+        # 로봇이 아직 이전 턴을 말하는 도중이면 곧장 보내지 않고 기다린다 — 안 그러면 새
+        # 응답 생성이 이전 발화 위에 겹쳐서 음성이 끊기거나 뭉개지는 사고가 난다(2026-07-30).
+        await speaking_done.wait()
+        await asyncio.sleep(POST_SPEECH_DRAIN_SEC)
         await s.send_client_content(
             turns=types.Content(role="user", parts=[types.Part(text=text)]),
             turn_complete=True,
@@ -271,6 +287,9 @@ async def run_conversation(name_state: dict, facts_summary: str | None, emotion_
                             speaker.stop_immediately()
                             if shifter:
                                 shifter.reset()
+                            # 재생을 강제로 끊었으니(barge-in 등) 더 이상 "말하는 중"이 아니다 —
+                            # inject_turn()이 여기서 계속 기다리며 멈춰있지 않게 한다.
+                            speaking_done.set()
 
                         if message.data:
                             if shifter:
@@ -278,8 +297,10 @@ async def run_conversation(name_state: dict, facts_summary: str | None, emotion_
                             else:
                                 speaker.play(message.data)
                             # 로봇이 말하는 중 — 사용자가 조용히 듣고만 있어도 idle-sleep이
-                            # 끼어들면 안 된다.
+                            # 끼어들면 안 되고, inject_turn()도 이 턴이 끝날 때까지 기다려야
+                            # 겹쳐 말하지 않는다(2026-07-30).
                             last_activity_time[0] = time.monotonic()
+                            speaking_done.clear()
 
                         if sc and sc.input_transcription and sc.input_transcription.text:
                             turn_user.append(sc.input_transcription.text)
@@ -303,6 +324,10 @@ async def run_conversation(name_state: dict, facts_summary: str | None, emotion_
                                 # 버퍼 임계값(기본 500ms) 미만으로 남은 발화 꼬리를 흘려보낸다
                                 # — 안 하면 매 턴 마지막 조각이 조용히 잘려나간다.
                                 shifter.flush()
+                            # 서버가 이 턴의 생성을 끝냈다 — inject_turn()이 기다리고 있었다면
+                            # 이제 진행해도 된다(POST_SPEECH_DRAIN_SEC만큼 더 기다려 로컬
+                            # 버퍼/재생 꼬리까지 흘려보낸 뒤 다음 턴을 보낸다).
+                            speaking_done.set()
                             u = "".join(turn_user).strip()
                             m_raw = "".join(turn_moti).strip()
                             m_clean, should_end = extract_exit_tag(m_raw)
@@ -504,17 +529,9 @@ def main():
         elif session_history:
             print("ℹ️  이름을 몰라 결과지는 생성하지 않습니다 (대화 자체는 정상 진행됨).")
 
-        if quiz_log:
-            # 연구 데이터 — 문항별 모드/정답여부/힌트요청여부/타임스탬프(core/quiz_state.py
-            # export_log() 참고). report_manager.py를 건드리지 않고 여기서 직접 저장.
-            result_dir = os.path.join(_REPO_ROOT, "user_result")
-            os.makedirs(result_dir, exist_ok=True)
-            today_str = datetime.now().strftime("%Y-%m-%d")
-            quiz_log_name = final_name or "unknown"
-            quiz_log_path = os.path.join(result_dir, f"{today_str}_{quiz_log_name}_quiz.json")
-            with open(quiz_log_path, "w", encoding="utf-8") as f:
-                json.dump(quiz_log, f, ensure_ascii=False, indent=2)
-            print(f"📄 퀴즈 결과 로그 저장 완료: {quiz_log_path}")
+        # 연구 데이터 — 문항별 모드/정답여부/힌트요청여부/타임스탬프(core/quiz_state.py
+        # export_log() 참고)를 1/2/3번 모드별 파일로 나눠 저장한다(core/quiz_export.py).
+        save_quiz_results(final_name, quiz_log)
 
 
 if __name__ == "__main__":

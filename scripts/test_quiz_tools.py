@@ -82,7 +82,7 @@ async def main():
     ok &= check("mode-select pushes first question",
                 msg["type"] == "question" and msg["image_path"].replace("\\", "/").endswith("q0.jpg"))
 
-    submit_guess("user", "내추측")
+    submit_guess("user", "모르겠어요")  # 포기 신호 -> "저도 맞춰볼게요" 이벤트로 감
     submit_guess("robot", "정답0")  # 로봇이 우연히 맞춤
     ok &= check("robot-correct triggers EXCITED emotion", emotion_calls == ["EXCITED"])
     time.sleep(0.1)
@@ -96,7 +96,7 @@ async def main():
     ok &= check("advances to second question after reveal hold",
                 msg["type"] == "question" and msg["image_path"].replace("\\", "/").endswith("q1.jpg"))
 
-    submit_guess("user", "사용자오답2")
+    submit_guess("user", "정답 알려줘")  # 이것도 포기 신호로 인식돼야 함
     submit_guess("robot", "틀린답")  # 로봇도 틀림
     time.sleep(0.1)
     ok &= check("robot-wrong triggers look-away motion", ("look_away",) in calls)
@@ -105,6 +105,33 @@ async def main():
     await asyncio.sleep(0.15)
     msg = quiz_ui_q.get()
     ok &= check("quiz ends after last question", msg["type"] == "hide")
+
+    # 2026-07-30: 하찮미 모드에서 실제 답 시도는 "저도 맞춰볼게요" 이벤트 없이 바로
+    # 채점되고, reveal/다음 문제 전환은 여느 모드와 동일하게 정상 동작해야 한다.
+    start1b, select1b, submit1b, hint1b, end1b, sess1b = qt.make_quiz_tools(
+        quiz_ui_q, busy, motion_ctx, fake_inject_turn, loop, emotion_queue=emotion_queue, num_questions=2,
+    )
+    start1b()
+    quiz_ui_q.get()
+    select1b("imperfect")
+    quiz_ui_q.get()
+
+    # 오답 시도 — 2026-07-30 피드백: 척척박사처럼 곧장 정답 공개+전진하면 안 되고, 같은
+    # 문제 사진에 머물며 재도전을 유도해야 한다(화면에는 아무것도 새로 안 떠야 함).
+    r = submit1b("user", "땡땡땡")
+    ok &= check("imperfect wrong guess does not leak the answer", "정답0" not in r)
+    ok &= check("imperfect wrong guess does not advance", sess1b.index == 0)
+    ok &= check("imperfect wrong guess pushes nothing to the UI", quiz_ui_q.empty())
+
+    r = submit1b("user", "정답0")  # 재도전 끝에 정답
+    ok &= check("imperfect real guess has no kickoff instruction", "submit_guess" not in r)
+    ok &= check("imperfect real guess advances immediately", sess1b.index == 1)
+    msg = quiz_ui_q.get()
+    ok &= check("imperfect real guess still pushes reveal", msg["type"] == "reveal" and "정답0" in msg["text"])
+    await asyncio.sleep(0.15)
+    msg = quiz_ui_q.get()
+    ok &= check("imperfect real guess still advances UI to next question",
+                msg["type"] == "question" and msg["image_path"].replace("\\", "/").endswith("q1.jpg"))
 
     # 짜증유발 모드 힌트 스톨 + 지연 주입(가장 중요한 케이스)
     start2, select2, submit2, hint2, end2, sess2 = qt.make_quiz_tools(

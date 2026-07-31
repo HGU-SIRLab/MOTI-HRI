@@ -104,5 +104,57 @@
     ],
     "hint": "음식",
     "full_image_path": "assets/quiz/full/호두과자.jpg"
+  },
+  {
+    "id": "딸기",
+    "image_path": "assets/quiz/cropped/딸기.jpg",
+    "answer": "딸기",
+    "alternates": [
+      "양딸기"
+    ],
+    "hint": "과일",
+    "full_image_path": "assets/quiz/full/딸기.jpg"
+  },
+  {
+    "id": "머그컵",
+    "image_path": "assets/quiz/cropped/머그컵.jpg",
+    "answer": "머그컵",
+    "alternates": [
+      "손잡이컵",
+      "잔"
+    ],
+    "hint": "식기류",
+    "full_image_path": "assets/quiz/full/머그컵.jpg"
+  },
+  {
+    "id": "모티",
+    "image_path": "assets/quiz/cropped/모티.jpg",
+    "answer": "모티",
+    "alternates": [
+      "모티"
+    ],
+    "hint": null,
+    "full_image_path": "assets/quiz/full/모티.jpg"
+  },
+  {
+    "id": "손톱깍이",
+    "image_path": "assets/quiz/cropped/손톱깍이.jpg",
+    "answer": "손톱깍이",
+    "alternates": [
+      "손톱깎개"
+    ],
+    "hint": "위생용품",
+    "full_image_path": "assets/quiz/full/손톱깍이.jpg"
+  },
+  {
+    "id": "수건",
+    "image_path": "assets/quiz/cropped/수건.jpg",
+    "answer": "수건",
+    "alternates": [
+      "타월",
+      "닦개"
+    ],
+    "hint": "생활용품",
+    "full_image_path": "assets/quiz/full/수건.jpg"
   }
 ]

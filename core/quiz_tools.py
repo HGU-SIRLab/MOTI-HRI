@@ -73,6 +73,11 @@ def make_quiz_tools(quiz_ui_q, busy: threading.Event, motion_ctx, inject_turn, l
         await asyncio.sleep(REVEAL_HOLD_SEC)
         _pending_reveal_transition["task"] = None
         _push_question_or_hide()
+        # 화면이 실제로 다음 문제로 바뀐 이 순간에만 모델에게 물어보라고 알린다 —
+        # session.resolve_*_guess()가 곧장 돌려주면 아직 이전 문제 reveal 화면인 채로
+        # 모델이 먼저 물어봐서 말/화면이 어긋나는 문제(2026-07-30)가 있었다.
+        if session.active and session.current_question is not None:
+            await inject_turn(session.next_question_prompt())
 
     def _schedule_reveal_transition():
         _cancel_pending_reveal_transition()
@@ -171,20 +176,13 @@ def make_quiz_tools(quiz_ui_q, busy: threading.Event, motion_ctx, inject_turn, l
         if speaker not in ("user", "robot"):
             return "speaker는 'user' 또는 'robot'이어야 합니다."
 
-        was_imperfect_user_turn = speaker == "user" and session.mode == "imperfect"
-        if not was_imperfect_user_turn:
-            # 이 호출로 문제가 넘어갈 예정이니(하찮미 모드의 사용자 차례만 예외), 이전
-            # 문제에서 걸어둔 지연된 거절 대사/정답 공개 전환이 있으면 지금 취소한다.
-            _cancel_pending_stall()
-            _cancel_pending_reveal_transition()
-
-        # resolve_*_guess가 호출되면 session.current_question이 다음 문제로 넘어가므로,
-        # 정답 공개에 쓸 "방금 답한" 문제는 반드시 호출 전에 붙잡아둬야 한다.
-        answered_question = session.current_question if not was_imperfect_user_turn else None
-        # resolve_*_guess는 상황이 안 맞으면(퀴즈 비활성, pending_user_guess 없음 등) 아무것도
-        # 기록/전진하지 않고 안내 문구만 반환할 수 있다 — 그런 무효 호출에도 reveal을 띄우면
-        # 아직 안 풀린 문제의 "정답 공개" 화면이 잘못 뜨는 사고가 난다. 실제로 결과가
-        # 기록됐을 때만(진짜로 전진했을 때만) reveal을 띄운다.
+        # 2026-07-30까지는 "사용자 차례 + 하찮미 모드"면 무조건 채점을 미루는(staging)
+        # 호출이라고 미리 가정하고 여기서 판단했었다. 이제 하찮미 모드의 실제 답 시도는
+        # 이벤트 없이 곧장 채점/전진할 수 있어서 그 가정이 깨졌다 — 미리 판단하는 대신
+        # resolve_*_guess를 실제로 호출한 뒤 session.results가 늘었는지(advanced)로만
+        # 판단한다. "방금 답하던" 문제는 advanced 여부와 무관하게 호출 전 상태를 붙잡아둬야
+        # 하므로 미리 저장해둔다(advanced가 False면 그냥 버려짐).
+        question_before_call = session.current_question
         results_count_before = len(session.results)
 
         if speaker == "robot":
@@ -201,8 +199,16 @@ def make_quiz_tools(quiz_ui_q, busy: threading.Event, motion_ctx, inject_turn, l
             text = session.resolve_user_guess(guess_text)
 
         advanced = len(session.results) > results_count_before
-        if not was_imperfect_user_turn and advanced:
-            _push_reveal(answered_question)
+        if advanced:
+            # 실제로 채점/전진했을 때만 — 이전 문제에서 걸어둔 지연된 거절 대사/정답 공개
+            # 전환이 남아있으면 지금 취소하고, 방금 답한 문제의 정답 공개 화면을 띄운다.
+            # resolve_*_guess가 상황이 안 맞으면(퀴즈 비활성, pending_user_guess 없음, 하찮미
+            # 포기 신호로 staging만 한 경우 등) 아무것도 기록/전진하지 않을 수 있는데, 그런
+            # 무효/staging 호출에 reveal을 띄우면 아직 안 풀린 문제의 "정답 공개" 화면이
+            # 잘못 뜨는 사고가 난다.
+            _cancel_pending_stall()
+            _cancel_pending_reveal_transition()
+            _push_reveal(question_before_call)
             _schedule_reveal_transition()
 
         return text
