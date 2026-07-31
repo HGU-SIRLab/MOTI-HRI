@@ -74,11 +74,13 @@ def main():
     ok &= check("annoying mode clamps excited -> neutral too", q3.items[-1] == "NEUTRAL")
 
     # 4. 짜증유발 모드가 자연 종료되면(session.active == False) 제한도 같이 풀려야 한다
-    # (퀴즈 끝난 뒤 평소 대화로 돌아왔는데 표정이 계속 눌려 있으면 안 됨).
+    # (퀴즈 끝난 뒤 평소 대화로 돌아왔는데 표정이 계속 눌려 있으면 안 됨). 2026-07-31
+    # 재설계(3차)로 실제 답 시도는 항상 거절만 당하고, 명시적 포기/스킵 요청("정답
+    # 알려줘" 등)이 와야 그 자리에서 곧장 기록/전진한다.
     session3.resolve_user_guess("정답0")
-    session3.confirm_annoying_correct()
+    session3.resolve_user_guess("정답 알려줘")
     session3.resolve_user_guess("정답1")
-    session3.confirm_annoying_correct()
+    session3.resolve_user_guess("정답 알려줘")
     ok &= check("quiz naturally ended after last question", not session3.active)
     set_emotion3("happy")
     ok &= check("emotion unclamped again once the annoying round has ended", q3.items[-1] == "HAPPY")

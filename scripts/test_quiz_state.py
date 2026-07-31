@@ -134,88 +134,67 @@ def main():
     txt = s4.request_hint()
     ok &= check("annoying hint does NOT contain the refusal line itself", MODE3_REFUSAL_LINE not in txt)
 
-    # 4b. 2026-07-31 1차 수정: 짜증유발 모드는 오답이든 정답이든 이 턴에서 곧장 알려주면
-    # 안 된다(정답을 몰라야 하는데 즉시 "땡! 정답은 ~"으로 새버렸던 실제 버그) — 힌트
-    # 거절과 같은 필러만 반환하고, pending_user_guess/annoying_pending_correct로 core/
-    # quiz_tools.py가 지연 스케줄링을 결정한다. 2차 수정: 오답은 거절 대사만 하고 끝나면
-    # 안 되고(정답을 못 맞히면 영원히 다음 문제로 못 넘어가는 사고가 실제 테스트에서
-    # 났음), 거절 직후 곧장 reveal_annoying_wrong()으로 정답을 공개하고 전진해야 한다.
+    # 4b. 2026-07-31 재설계(3차): 짜증유발 모드는 실제 답 시도(맞았든 틀렸든)에 예외 없이
+    # 매번 거절만 하고 절대 진행하지 않는다 — "거절해놓고 몇 초 뒤 바로 정답을 알려주면
+    # 사실 알고 있었던 것처럼 보인다"는 지적으로, 이전(1~2차)의 "거절 후 자동 공개" 설계를
+    # 되돌렸다. 참가자가 명시적으로 포기/스킵을 요청할 때만(judge_guess의 is_dont_know)
+    # 그 자리에서 곧장 정답을 공개하고 전진한다("나는 모르지만 화면 정보를 전달한다" 서사).
     s4b = QuizSession(make_questions(2), num_questions=2)
     s4b.start()
     s4b.choose_mode("annoying")
     txt = s4b.resolve_user_guess("땡땡땡")
     ok &= check(
-        "annoying wrong guess withholds answer, no advance yet, filler only",
+        "annoying wrong guess withholds answer, does not advance, filler only",
         "정답0" not in txt and s4b.index == 0 and len(s4b.results) == 0
         and s4b.pending_user_guess == "땡땡땡" and s4b.annoying_pending_correct is False,
     )
-    # core/quiz_tools.py가 거절 대사(MODE3_REFUSAL_LINE)를 말한 직후 이걸 호출해야
-    # 비로소 기록/전진하고 정답을 공개한다 — 정답을 맞히지 못해도 다음 문제로 넘어간다.
-    txt = s4b.reveal_annoying_wrong()
+    # 계속 답을 시도해도(맞아도!) 진행되지 않는다 — 정답을 맞혀도 그냥 거절만 당한다.
+    txt = s4b.resolve_user_guess("정답0")
     ok &= check(
-        "reveal_annoying_wrong records the wrong guess, advances, and reveals the answer",
+        "even a CORRECT guess still gets withheld/refused, no advance",
+        "정답0" not in txt and s4b.index == 0 and len(s4b.results) == 0
+        and s4b.pending_user_guess == "정답0" and s4b.annoying_pending_correct is True,
+    )
+    # 명시적으로 포기/스킵을 요청해야만 그 자리에서 곧장 정답이 공개되고 전진한다 —
+    # 직전 실제 시도(정답0, 맞았음)의 정오는 로그에 보존된다.
+    txt = s4b.resolve_user_guess("그냥 다음 문제로 넘어가줘")
+    ok &= check(
+        "an explicit give-up/skip request immediately reveals and advances (no stalling)",
         "정답0" in txt and s4b.index == 1 and len(s4b.results) == 1
-        and s4b.results[0].user_correct is False and s4b.results[0].user_guess_text == "땡땡땡"
         and s4b.pending_user_guess is None,
     )
-
-    # 두 번째(마지막) 문제 — 이번엔 정답을 맞히면 즉시 확정하지 않고 pending에만 저장.
-    txt = s4b.resolve_user_guess("정답1")
+    r0 = s4b.results[0]
     ok &= check(
-        "annoying correct guess ALSO withholds confirmation for now (stashed as pending)",
-        "정답1" not in txt and s4b.index == 1 and len(s4b.results) == 1
-        and s4b.pending_user_guess == "정답1" and s4b.annoying_pending_correct is True,
+        "the give-up result preserves the last real attempt's correctness for logging",
+        r0.user_correct is True and r0.user_dont_know is True
+        and r0.user_guess_text == "그냥 다음 문제로 넘어가줘",
     )
-    # 정답을 맞힌 뒤 core/quiz_tools.py가 뜸들이기 지연 끝에 이걸 호출해야 실제로 기록/전진한다.
-    txt = s4b.confirm_annoying_correct()
     ok &= check(
-        "confirm_annoying_correct records the correct guess and advances",
-        "정답입니다" in txt and s4b.index == 2 and len(s4b.results) == 2
-        and s4b.pending_user_guess is None and s4b.results[1].user_correct is True
+        "reveal wording frames it as reading the screen, not the robot's own knowledge",
+        "화면에 적힌" in txt,
+    )
+
+    # 두 번째(마지막) 문제 — 이번엔 실제 시도 없이 곧장 포기하면 correctness가 False로 남는다.
+    txt = s4b.resolve_user_guess("정답 알려줘")
+    ok &= check(
+        "giving up with no prior real attempt records user_correct=False",
+        "정답1" in txt and s4b.index == 2 and len(s4b.results) == 2
+        and s4b.results[1].user_correct is False and s4b.results[1].user_dont_know is True
         and not s4b.active,
     )
-    # 방어 가드: annoying_pending_correct가 없는데(예: 이미 확정된 뒤) 잘못 호출되면 무시.
-    txt2 = s4b.confirm_annoying_correct()
-    ok &= check("confirm_annoying_correct is a no-op without a pending correct guess", "무시" in txt2)
 
-    # 방어 가드: 짜증유발 모드가 아니면 reveal_annoying_wrong도 무시해야 한다.
+    # request_hint()도 정오 로그를 초기화해야 한다 — 힌트를 물었다는 건 실제로 맞힌 적이
+    # 없다는 뜻이므로, 그 직후 포기하면 정확하게 False로 기록돼야 한다.
     s4c = QuizSession(make_questions(1), num_questions=1)
     s4c.start()
-    s4c.choose_mode("all_knowing")
-    txt = s4c.reveal_annoying_wrong()
-    ok &= check("reveal_annoying_wrong ignored outside annoying mode", "무시" in txt)
-
-    # 회귀 방지: 정답을 말해 annoying_pending_correct가 True인 상태에서, 확정 전에 다시
-    # 오답을 말하면 그 정답 상태는 지워져야 한다 — 안 그러면 core/quiz_tools.py가 오답
-    # 다음에도 "정답 확정" 지연을 잘못 스케줄해버린다(코드 리뷰로 발견).
-    s4d = QuizSession(make_questions(1), num_questions=1)
-    s4d.start()
-    s4d.choose_mode("annoying")
-    s4d.resolve_user_guess("정답0")
-    ok &= check("correct guess sets the pending-correct flag",
-                s4d.annoying_pending_correct is True and s4d.pending_user_guess == "정답0")
-    s4d.resolve_user_guess("이번엔땡")
-    ok &= check(
-        "a wrong guess right after a pending correct clears the stale correct flag",
-        s4d.annoying_pending_correct is False and s4d.pending_user_guess == "이번엔땡",
-    )
-
-    # request_hint()도 pending을 "모름"으로 명시해야, 이전에 남아있던 오답 텍스트가
-    # 엉뚱하게 다음 reveal에 기록되지 않는다.
-    s4e = QuizSession(make_questions(1), num_questions=1)
-    s4e.start()
-    s4e.choose_mode("annoying")
-    s4e.resolve_user_guess("아까오답")
-    s4e.request_hint()
-    ok &= check(
-        "annoying hint request clears any earlier pending wrong-guess text",
-        s4e.pending_user_guess is None and s4e.annoying_pending_dont_know is True,
-    )
-    s4e.reveal_annoying_wrong()
-    ok &= check(
-        "reveal after a bare hint request records a None/dont-know guess, not the stale wrong text",
-        s4e.results[0].user_guess_text is None and s4e.results[0].user_dont_know is True,
-    )
+    s4c.choose_mode("annoying")
+    s4c.resolve_user_guess("정답0")  # 실제로 맞혔지만
+    s4c.request_hint()  # 그 뒤 힌트를 물었으니 "맞힌 적 없음"으로 리셋돼야 함
+    ok &= check("hint request resets the pending-correct flag even after a correct guess",
+                s4c.annoying_pending_correct is False)
+    txt = s4c.resolve_user_guess("그만할래")
+    ok &= check("give-up after a hint request records user_correct=False",
+                s4c.results[0].user_correct is False)
 
     # 5. 조기 종료
     s5 = QuizSession(make_questions(5), num_questions=5)

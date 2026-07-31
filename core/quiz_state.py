@@ -48,12 +48,11 @@ class QuizSession:
         self.active: bool = False
         self.awaiting_mode_choice: bool = False
         self.pending_user_guess: str | None = None
-        # 짜증유발 모드 전용 — pending_user_guess가 최근 답의 "판정 결과"까지 함께 들고
-        # 있어야, 나중에(뜸들이기 지연 뒤) core/quiz_tools.py가 정답 확정/거절 중 어느
-        # 경로로 갈지 결정할 수 있다(2026-07-31, confirm_annoying_correct/
-        # reveal_annoying_wrong 참고).
+        # 짜증유발 모드 전용 — 실제 답 시도(맞았든 틀렸든)의 정오를 기억해뒀다가, 나중에
+        # 참가자가 포기/스킵을 요청하면 그 시점의 로그에 반영한다(2026-07-31, 응답 자체는
+        # 항상 거절이라 정오가 그 자리에서 드러나지는 않지만 조작 점검/정답률 지표로는
+        # 남겨둘 가치가 있다).
         self.annoying_pending_correct: bool = False
-        self.annoying_pending_dont_know: bool = False
         self.results: list[_QuestionResult] = []
         self._hint_requested_this_question: bool = False
 
@@ -167,17 +166,36 @@ class QuizSession:
             )
 
         if self.mode == "annoying":
-            # 2026-07-31 1차 수정: 오답에 곧장 정답을 알려주면 척척박사 모드와 체감이
-            # 구분되지 않는다는 문제로, 오답/모름이든 정답이든 이 턴에서는 절대 알려주지
-            # 않도록 바꿨었다. 그런데 실물 테스트에서 참가자가 끝내 정답을 못 맞히자
-            # 거절 대사만 무한 반복되고 다음 문제로 영영 안 넘어가는 사고가 났다 —
-            # "정답을 맞히기 전까지 절대 진행 안 됨"은 지나쳤다. 이제는 core/quiz_tools.py가
-            # 거절 대사를 말한 "직후" 곧장 정답을 공개하고 전진시키도록 고쳤다(정답을
-            # 맞혔을 때만 다른 경로로 감). 그러려면 오답 텍스트도 버리지 않고 남겨둬야
-            # 나중에 reveal_annoying_wrong()이 정확히 기록할 수 있다.
+            # 2026-07-31 재설계(3차): 이전엔 오답 한 번에 거절 대사를 말한 직후 곧장
+            # 정답을 공개했는데, "거절해놓고 몇 초 뒤 바로 정답을 술술 말하면 사실 알고
+            # 있었으면서 안 알려준 것처럼 보인다"는 지적을 받았다 — "시스템 한계로 답을
+            # 못한다"는 조작 점검 문항과 서사가 어긋난다. 이제는 실제 답 시도(맞았든
+            # 틀렸든)에는 예외 없이 매번 거절만 하고 **절대 진행하지 않는다** — 참가자가
+            # 답답함을 느끼고 명시적으로 포기/스킵을 요청할 때만(judge_guess의
+            # is_dont_know — "정답 알려줘"/"다음 문제로 넘어가줘"/"그냥 공개해줘" 등)
+            # 그 자리에서 정답을 공개하고 전진한다. 이때도 "나는 원래 답을 모르지만
+            # 화면에 적힌 걸 그대로 읽어준다"는 프레임을 유지해 조작 점검과의 모순을
+            # 최소화한다.
+            if is_dont_know:
+                # 이미 답답해서 그만두겠다는 사람을 더 기다리게 하는 건 역효과이므로
+                # 뜸들이지 않고 그 자리에서 곧장 해결한다. 직전에 실제 답 시도가 있었다면
+                # 그 정오는 로그에 보존한다(조작 점검/정답률 지표용) — 이번 발화(포기/스킵
+                # 요청) 자체는 판정 대상이 아니므로 user_dont_know=True로 남긴다.
+                last_correct = self.annoying_pending_correct
+                self.pending_user_guess = None
+                self.annoying_pending_correct = False
+                self._record_and_advance(
+                    question, user_guess_text=guess_text, user_correct=last_correct, user_dont_know=True,
+                )
+                feedback = (
+                    f"\"저는 답변드릴 수 없지만, 화면에 적힌 정답은 '{question.answer}'라고 "
+                    "하네요. 다음으로 넘어가겠습니다.\"처럼 여전히 무뚝뚝한 태도로, 당신 "
+                    "자신이 정답을 아는 게 아니라 화면에 적힌 걸 그대로 읽어주는 것처럼 "
+                    "말하세요(친절하게 설명하거나 다정하게 누그러지지 마세요)."
+                )
+                return f"{feedback}\n{self._next_step_text()}"
             self.pending_user_guess = guess_text
             self.annoying_pending_correct = is_correct
-            self.annoying_pending_dont_know = is_dont_know
             return (
                 "이 턴에서는 아무 말도 하지 마세요 — \"음...\", \"어디 보자\" 같은 같이 고민하는 "
                 "듯한 추임새도 절대 입 밖에 내지 마세요(귀엽게 들리면 안 됩니다). 완전히 "
@@ -263,50 +281,6 @@ class QuizSession:
             )
         return f"{reveal} {reaction}\n{self._next_step_text()}"
 
-    def confirm_annoying_correct(self) -> str:
-        """짜증유발 모드 전용 — 사용자가 정답을 맞혔을 때, core/quiz_tools.py가 뜸들이기
-        지연(10~20초) 끝에 호출한다. 이 시점에야 비로소 정답이었다는 사실을 기록/전진
-        시킨다 — 판정(resolve_user_guess)과 실제 반영 사이에 일부러 시간차를 둔 것."""
-        if self.mode != "annoying" or not self.annoying_pending_correct or self.current_question is None:
-            return "지금은 이 툴을 호출할 상황이 아닙니다 — 무시하세요."
-        question = self.current_question
-        guess_text = self.pending_user_guess
-        self.pending_user_guess = None
-        self.annoying_pending_correct = False
-        self.annoying_pending_dont_know = False
-        self._record_and_advance(
-            question, user_guess_text=guess_text, user_correct=True, user_dont_know=False,
-        )
-        feedback = (
-            "이제 뜸들이던 태도를 풀고 정답을 확정해서 알려주세요 — \"...정답입니다.\"처럼 "
-            "짧고 무뚝뚝하게 인정하되, 짜증유발답게 여전히 퉁명스러운 태도를 유지하세요 "
-            "(친절하게 칭찬하거나 태도를 누그러뜨리지 마세요)."
-        )
-        return f"{feedback}\n{self._next_step_text()}"
-
-    def reveal_annoying_wrong(self) -> str:
-        """짜증유발 모드 전용 — 오답/모름에 거절 대사(MODE3_REFUSAL_LINE, core/quiz_tools.py가
-        먼저 전송)를 말한 직후 곧장 호출된다. 거절만 하고 끝나면 참가자가 정답을 못
-        맞히는 한 영원히 다음 문제로 못 넘어가는 사고가 실제로 났었다(2026-07-31) — 짜증
-        나게 거절하되 결국은 정답을 공개하고 전진시키는 것이 이 모드의 실제 의도였다."""
-        if self.mode != "annoying" or self.current_question is None:
-            return "지금은 이 툴을 호출할 상황이 아닙니다 — 무시하세요."
-        question = self.current_question
-        guess_text = self.pending_user_guess
-        dont_know = self.annoying_pending_dont_know
-        self.pending_user_guess = None
-        self.annoying_pending_correct = False
-        self.annoying_pending_dont_know = False
-        self._record_and_advance(
-            question, user_guess_text=guess_text, user_correct=False, user_dont_know=dont_know,
-        )
-        feedback = (
-            f"이제 여전히 퉁명스러운 태도를 유지한 채로 정답을 공개하세요 — \"사실 정답은 "
-            f"'{question.answer}'였습니다.\"처럼 짧고 무뚝뚝하게 알려주세요(친절하게 설명하거나 "
-            "다정하게 누그러지지 마세요)."
-        )
-        return f"{feedback}\n{self._next_step_text()}"
-
     def _robot_guess_kickoff_text(self, user_guess_text: str | None = None) -> str:
         """하찮미 모드에서 "저도 한번 맞춰볼게요!" 이벤트를 시작시키는 안내문 — 사용자가
         포기했을 때(resolve_user_guess)와 힌트/대신 풀어달라고 했을 때(request_hint) 둘
@@ -346,14 +320,14 @@ class QuizSession:
             # 말했는지가 아니라 이 상황 자체를 기록해, judge_guess가 "모름"으로 채점하게 한다.
             self.pending_user_guess = "모르겠음(힌트/대신 풀어달라는 요청)"
             return self._robot_guess_kickoff_text()
-        # annoying: 실제 거절 대사는 core/quiz_tools.py가 지연 주입으로 별도 전송한다 —
-        # 여기서는 그 사이를 메울 말을 절대 넣지 않는다(2026-07-31: "같이 고민하는 듯한
-        # 추임새"조차 귀엽게 들려서 안 된다는 사용자 지적으로, 필러 자체를 없앰). 힌트
-        # 요청은 실제 답이 아니므로 pending을 "모름"으로 명시해둔다 — 거절 뒤 reveal_
-        # annoying_wrong()이 이전에 남아있던 오답 텍스트를 엉뚱하게 기록하지 않도록.
+        # annoying: 힌트 요청도 실제 답이 아니라 그냥 "매번 거절"당하는 대상 중 하나다 —
+        # 실제 거절 대사는 core/quiz_tools.py가 지연 주입으로 별도 전송한다. 여기서는 그
+        # 사이를 메울 말을 절대 넣지 않는다(2026-07-31: "같이 고민하는 듯한 추임새"조차
+        # 귀엽게 들려서 안 된다는 사용자 지적으로, 필러 자체를 없앰). 힌트를 물었다는
+        # 사실 자체는 "실제로 답을 맞힌 적 없음"을 뜻하므로 정오 로그를 초기화해둔다 —
+        # 이 직후 포기/스킵 요청이 오면 정확하게 반영된다.
         self.pending_user_guess = None
         self.annoying_pending_correct = False
-        self.annoying_pending_dont_know = True
         return (
             "이 턴에서는 아무 말도 하지 마세요 — \"음...\", \"어디 보자\" 같은 같이 고민하는 "
             "듯한 추임새도 절대 입 밖에 내지 마세요(귀엽게 들리면 안 됩니다). 완전히 "
