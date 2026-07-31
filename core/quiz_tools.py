@@ -17,6 +17,11 @@ from hardware.motion import play_express_gesture, play_look_away_motion, play_th
 
 STALL_MIN_SEC = 10.0
 STALL_MAX_SEC = 12.0
+# 짜증유발 모드에서 사용자가 실제로 정답을 맞혔을 때 뜸들이는 시간 — 오답 거절
+# (STALL_MIN/MAX_SEC)보다 조금 더 길게 잡아서, 맞혀도 곧바로 안 알려주는 짓궂음을
+# 강조한다(2026-07-31 사용자 지정).
+CORRECT_STALL_MIN_SEC = 10.0
+CORRECT_STALL_MAX_SEC = 20.0
 # 정답 공개 화면(원본 사진)을 다음 문제로 넘기기 전 유지하는 시간 — 로봇이 정답을
 # 말하는 동안 참가자가 원본 사진을 볼 시간을 준다.
 REVEAL_HOLD_SEC = 4.0
@@ -37,7 +42,12 @@ def make_quiz_tools(quiz_ui_q, busy: threading.Event, motion_ctx, inject_turn, l
     # asyncio.create_task()가 만든 태스크는 어딘가에서 강하게 참조하고 있지 않으면
     # 이벤트 루프가 약한 참조만 들고 있어서 도중에 가비지 컬렉션될 수 있다(공식 문서
     # 경고) — 지연된 거절 대사가 통째로 사라지는 사고를 막기 위해 여기 붙잡아둔다.
-    _pending_stall = {"task": None}
+    # "kind"는 "wrong"(거절 예정) 또는 "correct"(정답 확정 예정) — 정답/오답 사이에
+    # 마음이 바뀌었을 때만(예: 오답 뒤 정답으로 정정) 취소 후 재스케줄해야 하고, 같은
+    # 종류가 반복되면(오답을 계속 말하는 등) 원래 타이머를 그대로 둬야 한다(2026-07-31,
+    # 안 그러면 참가자가 대기 중 계속 말할 때마다 타이머가 리셋되어 영원히 결론이 안
+    # 나는 사고가 실제로 났었다). 아래 참고.
+    _pending_stall = {"task": None, "kind": None}
     # _pending_stall과 같은 이유로(가비지 컬렉션 방지) 붙잡아둔다 — 정답 공개 화면을
     # REVEAL_HOLD_SEC 뒤 다음 문제로 넘기는 지연 태스크.
     _pending_reveal_transition = {"task": None}
@@ -105,18 +115,58 @@ def make_quiz_tools(quiz_ui_q, busy: threading.Event, motion_ctx, inject_turn, l
     async def _delayed_refusal():
         await asyncio.sleep(random.uniform(STALL_MIN_SEC, STALL_MAX_SEC))
         _pending_stall["task"] = None
+        _pending_stall["kind"] = None
+        if session.mode != "annoying" or session.current_question is None:
+            return
+        question_before = session.current_question
         await inject_turn(
             "이제 정확히 이 문장만 그대로 말하세요(단어 하나도 바꾸거나 덧붙이지 마세요): "
             f"\"{MODE3_REFUSAL_LINE}\""
         )
+        # 거절만 하고 끝나면 참가자가 끝내 정답을 못 맞히는 한 다음 문제로 영영 못
+        # 넘어가는 사고가 실제로 났다(2026-07-31 실물 테스트) — 짜증나게 거절하되
+        # 결국은 정답을 공개하고 전진시키는 것이 이 모드의 실제 의도였다.
+        text = session.reveal_annoying_wrong()
+        _cancel_pending_reveal_transition()
+        _push_reveal(question_before)
+        _schedule_reveal_transition()
+        await inject_turn(text)
 
     def _schedule_stall_refusal():
-        """이미 대기 중인 지연 주입이 있으면 또 예약하지 않는다 — 사용자가 짧은 간격으로
-        힌트를 여러 번 요청하면 거절 대사가 여러 번 겹쳐 발화되는 사고를 막기 위함."""
+        """이미 대기 중인 지연 주입이 있으면 또 예약하지 않는다 — 참가자가 대기 중
+        계속 말할 때마다(추가 오답, 재차 힌트 요청 등) 매번 취소하고 다시 예약하면
+        타이머가 영원히 리셋되어 절대 끝나지 않는 사고가 난다(2026-07-31 실물 테스트로
+        발견). submit_guess()는 정답으로 마음이 바뀐 경우에만(kind가 달라질 때만)
+        먼저 _cancel_pending_stall()을 불러 이 가드를 무력화시킨다(아래 참고)."""
         existing = _pending_stall["task"]
         if existing is not None and not existing.done():
             return
+        _pending_stall["kind"] = "wrong"
         _pending_stall["task"] = loop.create_task(_delayed_refusal())
+
+    async def _delayed_correct_confirm():
+        await asyncio.sleep(random.uniform(CORRECT_STALL_MIN_SEC, CORRECT_STALL_MAX_SEC))
+        _pending_stall["task"] = None
+        _pending_stall["kind"] = None
+        # 뜸들이는 동안 실험자가 퀴즈를 조기 종료했거나 모드가 바뀌는 등 상태가 변했을
+        # 수 있다 — 그런 드문 경우엔 그냥 조용히 아무 것도 안 한다(엉뚱한 히든 턴을
+        # 주입하지 않기 위함).
+        if session.mode != "annoying" or not session.annoying_pending_correct:
+            return
+        question_before = session.current_question
+        text = session.confirm_annoying_correct()
+        _cancel_pending_reveal_transition()
+        _push_reveal(question_before)
+        _schedule_reveal_transition()
+        await inject_turn(text)
+
+    def _schedule_correct_confirm():
+        """_schedule_stall_refusal()과 같은 이유로 이미 대기 중이면 재예약하지 않는다."""
+        existing = _pending_stall["task"]
+        if existing is not None and not existing.done():
+            return
+        _pending_stall["kind"] = "correct"
+        _pending_stall["task"] = loop.create_task(_delayed_correct_confirm())
 
     def _cancel_pending_stall():
         """질문이 넘어가거나(정답 제출), 모드가 바뀌거나, 퀴즈가 끝나면 그 이전 문제의
@@ -125,6 +175,7 @@ def make_quiz_tools(quiz_ui_q, busy: threading.Event, motion_ctx, inject_turn, l
         if task is not None and not task.done():
             task.cancel()
         _pending_stall["task"] = None
+        _pending_stall["kind"] = None
 
     def start_quiz() -> str:
         """Begin the zoomed-in-photo quiz game.
@@ -184,6 +235,7 @@ def make_quiz_tools(quiz_ui_q, busy: threading.Event, motion_ctx, inject_turn, l
         # 하므로 미리 저장해둔다(advanced가 False면 그냥 버려짐).
         question_before_call = session.current_question
         results_count_before = len(session.results)
+        mode_before = session.mode
 
         if speaker == "robot":
             text = session.resolve_robot_guess(guess_text)
@@ -197,6 +249,20 @@ def make_quiz_tools(quiz_ui_q, busy: threading.Event, motion_ctx, inject_turn, l
                     _run_guarded(play_look_away_motion, port, pkt, lock, shared_state, home_pan)
         else:
             text = session.resolve_user_guess(guess_text)
+            if mode_before == "annoying" and question_before_call is not None:
+                # 짜증유발 모드는 이 턴에서 곧장 결과를 알려주지 않는다 — 힌트 거절과
+                # 같은 지연 패턴(뜸들이기 후 히든 턴)으로 나중에 알려준다. 마음이 바뀐
+                # 경우(예: 오답 뒤 정답으로 정정, 또는 그 반대)에만 이전 스케줄을
+                # 취소하고 새로 건다 — 같은 종류가 반복될 때(오답을 계속 말하는 등)
+                # 매번 취소/재예약하면 타이머가 영원히 리셋되는 사고가 난다(위 주석 참고).
+                _run_guarded(play_thinking_stall, port, pkt, lock, shared_state, emotion_queue)
+                desired_kind = "correct" if session.annoying_pending_correct else "wrong"
+                if _pending_stall["kind"] not in (None, desired_kind):
+                    _cancel_pending_stall()
+                if desired_kind == "correct":
+                    _schedule_correct_confirm()
+                else:
+                    _schedule_stall_refusal()
 
         advanced = len(session.results) > results_count_before
         if advanced:

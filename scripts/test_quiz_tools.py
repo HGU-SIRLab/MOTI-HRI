@@ -26,6 +26,8 @@ from core.quiz_bank import load_question_bank
 # 실제 스톨(10~12초)/정답 공개 유지(4초)를 기다리면 테스트가 너무 오래 걸리므로 확 줄인다.
 qt.STALL_MIN_SEC = 0.05
 qt.STALL_MAX_SEC = 0.08
+qt.CORRECT_STALL_MIN_SEC = 0.05
+qt.CORRECT_STALL_MAX_SEC = 0.08
 qt.REVEAL_HOLD_SEC = 0.05
 
 calls: list[tuple] = []
@@ -106,8 +108,9 @@ async def main():
     msg = quiz_ui_q.get()
     ok &= check("quiz ends after last question", msg["type"] == "hide")
 
-    # 2026-07-30: 하찮미 모드에서 실제 답 시도는 "저도 맞춰볼게요" 이벤트 없이 바로
-    # 채점되고, reveal/다음 문제 전환은 여느 모드와 동일하게 정상 동작해야 한다.
+    # 2026-07-31 재설계: 하찮미 모드는 실제 답 시도도 즉시 채점하지 않고, 로봇도 같이
+    # 추측해서 나란히 비교하는 이벤트로 넘어간다 — 즉시 정오를 알려주면 로봇이 이미
+    # 정답을 아는 것처럼 보여 조작 점검 문항과 모순된다는 실물 테스트 피드백.
     start1b, select1b, submit1b, hint1b, end1b, sess1b = qt.make_quiz_tools(
         quiz_ui_q, busy, motion_ctx, fake_inject_turn, loop, emotion_queue=emotion_queue, num_questions=2,
     )
@@ -116,21 +119,19 @@ async def main():
     select1b("imperfect")
     quiz_ui_q.get()
 
-    # 오답 시도 — 2026-07-30 피드백: 척척박사처럼 곧장 정답 공개+전진하면 안 되고, 같은
-    # 문제 사진에 머물며 재도전을 유도해야 한다(화면에는 아무것도 새로 안 떠야 함).
-    r = submit1b("user", "땡땡땡")
-    ok &= check("imperfect wrong guess does not leak the answer", "정답0" not in r)
-    ok &= check("imperfect wrong guess does not advance", sess1b.index == 0)
-    ok &= check("imperfect wrong guess pushes nothing to the UI", quiz_ui_q.empty())
+    r = submit1b("user", "정답0")
+    ok &= check("imperfect real guess triggers the kickoff event, no immediate verdict",
+                "맞혔습니다" not in r and "submit_guess" in r)
+    ok &= check("imperfect real guess does not advance yet", sess1b.index == 0)
+    ok &= check("imperfect real guess pushes nothing to the UI yet", quiz_ui_q.empty())
 
-    r = submit1b("user", "정답0")  # 재도전 끝에 정답
-    ok &= check("imperfect real guess has no kickoff instruction", "submit_guess" not in r)
-    ok &= check("imperfect real guess advances immediately", sess1b.index == 1)
+    r = submit1b("robot", "정답0")  # 로봇도 우연히 맞춤 -> 둘 다 맞음, 이제야 전진
+    ok &= check("paired guess advances the session", sess1b.index == 1)
     msg = quiz_ui_q.get()
-    ok &= check("imperfect real guess still pushes reveal", msg["type"] == "reveal" and "정답0" in msg["text"])
+    ok &= check("imperfect paired guess pushes reveal", msg["type"] == "reveal" and "정답0" in msg["text"])
     await asyncio.sleep(0.15)
     msg = quiz_ui_q.get()
-    ok &= check("imperfect real guess still advances UI to next question",
+    ok &= check("imperfect paired guess advances UI to next question",
                 msg["type"] == "question" and msg["image_path"].replace("\\", "/").endswith("q1.jpg"))
 
     # 짜증유발 모드 힌트 스톨 + 지연 주입(가장 중요한 케이스)
@@ -148,6 +149,10 @@ async def main():
                 any(qt.MODE3_REFUSAL_LINE in t for t in injected))
     time.sleep(0.1)
     ok &= check("annoying hint triggers thinking-stall motion", ("thinking_stall",) in calls)
+    # 2026-07-31: 거절 뒤엔 곧장 reveal_annoying_wrong()으로 이어져(질문이 1개뿐이라 곧장
+    # 종료), 그 사이 reveal + hide가 quiz_ui_q에 쌓인다 — 다음 테스트를 오염시키지 않게 비운다.
+    ok &= check("bare hint request also reveals+advances (ends the only question)",
+                quiz_ui_q.get()["type"] == "reveal" and quiz_ui_q.get()["type"] == "hide")
 
     # 힌트를 짧은 간격으로 두 번 요청해도 지연 주입은 한 번만 걸려야 한다(중복 발화 방지).
     injected.clear()
@@ -163,9 +168,87 @@ async def main():
     await asyncio.sleep(0.2)
     ok &= check("duplicate hint requests only inject the refusal once",
                 sum(1 for t in injected if qt.MODE3_REFUSAL_LINE in t) == 1)
+    quiz_ui_q.get()  # reveal (거절 뒤 자동 공개)
+    quiz_ui_q.get()  # hide (문항이 1개뿐이라 곧장 종료)
 
-    # 힌트 요청(스톨 예약) 직후 바로 정답을 제출해 다음 문제로 넘어가면, 그 이전 문제의
-    # 지연된 거절 대사는 취소되어 절대 도착하지 않아야 한다(엉뚱한 타이밍에 튀어나오는 사고 방지).
+    # 짜증유발 모드에서 실제 답 제출(submit_guess) — 2026-07-31 1차 수정 검증: 오답이든
+    # 정답이든 이 턴에서는 필러만 반환해야 한다(이전엔 all_knowing과 똑같이 오답에도
+    # 곧장 정답을 공개해버렸다 — "정답을 모르는 척척박사"가 되어버린 조작 점검 모순).
+    # 2차 수정 검증: 거절만 하고 끝나면 정답을 못 맞히는 한 영원히 다음 문제로 못
+    # 넘어가는 사고가 실제 로봇 테스트로 났으므로, 거절 직후 곧장 정답을 공개하고
+    # 전진해야 한다(정답을 몰라도 진행은 된다).
+    injected.clear()
+    calls.clear()
+    startA, selectA, submitA, hintA, endA, sessA = qt.make_quiz_tools(
+        quiz_ui_q, busy, motion_ctx, fake_inject_turn, loop, emotion_queue=emotion_queue, num_questions=2,
+    )
+    startA()
+    quiz_ui_q.get()
+    selectA("annoying")
+    quiz_ui_q.get()
+    r = submitA("user", "땡땡땡")
+    ok &= check("annoying wrong guess returns filler only (no answer leak)", "정답0" not in r)
+    ok &= check("annoying wrong guess does not push anything to the UI yet", quiz_ui_q.empty())
+    ok &= check("annoying wrong guess triggers the thinking-stall motion", ("thinking_stall",) in calls)
+    await asyncio.sleep(0.15)  # STALL_MIN/MAX_SEC이 지나갈 때까지 대기
+    ok &= check("delayed injection fires the exact refusal line for a wrong guess",
+                any(qt.MODE3_REFUSAL_LINE in t for t in injected))
+    ok &= check("refusal is immediately followed by revealing the real answer, not left hanging",
+                any("사실 정답은" in t for t in injected))
+    ok &= check("wrong guess DOES eventually advance the session (no more infinite stall)",
+                sessA.index == 1 and len(sessA.results) == 1 and sessA.results[0].user_correct is False)
+    msg = quiz_ui_q.get()
+    ok &= check("wrong-guess reveal pushes the original photo + answer", msg["type"] == "reveal" and "정답0" in msg["text"])
+    await asyncio.sleep(0.15)  # REVEAL_HOLD_SEC 경과 대기
+    msg = quiz_ui_q.get()
+    ok &= check("wrong-guess reveal advances UI to the next question",
+                msg["type"] == "question" and msg["image_path"].replace("\\", "/").endswith("q1.jpg"))
+
+    # 두 번째(마지막) 문제 — 정답을 제출해도 즉시 확정되지 않고(필러만), 뜸들이기 지연
+    # 끝에 reveal + 다음 문제 전환 + 확정 히든 턴까지 이어져야 한다.
+    injected.clear()
+    r = submitA("user", "정답1")
+    ok &= check("annoying correct guess also returns filler only for now", "정답입니다" not in r)
+    ok &= check("annoying correct guess does not push anything to the UI yet", quiz_ui_q.empty())
+    await asyncio.sleep(0.15)
+    ok &= check("delayed correct-confirm injects the confirmation text",
+                any("정답입니다" in t for t in injected))
+    msg = quiz_ui_q.get()
+    ok &= check("correct-confirm pushes the reveal", msg["type"] == "reveal" and "정답1" in msg["text"])
+    await asyncio.sleep(0.15)
+    msg = quiz_ui_q.get()
+    ok &= check("correct-confirm ends the quiz after the last question", msg["type"] == "hide")
+    ok &= check("session recorded both results (one wrong, one correct)",
+                len(sessA.results) == 2 and sessA.results[0].user_correct is False
+                and sessA.results[1].user_correct is True)
+
+    # 회귀 방지: 정답을 먼저 제출해 "정답 확정" 스톨이 걸린 상태에서, 확정되기 전에
+    # (실수로) 다시 오답을 말하면 정답 확정 스케줄은 취소되고 거절 스케줄로 교체돼야
+    # 한다 — 안 그러면 방금 말한 오답인데도 뒤늦게 "정답입니다"가 튀어나오는 사고가 난다.
+    injected.clear()
+    startB, selectB, submitB, hintB, endB, sessB = qt.make_quiz_tools(
+        quiz_ui_q, busy, motion_ctx, fake_inject_turn, loop, emotion_queue=emotion_queue, num_questions=1,
+    )
+    startB()
+    quiz_ui_q.get()
+    selectB("annoying")
+    quiz_ui_q.get()
+    submitB("user", "정답0")  # 정답 확정 스톨 예약
+    submitB("user", "땡땡땡")  # 확정되기 전에 번복 -> 거절 스톨로 교체돼야 함
+    await asyncio.sleep(0.15)
+    ok &= check(
+        "a wrong guess overriding a pending correct-confirm fires the refusal, not the confirmation",
+        any(qt.MODE3_REFUSAL_LINE in t for t in injected) and not any("정답입니다" in t for t in injected),
+    )
+    ok &= check(
+        "the overridden guess still eventually reveals+advances via the wrong-answer path",
+        sessB.index == 1 and len(sessB.results) == 1 and sessB.results[0].user_correct is False,
+    )
+    quiz_ui_q.get()  # reveal
+    quiz_ui_q.get()  # hide (문항이 1개뿐이라 REVEAL_HOLD_SEC 경과 후 바로 hide)
+
+    # 힌트 요청(스톨 예약) 직후 바로 정답을 제출하면, 힌트의 거절 스케줄은 취소되고
+    # 정답 확정 스케줄로 교체되어야 한다(엉뚱한 타이밍에 거절 대사가 튀어나오는 사고 방지).
     injected.clear()
     start4, select4, submit4, hint4, end4, sess4 = qt.make_quiz_tools(
         quiz_ui_q, busy, motion_ctx, fake_inject_turn, loop, emotion_queue=emotion_queue, num_questions=2,
@@ -174,13 +257,16 @@ async def main():
     quiz_ui_q.get()
     select4("annoying")
     quiz_ui_q.get()
-    hint4()  # 스톨 예약
-    submit4("user", "정답0")  # 곧바로 정답 제출 -> 다음 문제로 넘어감(reveal이 먼저 뜸)
-    quiz_ui_q.get()  # reveal
-    await asyncio.sleep(0.2)  # 원래 스톨이 발화했을 시간을 넘겨서 대기(REVEAL_HOLD_SEC도 이 사이 지남)
-    quiz_ui_q.get()  # REVEAL_HOLD_SEC 경과로 밀려온 다음 문제 메시지까지 비워서 이후 테스트 오염 방지
-    ok &= check("advancing past a question cancels its pending stall injection",
+    hint4()  # 힌트 거절 스톨 예약
+    submit4("user", "정답0")  # 곧바로 정답 제출 -> 힌트의 거절 스톨은 취소되고 정답 확정 스톨로 교체됨
+    await asyncio.sleep(0.15)  # 정답 확정 스톨(CORRECT_STALL_*)이 지나갈 때까지 대기
+    ok &= check("submitting the correct answer cancels the pending hint refusal",
                 not any(qt.MODE3_REFUSAL_LINE in t for t in injected))
+    ok &= check("delayed correct-confirm eventually injects a confirmation turn",
+                any("정답입니다" in t for t in injected))
+    quiz_ui_q.get()  # reveal
+    await asyncio.sleep(0.15)  # REVEAL_HOLD_SEC 경과 대기
+    quiz_ui_q.get()  # 다음 문제 메시지까지 비워서 이후 테스트 오염 방지
 
     # 모드가 이미 선택된 뒤 재선택을 시도하면 거부돼야 한다 — 안 그러면 index가 0으로
     # 리셋돼 같은 문제가 연구 결과 로그에 중복 기록될 위험이 있다.

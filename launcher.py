@@ -190,14 +190,14 @@ async def run_conversation(name_state: dict, facts_summary: str | None, emotion_
     tools.append(forget_me)
     tool_fns["forget_me"] = forget_me
 
-    set_emotion = make_set_emotion_tool(emotion_queue)
-    tools.append(set_emotion)
-    tool_fns["set_emotion"] = set_emotion
-
     for tool_fn in motion_tools or []:
         tools.append(tool_fn)
         tool_fns[tool_fn.__name__] = tool_fn
 
+    # quiz_session을 set_emotion보다 먼저 만든다 — 짜증유발 모드에서는 표정을
+    # neutral/thinking으로만 제한해야 하는데(2026-07-31), 그러려면 set_emotion이 만들어질
+    # 때 이미 quiz_session 참조를 쥐고 있어야 한다(quiz_ui_q가 없으면 quiz_session은 그냥
+    # None으로 남고 make_set_emotion_tool도 제한 없이 평소대로 동작한다).
     quiz_session = None
     if quiz_ui_q is not None:
         quiz_motion_ctx = (port, pkt, lock, shared_state, home_pan, home_tilt)
@@ -209,6 +209,10 @@ async def run_conversation(name_state: dict, facts_summary: str | None, emotion_
         for quiz_tool_fn in (start_quiz, select_quiz_mode, submit_guess, request_hint, end_quiz_early):
             tools.append(quiz_tool_fn)
             tool_fns[quiz_tool_fn.__name__] = quiz_tool_fn
+
+    set_emotion = make_set_emotion_tool(emotion_queue, quiz_session=quiz_session)
+    tools.append(set_emotion)
+    tool_fns["set_emotion"] = set_emotion
 
     config = types.LiveConnectConfig(
         response_modalities=[types.Modality.AUDIO],
