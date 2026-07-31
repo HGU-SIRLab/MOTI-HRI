@@ -5,6 +5,7 @@ docs/architecture.md §04 — 고정 슬롯(STAGES) 대신 자유 key-value fact
 """
 import json
 import os
+import shutil
 import threading
 from datetime import datetime, timezone
 
@@ -26,13 +27,34 @@ def _load_all() -> dict:
     with open(_PROFILES_PATH, "r", encoding="utf-8") as f:
         try:
             return json.load(f)
-        except json.JSONDecodeError:
+        except json.JSONDecodeError as e:
+            # 2026-07-31 코드 리뷰로 발견: 예전엔 여기서 조용히 {}를 반환했다 — 그러면
+            # 다음 remember_fact() 호출이 "원래 비어있던 저장소"로 착각해서 지금까지 쌓인
+            # 모든 참가자 프로필을 통째로 덮어써버리는 사고로 이어질 수 있었다(N=30 연구
+            # 데이터가 전부 이 파일 하나에 누적됨). 손상된 원본을 먼저 백업해두고 크게
+            # 경고한다 — 저장소가 원래부터 빈 것과 파일이 손상된 것을 헷갈리지 않도록.
+            timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+            backup_path = f"{_PROFILES_PATH}.corrupted-{timestamp}"
+            try:
+                shutil.copy2(_PROFILES_PATH, backup_path)
+                backup_note = f"손상된 원본은 백업해뒀습니다: {backup_path}"
+            except OSError as backup_err:
+                backup_note = f"손상된 원본 백업도 실패했습니다({backup_err}) — 수동으로 확인하세요: {_PROFILES_PATH}"
+            print(
+                f"🚨 user_profiles.json 파싱 실패({e}) — 빈 저장소로 시작합니다. "
+                f"이대로 remember_fact가 호출되면 저장 시점에 빈 데이터로 덮어써집니다! {backup_note}"
+            )
             return {}
 
 
 def _save_all(data: dict):
-    with open(_PROFILES_PATH, "w", encoding="utf-8") as f:
+    # 쓰는 도중 프로세스가 죽으면(Ctrl+C, 크래시, 정전 등) 파일이 손상된 채로 남을 수
+    # 있었다 — 임시 파일에 먼저 쓰고 os.replace()로 원자적으로 교체해, 쓰기가 절반만
+    # 진행된 상태의 파일이 디스크에 남는 경우 자체를 없앤다(2026-07-31 코드 리뷰).
+    tmp_path = f"{_PROFILES_PATH}.tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
+    os.replace(tmp_path, _PROFILES_PATH)
 
 
 def remember_fact(name: str, field: str, value: str, confidence: str = "certain") -> dict:

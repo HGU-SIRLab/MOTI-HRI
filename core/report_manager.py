@@ -35,13 +35,19 @@ def generate_and_save_reports(user_name: str, conversation_log: str, facts_summa
         return
 
     try:
-        today_str = datetime.now().strftime("%Y-%m-%d")
+        now = datetime.now()
+        today_str = now.strftime("%Y-%m-%d")
+        # 2026-07-31 코드 리뷰로 발견: 날짜만으로 파일명을 지으면 같은 참가자를 같은 날
+        # 다시 진행해야 하는 경우(기술적 문제로 재실험 등) 이전 시도의 대화록/결과지가
+        # 조용히 덮어써진다 — core/quiz_export.py가 22단계에서 이미 겪고 고친 문제와
+        # 동일해서, 여기도 시각(HHMMSS)을 파일명에 포함시켜 같은 방식으로 맞춘다.
+        time_str = now.strftime("%H%M%S")
         base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         result_dir = os.path.join(base_dir, "user_result")
         os.makedirs(result_dir, exist_ok=True)
 
         # 1. 대화록 저장
-        chat_filename = os.path.join(result_dir, f"{today_str}_{user_name}_대화.txt")
+        chat_filename = os.path.join(result_dir, f"{today_str}_{time_str}_{user_name}_대화.txt")
         formatted_log = ""
         for line in conversation_log.split('\n'):
             parts = line.split(" | Moti: ")
@@ -53,7 +59,7 @@ def generate_and_save_reports(user_name: str, conversation_log: str, facts_summa
 
         with open(chat_filename, "w", encoding="utf-8") as f:
             f.write(f"--- {user_name}님과의 전체 대화 기록 ---\n")
-            f.write(f"일시: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+            f.write(f"일시: {now.strftime('%Y-%m-%d %H:%M:%S')}\n\n")
             f.write(formatted_log)
         print(f"📄 전체 대화문 저장 완료: {chat_filename}")
 
@@ -110,7 +116,7 @@ def generate_and_save_reports(user_name: str, conversation_log: str, facts_summa
         response = model.generate_content(report_prompt)
         report_text = _extract_text(response)
 
-        report_filename = os.path.join(result_dir, f"{today_str}_{user_name}_결과지.txt")
+        report_filename = os.path.join(result_dir, f"{today_str}_{time_str}_{user_name}_결과지.txt")
         with open(report_filename, "w", encoding="utf-8") as f:
             f.write(report_text)
         print(f"📄 상담 결과지 저장 완료: {report_filename}")

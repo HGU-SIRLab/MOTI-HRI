@@ -316,7 +316,18 @@ async def run_conversation(name_state: dict, facts_summary: str | None, emotion_
                             responses = []
                             for fc in message.tool_call.function_calls:
                                 fn = tool_fns.get(fc.name)
-                                result = fn(**(fc.args or {})) if fn else f"unknown tool {fc.name}"
+                                try:
+                                    result = fn(**(fc.args or {})) if fn else f"unknown tool {fc.name}"
+                                except Exception as e:
+                                    # 2026-07-31 코드 리뷰로 발견: 여기서 예외가 나면(툴 구현
+                                    # 버그, 모델이 잘못된 인자를 준 경우 등) asyncio.gather를
+                                    # 통해 전파되어 세션 전체가 죽고, session_history/quiz_log가
+                                    # 빈 채로 남아 대화록·결과지·퀴즈 결과가 통째로 유실됐다
+                                    # (물리적 안전 정리는 launcher.py의 finally가 여전히 실행
+                                    # 하므로 모터 쪽은 안전함 — 유실되는 건 연구/대화 데이터).
+                                    # 툴 하나의 실패를 그 자리에서 흡수해 세션이 계속되게 한다.
+                                    print(f"❌ 툴 호출 실패: {fc.name}({fc.args}) -> {e!r}")
+                                    result = f"tool call failed: {e}"
                                 print(f"\n  🔧 {fc.name}({fc.args}) -> {result}")
                                 responses.append(
                                     types.FunctionResponse(id=fc.id, name=fc.name, response={"result": result})
