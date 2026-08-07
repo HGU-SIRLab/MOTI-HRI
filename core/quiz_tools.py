@@ -147,6 +147,11 @@ def make_quiz_tools(quiz_ui_q, busy: threading.Event, motion_ctx, inject_turn, l
         # 거절이 실제로 발화 주입된 뒤에만 센다 — 예약만 되고 취소된 스톨은 참가자가
         # 겪은 적이 없으므로 "포기까지 겪은 거절 횟수" 지표에 포함되면 안 된다.
         session.note_refusal_delivered()
+        # 표정 시퀀스(2026-08-07 사용자 요청): 뜸들이는 동안만 THINKING이고, 거절 대사를
+        # 말할 때는 NEUTRAL로 돌아와 있어야 한다("고민해봤지만 결국 기계적으로 거절"이라는
+        # 서사) — 거절 주입 직후에 되돌려 발화 시작 시점엔 무표정이 되게 한다.
+        if emotion_queue:
+            emotion_queue.put("NEUTRAL")
 
     def _schedule_stall_refusal():
         """이미 대기 중인 지연 주입이 있으면 또 예약하지 않는다 — 참가자가 대기 중
@@ -248,9 +253,19 @@ def make_quiz_tools(quiz_ui_q, busy: threading.Event, motion_ctx, inject_turn, l
                     # 뜸들임 없이 기록/전진까지 마쳤다) — 남아있던 거절 스톨은 이제
                     # 무의미하니 취소한다(다음 문제에 엉뚱한 타이밍으로 튀어나오면 안 됨).
                     _cancel_pending_stall()
+                    # 뜸들이던 THINKING 표정이 남아있을 수 있다 — 정답 공개를 말할 때는
+                    # 무표정으로(거절 대사 때와 같은 시퀀스, 2026-08-07).
+                    if emotion_queue:
+                        emotion_queue.put("NEUTRAL")
                 else:
                     # 실제 답 시도(맞았든 틀렸든) — 매번 거절만 한다. 이미 스톨이 대기
                     # 중이면 재예약하지 않는다(계속 말할 때마다 타이머가 리셋되는 사고 방지).
+                    # 뜸들이는 동안은 THINKING 표정(2026-08-07 확정 시퀀스: neutral ->
+                    # 요청받으면 thinking -> 거절/공개 발화 때 neutral 복귀). 모션 쪽
+                    # play_thinking_stall도 THINKING을 넣지만 busy면 통째로 스킵되므로,
+                    # 표정만큼은 여기서 무조건 보장한다(같은 값 중복 put은 무해).
+                    if emotion_queue:
+                        emotion_queue.put("THINKING")
                     _run_guarded(play_thinking_stall, port, pkt, lock, shared_state, emotion_queue)
                     _schedule_stall_refusal()
 
@@ -274,6 +289,9 @@ def make_quiz_tools(quiz_ui_q, busy: threading.Event, motion_ctx, inject_turn, l
         mode_before = session.mode
         text = session.request_hint()
         if mode_before == "annoying":
+            # submit_guess의 실제 답 시도 분기와 같은 표정 시퀀스(위 주석 참고).
+            if emotion_queue:
+                emotion_queue.put("THINKING")
             _run_guarded(play_thinking_stall, port, pkt, lock, shared_state, emotion_queue)
             _schedule_stall_refusal()
         return text

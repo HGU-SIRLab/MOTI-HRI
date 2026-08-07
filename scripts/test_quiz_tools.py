@@ -183,6 +183,7 @@ async def main():
     # 없이) 정답이 공개되고 전진한다.
     injected.clear()
     calls.clear()
+    emotion_calls.clear()
     startA, selectA, submitA, hintA, endA, sessA = qt.make_quiz_tools(
         quiz_ui_q, busy, motion_ctx, fake_inject_turn, loop, speaking_done, emotion_queue=emotion_queue, num_questions=2,
     )
@@ -194,9 +195,15 @@ async def main():
     ok &= check("annoying wrong guess returns filler only (no answer leak)", "정답0" not in r)
     ok &= check("annoying wrong guess does not push anything to the UI yet", quiz_ui_q.empty())
     ok &= check("annoying wrong guess triggers the thinking-stall motion", ("thinking_stall",) in calls)
+    # 표정 시퀀스(2026-08-07): 답 시도를 받으면 뜸들이는 동안 THINKING.
+    ok &= check("annoying attempt switches the face to THINKING for the stall",
+                emotion_calls[-1] == "THINKING")
     await asyncio.sleep(0.15)  # STALL_MIN/MAX_SEC이 지나갈 때까지 대기
     ok &= check("delayed injection fires the exact refusal line for a wrong guess",
                 any(qt.MODE3_REFUSAL_LINE in t for t in injected))
+    # 거절 대사가 주입되는 순간 무표정으로 복귀해야 한다(THINKING인 채로 거절하면 안 됨).
+    ok &= check("the face returns to NEUTRAL when the refusal is delivered",
+                emotion_calls[-1] == "NEUTRAL")
     ok &= check("refusal alone never advances the session (no more auto-reveal)",
                 sessA.index == 0 and len(sessA.results) == 0 and quiz_ui_q.empty())
 
@@ -215,6 +222,9 @@ async def main():
     r = submitA("user", "그냥 다음 문제로 넘어가줘")
     ok &= check("an explicit give-up request immediately reveals, no stalling",
                 "정답0" in r and "화면에 적힌" in r)
+    # 포기로 정답을 공개할 때도 THINKING이 남지 않고 무표정으로 돌아온다.
+    ok &= check("the face returns to NEUTRAL on give-up reveal too",
+                emotion_calls[-1] == "NEUTRAL")
     ok &= check("give-up advances the session right away", sessA.index == 1 and len(sessA.results) == 1)
     ok &= check(
         "the logged result preserves the last real (correct) attempt's correctness",

@@ -2,6 +2,14 @@
 
 `docs/architecture.md`의 로드맵(§10) 대비 실제 구현 상태를 기록한다. 설계 자체가 바뀌면 architecture.md를, 무엇을 언제 어떻게 만들었는지는 이 문서를 갱신한다.
 
+### 35단계 — 짜증유발 모드 거절 시퀀스에 THINKING 표정 삽입 (2026-08-07)
+
+사용자 요청: 짜증유발 모드가 답을 거절하기 전 "뜸들이는 동안"에는 THINKING 표정을, 실제로 거절 대사("저는 AI 로봇이라 그런 답변은 할 수 없습니다")를 말하는 순간에는 다시 NEUTRAL로 — "고민해봤지만 결국 기계적으로 거절"하는 서사를 표정으로도 드러냄. 확정 시퀀스: neutral(기본) → 답/힌트/풀어달라 요청 시 THINKING → 거절 대사 발화 직전(또는 포기로 정답 공개될 때) NEUTRAL 복귀.
+
+**구현**: `core/quiz_tools.py` — `submit_guess`의 실제 답 시도 분기와 `request_hint`에서 스톨 모션 시작과 함께 `emotion_queue.put("THINKING")`. `_delayed_refusal`이 거절 대사를 주입하는 순간과, 포기/스킵으로 스톨이 취소되고 곧장 정답이 공개되는 분기 양쪽에 `emotion_queue.put("NEUTRAL")` 추가 — 두 경로 다 THINKING이 남지 않고 무표정으로 복귀해야 함. `hardware/motion.py`의 `play_thinking_stall`도 이미 THINKING을 넣지만 `busy`가 이미 set이면 통째로 스킵되므로(다른 동작 실행 중), 표정만큼은 `quiz_tools.py`에서 무조건 보장하도록 별도로 넣음(같은 값 중복 put은 무해).
+
+**검증**: `scripts/test_quiz_tools.py`에 회귀 테스트 3건 추가 — 답 시도 시 THINKING 전환, 거절 발화 시 NEUTRAL 복귀, 포기 reveal 시에도 NEUTRAL 복귀. 기존 quiz_state/quiz_tools/emotion_tools 테스트 전부 재통과. **실물 미확인.**
+
 ### 34단계 — 척척박사 모드 표정 neutral 고정 (2026-08-07)
 
 사용자 요청: 척척박사(all_knowing) 모드 중에는 로봇 표정을 neutral로 고정. 30단계의 톤/제스처 규칙(짧고 사무적, 감정적 제스처 금지)과 같은 취지의 시각 채널 마감.
