@@ -41,9 +41,19 @@ MIN_SHIFT_SAMPLES = 2400  # 24kHz 기준 100ms
 # 700으로 롤백.
 VOICE_SHIFT_BUFFER_MS = int(os.getenv("VOICE_SHIFT_BUFFER_MS", "1200"))
 
+# 청크를 서로 독립적으로 pyworld 처리하면 경계에서 F0/스펙트럼 추정이 어긋나 톤이 뚝
+# 끊기는 불연속이 생긴다 — "편하게 말씀해주세요"가 "말...씀"처럼 들리던 실사용 제보
+# (docs/progress.md 14단계, 당시 오버랩-크로스페이드가 필요하다고 가설만 세우고 보류).
+# 이제 각 청크 앞에 직전 청크의 입력 꼬리를 이 길이만큼 이어붙여 분석하고, 겹치는 구간의
+# 출력은 선형 크로스페이드로 섞는다(2026-08-07, VoiceShifter 참고) — 청크 경계가 항상
+# 분석 문맥의 한가운데 놓여 경계 아티팩트가 사라진다. 그만큼(120ms) 재생이 더 지연되고
+# pyworld 처리량도 ~10% 늘어나는 트레이드오프.
+VOICE_SHIFT_OVERLAP_MS = int(os.getenv("VOICE_SHIFT_OVERLAP_MS", "120"))
+
 # turn_complete 이후에도 이 버퍼만큼 오디오가 아직 재생 중일 수 있어, 그 뒤에야 다음 턴을
 # 안전하게 보내거나(launcher.py의 inject_turn) 정답 공개 화면을 띄울 수 있는(core/quiz_tools.py)
-# 곳이 여러 군데라 여기서 한 번만 계산해 공유한다(2배 여유).
+# 곳이 여러 군데라 여기서 한 번만 계산해 공유한다(2배 여유 — 오버랩 홀드백 120ms까지
+# 포함하고도 남는 마진).
 POST_SPEECH_DRAIN_SEC = (VOICE_SHIFT_BUFFER_MS * 2) / 1000
 
 
@@ -82,57 +92,142 @@ class VoiceShifter:
     pyworld 처리는 CPU 바운드 블로킹 작업이라 asyncio 이벤트 루프에서 직접 돌리면 안
     된다(recv_loop의 다른 이벤트 처리가 수백 ms씩 밀림) — MicStreamer/Speaker와 같은
     패턴으로 별도 스레드+큐를 쓴다.
+
+    청크 경계 처리(2026-08-07): 각 청크를 직전 청크의 입력 꼬리(`overlap_ms`)와
+    이어붙여 분석하고, 그 꼬리에 해당하는 출력은 직전에 붙잡아둔 출력 꼬리와 선형
+    크로스페이드로 섞어 내보낸다 — 청크를 독립 처리하던 시절의 경계 톤 불연속
+    ("말...씀" 끊김)과, 턴 마지막 짧은 꼬리가 MIN_SHIFT_SAMPLES 미만이라 변조 없이
+    원본 톤으로 재생되던 문제(원본/변환본 톤 차이)를 함께 해결한다. 항상 출력 꼬리
+    `overlap_ms`만큼을 다음 청크와 섞기 위해 들고 있으므로 재생이 그만큼 더 지연된다.
+
+    barge-in 처리(2026-08-07): reset()이 세대 번호를 올리고, feed()가 넣은 데이터엔
+    그 시점 세대가 태깅된다. 워커는 (1) 큐에서 꺼낼 때 (2) 오래 걸리는 pyworld 처리를
+    마치고 재생 직전, 두 번 세대를 검사한다 — 이전엔 reset 마커가 큐 뒤에 줄을 서는
+    구조라, 이미 큐에 쌓였거나 처리 중이던 오디오가 stop_immediately() 이후에도 최대
+    버퍼 길이만큼 뒤늦게 새어나올 수 있었다(2026-07-31 리뷰에서 발견, 당시 보류).
     """
 
-    def __init__(self, on_shifted, sample_rate: int, buffer_ms: int = VOICE_SHIFT_BUFFER_MS):
+    def __init__(self, on_shifted, sample_rate: int, buffer_ms: int = VOICE_SHIFT_BUFFER_MS,
+                 overlap_ms: int = VOICE_SHIFT_OVERLAP_MS):
         self._on_shifted = on_shifted
         self._sr = sample_rate
         self._buffer_bytes = int(sample_rate * buffer_ms / 1000) * 2  # int16 = 2 bytes/sample
+        self._overlap_bytes = int(sample_rate * overlap_ms / 1000) * 2
         self._buf = bytearray()
-        self._in_q: "queue.Queue[tuple[str, bytes | None]]" = queue.Queue()
+        self._in_q: "queue.Queue[tuple[str, bytes | None, int]]" = queue.Queue()
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, name="voice-shift", daemon=True)
+        # 오버랩-크로스페이드 상태(워커 스레드 전용): 직전 청크의 입력 꼬리와, 그 꼬리에
+        # 해당하는 변환된 출력(아직 재생 안 됨 — 다음 청크의 머리와 섞어서 내보낸다).
+        self._prev_in_tail = b""
+        self._prev_out_tail = b""
+        # reset() 세대 번호. feed/reset은 같은 스레드(recv_loop)에서만 불리고 워커는
+        # 읽기만 하므로 락 없이 int 갱신으로 충분하다(GIL).
+        self._gen = 0
 
     def feed(self, pcm_bytes: bytes):
-        self._in_q.put(("data", pcm_bytes))
+        self._in_q.put(("data", pcm_bytes, self._gen))
 
     def flush(self):
-        """턴이 끝났을 때 버퍼 임계값 미만으로 남은 꼬리를 그대로 흘려보낸다."""
-        self._in_q.put(("flush", None))
+        """턴이 끝났을 때 버퍼 임계값 미만으로 남은 꼬리 + 붙잡아둔 출력 꼬리를 흘려보낸다."""
+        self._in_q.put(("flush", None, self._gen))
 
     def reset(self):
-        """barge-in 등으로 재생을 즉시 끊을 때 — 버퍼링 중이던 미처리 오디오는
-        재생하지 않고 폐기한다(Speaker.stop_immediately()와 함께 호출할 것)."""
-        self._in_q.put(("reset", None))
+        """barge-in 등으로 재생을 즉시 끊을 때 — 큐에 쌓였거나 처리 중이던 미재생 오디오를
+        전부 폐기한다(Speaker.stop_immediately()와 함께 호출할 것)."""
+        self._gen += 1
+        self._in_q.put(("reset", None, self._gen))
 
     def _run(self):
         while not self._stop.is_set():
             try:
-                kind, payload = self._in_q.get(timeout=0.2)
+                kind, payload, gen = self._in_q.get(timeout=0.2)
             except queue.Empty:
                 continue
 
             if kind == "reset":
                 self._buf.clear()
-            elif kind == "data":
+                self._prev_in_tail = b""
+                self._prev_out_tail = b""
+                continue
+            if gen != self._gen:
+                # reset() 이전에 feed()된 스테일 오디오 — 처리도 재생도 하지 않는다.
+                continue
+
+            if kind == "data":
                 self._buf.extend(payload)
                 while len(self._buf) >= self._buffer_bytes:
                     chunk = bytes(self._buf[:self._buffer_bytes])
                     del self._buf[:self._buffer_bytes]
-                    self._process_and_emit(chunk)
+                    self._emit_block(chunk, gen, is_flush=False)
             elif kind == "flush":
-                if self._buf:
-                    chunk = bytes(self._buf)
-                    self._buf.clear()
-                    self._process_and_emit(chunk)
+                chunk = bytes(self._buf)
+                self._buf.clear()
+                self._emit_block(chunk, gen, is_flush=True)
 
-    def _process_and_emit(self, pcm_bytes: bytes):
+    def _shift_same_length(self, pcm_bytes: bytes):
+        """shift_pcm을 돌리되 결과를 입력과 정확히 같은 샘플 수로 맞춰 돌려준다(int16 배열).
+        pyworld 재합성은 프레임 경계 때문에 입력과 몇 ms 어긋날 수 있는데, 그대로 두면
+        크로스페이드/꼬리 계산의 위치가 청크마다 조금씩 밀린다 — 모자라면 마지막 샘플을
+        반복해 채운다(어차피 다음 청크와 크로스페이드되는 구간이라 티가 안 남)."""
         try:
             shifted = shift_pcm(pcm_bytes, self._sr)
         except Exception as e:
             print(f"⚠️ 음성 변조 실패, 원본 그대로 재생: {e}")
             shifted = pcm_bytes
-        self._on_shifted(shifted)
+        target = len(pcm_bytes) // 2
+        arr = np.frombuffer(shifted, dtype=np.int16)
+        if len(arr) > target:
+            arr = arr[:target]
+        elif len(arr) < target:
+            arr = np.pad(arr, (0, target - len(arr)), mode="edge")
+        return arr
+
+    @staticmethod
+    def _crossfade(prev_tail_bytes: bytes, cur_head: "np.ndarray"):
+        prev = np.frombuffer(prev_tail_bytes, dtype=np.int16).astype(np.float32)
+        cur = cur_head.astype(np.float32)
+        fade = np.linspace(0.0, 1.0, len(prev), dtype=np.float32)
+        # rint 없이 astype만 하면 버림(truncate)이라, 같은 값끼리 섞어도 부동소수점 오차로
+        # ±1씩 어긋난다 — 반올림해야 "항등 변환이면 출력도 항등"이 정확히 성립한다.
+        return np.rint(np.clip(prev * (1.0 - fade) + cur * fade, -32768, 32767)).astype(np.int16)
+
+    def _emit_block(self, chunk: bytes, gen: int, is_flush: bool):
+        overlap_samples = self._overlap_bytes // 2
+
+        if not chunk:
+            if is_flush and self._prev_out_tail:
+                # 턴이 정확히 버퍼 경계에서 끝난 경우 — 붙잡아뒀던 출력 꼬리를 그대로 내보낸다.
+                tail = self._prev_out_tail
+                self._prev_in_tail = b""
+                self._prev_out_tail = b""
+                if gen == self._gen:
+                    self._on_shifted(tail)
+            return
+
+        inp = self._prev_in_tail + chunk
+        out = self._shift_same_length(inp)
+
+        if self._prev_out_tail:
+            head = self._crossfade(self._prev_out_tail, out[:overlap_samples])
+            out = np.concatenate((head, out[overlap_samples:]))
+
+        if is_flush:
+            emit = out
+            self._prev_in_tail = b""
+            self._prev_out_tail = b""
+        else:
+            emit = out[:-overlap_samples]
+            self._prev_out_tail = out[-overlap_samples:].tobytes()
+            self._prev_in_tail = inp[-self._overlap_bytes:]
+
+        if gen != self._gen:
+            # pyworld 처리 도중 reset()이 들어왔다 — 이미 stop_immediately()로 끊긴
+            # 발화의 꼬리를 뒤늦게 재생하지 않는다.
+            self._prev_in_tail = b""
+            self._prev_out_tail = b""
+            return
+        self._on_shifted(emit.tobytes())
 
     def start(self):
         self._thread.start()
