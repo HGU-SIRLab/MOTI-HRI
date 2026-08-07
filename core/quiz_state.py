@@ -10,6 +10,7 @@ name_state["name"]에 따라 분기하는 것과 같은 패턴을 그대로 확�
 이 모듈은 순수 로직만 다룬다 — asyncio/하드웨어/UI 큐를 몰라야 core/quiz_tools.py 없이도
 독립적으로 유닛 테스트할 수 있다.
 """
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
@@ -32,17 +33,31 @@ class _QuestionResult:
     robot_guess_text: str | None = None
     robot_correct: bool | None = None
     hint_requested: bool = False
+    # 문제가 화면에 실제로 표시된 순간부터 채점/포기로 확정될 때까지 걸린 시간(초).
+    # docs/experiment_design.md §5의 "문제당 소요시간" 지표 — mark_question_shown()이
+    # 호출된 적 없으면(순수 로직 테스트 등) None으로 남는다.
+    elapsed_sec: float | None = None
+    # 짜증유발 모드 전용 — 이 문제에서 포기하기까지 실제로 발화된 거절 대사 횟수
+    # (docs/experiment_design.md §5의 "포기까지 겪은 거절 횟수" 지표, A-6 답답함
+    # 자기보고를 보완하는 객관적 노출량 프록시). 다른 모드에서는 None.
+    annoying_refusals: int | None = None
     timestamp: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat(timespec="seconds"))
 
 
 class QuizSession:
-    def __init__(self, questions: list[QuizQuestion], num_questions: int = 5):
+    def __init__(self, questions: list[QuizQuestion], num_questions: int = 5,
+                 initial_round_offset: int = 0):
         # 모든 참가자에게 같은 문제 은행/같은 순서 — 셔플하지 않는다. 실제 라운드별
         # 슬라이스는 start()가 _pick_round_questions()로 매번 새로 정한다(아래 참고).
+        # initial_round_offset: 세션이 도중에 크래시해 launcher를 재시작해야 할 때,
+        # 참가자가 이미 소모한 라운드 수를 지정해 이미 정답이 공개된 사진 슬라이스를
+        # 건너뛰게 한다(core/quiz_tools.py가 QUIZ_ROUND_OFFSET env로 전달) — 안 그러면
+        # 재시작한 세션이 슬라이스 0부터 다시 배분해 앞 라운드에서 공개된 사진을
+        # 다음 모드에서 또 보여주는 오염이 생긴다.
         self.all_questions = questions
         self.num_questions = num_questions
         self.questions: list[QuizQuestion] = []
-        self._rounds_played: int = 0
+        self._rounds_played: int = initial_round_offset
         self.mode: str | None = None
         self.index: int = -1
         self.active: bool = False
@@ -55,6 +70,17 @@ class QuizSession:
         self.annoying_pending_correct: bool = False
         self.results: list[_QuestionResult] = []
         self._hint_requested_this_question: bool = False
+        # 실험 설계상 각 모드는 참가자당 정확히 한 번씩이다 — 이미 진행한 모드를 다시
+        # 선택하려는 시도(사용자 말실수/STT 오인식/모델 매핑 실수)는 한 번 되물어 확인
+        # 받게 한다. 같은 모드로 곧바로 재호출하면 그때는 의도로 보고 허용(아래 참고).
+        self.modes_played: list[str] = []
+        self._pending_repeat_mode: str | None = None
+        # "문제당 소요시간" 지표용 — 화면에 문제가 실제로 표시된 순간(mark_question_shown)
+        # 의 monotonic 시각. 채점/포기로 확정될 때 elapsed_sec으로 기록된다.
+        self._question_shown_at: float | None = None
+        # 짜증유발 모드에서 이 문제에 대해 실제로 발화된 거절 대사 횟수 — 지연 주입이
+        # 진짜로 전송된 순간에만 core/quiz_tools.py가 note_refusal_delivered()로 올린다.
+        self.annoying_refusals_this_question: int = 0
 
     @property
     def current_question(self) -> QuizQuestion | None:
@@ -96,6 +122,7 @@ class QuizSession:
         self.awaiting_mode_choice = True
         self.mode = None
         self.index = -1
+        self._pending_repeat_mode = None
         self.questions = self._pick_round_questions()
         return (
             "지금부터 '부분 확대 사진 퀴즈'를 시작합니다. 규칙: 화면에 사물의 일부를 "
@@ -110,10 +137,30 @@ class QuizSession:
         if mode not in VALID_MODES:
             return None
 
+        if mode in self.modes_played and self._pending_repeat_mode != mode:
+            # 이미 진행한 모드의 재선택 — 실험 설계상 각 모드는 참가자당 한 번이므로,
+            # 사용자 말실수나 STT 오인식일 가능성이 크다(같은 모드를 두 번 돌리면 문제
+            # 슬라이스가 낭비되고 결과 파일에 두 라운드가 섞인다). 상태를 바꾸지 않고
+            # 한 번 되물어 확인받게 하되, 정말 의도라면(같은 모드로 곧바로 재호출) 허용
+            # — 하드 차단하면 재실험 같은 정당한 예외 상황에서 복구 경로가 없어진다.
+            self._pending_repeat_mode = mode
+            print(f"⚠️ 이미 진행한 모드({mode}) 재선택 시도 — 사용자 재확인을 요청합니다.")
+            return (
+                f"주의: '{mode}' 모드는 이번 세션에서 이미 진행했습니다. 실험 설계상 각 "
+                "모드는 참가자당 한 번씩입니다 — 사용자가 번호를 잘못 말했거나 당신이 "
+                "잘못 들었을 가능성이 큽니다. 사용자에게 실험자가 알려준 번호가 정말 "
+                "맞는지 한 번만 다시 확인하고, 맞다고 하면 같은 모드로 이 툴을 다시 "
+                "호출하세요(그때는 진행됩니다)."
+            )
+        self._pending_repeat_mode = None
+        self.modes_played.append(mode)
+
         self.mode = mode
         self.awaiting_mode_choice = False
         self.index = 0
         self._hint_requested_this_question = False
+        self._question_shown_at = None
+        self.annoying_refusals_this_question = 0
 
         question = self.current_question
         base = f"모드가 확정됐습니다. 사용자에게 첫 문제를 보여주고 \"이 물건은 무엇일까요?\"라고 물어보세요."
@@ -347,6 +394,20 @@ class QuizSession:
             "침묵한 채로 다음 지시를 기다리세요."
         )
 
+    def mark_question_shown(self):
+        """화면에 문제 사진이 실제로 표시된 순간 호출된다(core/quiz_tools.py의
+        _push_question_or_hide) — "문제당 소요시간"의 시작점. 상태 기계의 전진 시점이
+        아니라 UI 표시 시점을 기준으로 해야, 이전 문제의 정답 공개(reveal hold + 로봇
+        발화 대기) 시간이 다음 문제의 소요시간에 섞이지 않는다."""
+        if self.current_question is not None:
+            self._question_shown_at = time.monotonic()
+
+    def note_refusal_delivered(self):
+        """짜증유발 모드의 거절 대사가 실제로 발화 주입된 순간 호출된다(core/quiz_tools.py의
+        _delayed_refusal). 예약만 되고 취소된 스톨은 세지 않는다 — 참가자가 실제로 겪은
+        거절 횟수만이 지표로 의미가 있다."""
+        self.annoying_refusals_this_question += 1
+
     def end_early(self) -> str:
         self.active = False
         self.awaiting_mode_choice = False
@@ -356,12 +417,19 @@ class QuizSession:
         return [vars(r) for r in self.results]
 
     def _record_and_advance(self, question: QuizQuestion, **fields):
+        elapsed_sec = None
+        if self._question_shown_at is not None:
+            elapsed_sec = round(time.monotonic() - self._question_shown_at, 1)
         self.results.append(_QuestionResult(
             question_id=question.id, mode=self.mode,
             hint_requested=self._hint_requested_this_question,
+            elapsed_sec=elapsed_sec,
+            annoying_refusals=self.annoying_refusals_this_question if self.mode == "annoying" else None,
             **fields,
         ))
         self._hint_requested_this_question = False
+        self._question_shown_at = None  # 다음 문제의 시작점은 mark_question_shown()이 다시 찍는다
+        self.annoying_refusals_this_question = 0
         self.index += 1
         if self.index >= len(self.questions):
             self.active = False

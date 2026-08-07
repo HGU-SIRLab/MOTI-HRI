@@ -2,6 +2,21 @@
 
 `docs/architecture.md`의 로드맵(§10) 대비 실제 구현 상태를 기록한다. 설계 자체가 바뀌면 architecture.md를, 무엇을 언제 어떻게 만들었는지는 이 문서를 갱신한다.
 
+### 33단계 — 실험 준비 최종 점검: 미구현 로그 지표 2종 + 데이터 오염 방지 3종 (2026-08-07)
+
+실험 직전 전체 기능 재점검(사용자 요청)에서 `docs/experiment_design.md` §5가 "실험 전에 구현 필요"라고 명시한 항목과, 앞선 전수 검사에서 보류했던 데이터 오염 리스크를 한 번에 정리.
+
+**로그 지표(experiment_design.md §5 요구사항 — 미구현이었음):**
+1. **문제당 소요시간** — `_QuestionResult.elapsed_sec` 신설. 시작점은 상태 기계 전진 시점이 아니라 **문제 사진이 UI에 실제로 push되는 순간**(`QuizSession.mark_question_shown()`, `core/quiz_tools.py._push_question_or_hide`가 호출) — 이전 문제의 reveal hold/발화 대기 시간이 다음 문제 소요시간에 섞이지 않게 함.
+2. **짜증유발 거절 횟수** — `_QuestionResult.annoying_refusals` 신설. `_delayed_refusal`이 거절 대사를 **실제로 주입한 직후**에만 `note_refusal_delivered()`로 카운트(예약됐다 취소된 스톨은 참가자가 겪은 적 없으므로 제외 — 회귀 테스트로 고정). 다른 모드는 None. `core/quiz_export.py` summary에 `avg_elapsed_sec`/`annoying_refusals_total`도 추가.
+
+**데이터 오염 방지:**
+3. **포기 마커 부분 문자열 오탐**(`core/quiz_bank.py`) — "그만큼 어렵네요"의 "그만", "패스츄리"(크로와상 오답 시도)의 "패스", "화면이 안 넘어가는데요"(문제 신고)의 "넘어가"가 포기로 오인되면 짜증유발 모드에서 즉시 정답이 공개되어 조작이 깨진다. `_DONT_KNOW_FALSE_POSITIVES` 중화 목록(마커 검사 전 해당 부분 문자열 제거) 도입, 진짜 포기 표현("이제 그만할래요"/"패스할게요"/"넘어가줘")은 그대로 잡히는 것까지 테스트로 고정.
+4. **이미 진행한 모드 재선택 확인 가드**(`core/quiz_state.py.choose_mode`) — 실험 설계상 각 모드는 참가자당 한 번인데, 말실수/STT 오인식으로 같은 모드를 두 번 돌면 문제 슬라이스가 낭비되고 결과 파일에 두 라운드가 섞인다. 재선택 시 상태를 바꾸지 않고 한 번 되물어 확인받게 하되, 같은 모드로 곧바로 재호출하면 의도로 보고 허용(하드 차단하면 정당한 예외 상황의 복구 경로가 없어짐). 경고 중엔 화면을 hide로 덮지 않도록 `select_quiz_mode`도 보완.
+5. **크래시 복구용 `QUIZ_ROUND_OFFSET`**(env) — 세션이 도중에 죽어 launcher를 재시작할 때 이미 소모한 라운드 수를 지정하면 이미 공개된 사진 슬라이스를 건너뛴다(`QuizSession(initial_round_offset=...)`). 시작 시 콘솔에 크게 안내(실험 후 지우라는 경고 포함). 운영 가이드는 `docs/experiment_design.md` "실험 운영 시 알아둘 것" 신설 섹션에 정리.
+
+**검증**: `test_quiz_bank.py`(16케이스로 확장)/`test_quiz_state.py`(모드 재선택 확인 흐름, 지표 기록/리셋)/`test_quiz_tools.py`(전달된 거절만 카운트, 취소된 스톨 미카운트) 전부 갱신·통과. **실물 로봇으로 새 지표 값이 실제 세션에서 채워지는 것은 미확인.**
+
 ### 32단계 — 목소리 파이프라인: 청크 경계 끊김(오버랩-크로스페이드) + barge-in 스테일 오디오 수정 (2026-08-07)
 
 사용자 요청("끊기는 부분이나 먹히는 부분이 남아있으면 사용자가 듣기 힘들 것 같다")으로, 그동안 알고도 보류해뒀던 목소리 결함 두 가지를 `media/voice_shift.py`에서 해결.

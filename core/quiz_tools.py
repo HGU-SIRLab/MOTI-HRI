@@ -8,6 +8,7 @@ Live 세션의 tool_call 처리가 동기적이라 즉시 반환해야 하므로
 asyncio 태스크로 예약하고 그 태스크가 나중에 `inject_turn()`으로 새 히든 턴을 보낸다.
 """
 import asyncio
+import os
 import random
 import threading
 
@@ -38,7 +39,16 @@ def make_quiz_tools(quiz_ui_q, busy: threading.Event, motion_ctx, inject_turn, l
     말하기를 막고 있음) — 정답 공개 타이밍도 같은 신호를 재사용한다.
     """
     port, pkt, lock, shared_state, home_pan, home_tilt = motion_ctx
-    session = QuizSession(load_question_bank(), num_questions=num_questions)
+    # 크래시 복구용(docs/experiment_design.md §1-1): 세션이 도중에 죽어 launcher를
+    # 재시작해야 할 때, 참가자가 이미 마친 라운드 수를 .env의 QUIZ_ROUND_OFFSET으로
+    # 지정하면 이미 정답이 공개된 사진 슬라이스를 건너뛴다(예: 1라운드 완료 후 크래시
+    # -> QUIZ_ROUND_OFFSET=1로 재시작하면 다음 라운드가 6번째 사진부터 배분됨).
+    round_offset = int(os.getenv("QUIZ_ROUND_OFFSET", "0"))
+    if round_offset:
+        print(f"ℹ️ QUIZ_ROUND_OFFSET={round_offset} — 문제 은행을 {round_offset}라운드만큼 "
+              f"건너뛰고 시작합니다(크래시 복구 모드). 실험이 끝나면 .env에서 지우세요!")
+    session = QuizSession(load_question_bank(), num_questions=num_questions,
+                           initial_round_offset=round_offset)
     # asyncio.create_task()가 만든 태스크는 어딘가에서 강하게 참조하고 있지 않으면
     # 이벤트 루프가 약한 참조만 들고 있어서 도중에 가비지 컬렉션될 수 있다(공식 문서
     # 경고) — 지연된 거절 대사가 통째로 사라지는 사고를 막기 위해 여기 붙잡아둔다.
@@ -54,6 +64,9 @@ def make_quiz_tools(quiz_ui_q, busy: threading.Event, motion_ctx, inject_turn, l
                 "type": "question", "index": session.index, "total": session.total_questions,
                 "image_path": q.image_path, "prompt": "이 물건은 무엇일까요?",
             })
+            # "문제당 소요시간" 지표(docs/experiment_design.md §5)의 시작점 — 화면에
+            # 사진이 실제로 나가는 이 지점이 유일한 push 경로라 여기서 한 번만 찍는다.
+            session.mark_question_shown()
         else:
             quiz_ui_q.put({"type": "hide"})
 
@@ -131,6 +144,9 @@ def make_quiz_tools(quiz_ui_q, busy: threading.Event, motion_ctx, inject_turn, l
             "이제 정확히 이 문장만 그대로 말하세요(단어 하나도 바꾸거나 덧붙이지 마세요): "
             f"\"{MODE3_REFUSAL_LINE}\""
         )
+        # 거절이 실제로 발화 주입된 뒤에만 센다 — 예약만 되고 취소된 스톨은 참가자가
+        # 겪은 적이 없으므로 "포기까지 겪은 거절 횟수" 지표에 포함되면 안 된다.
+        session.note_refusal_delivered()
 
     def _schedule_stall_refusal():
         """이미 대기 중인 지연 주입이 있으면 또 예약하지 않는다 — 참가자가 대기 중
@@ -184,7 +200,11 @@ def make_quiz_tools(quiz_ui_q, busy: threading.Event, motion_ctx, inject_turn, l
         _cancel_pending_stall()
         _cancel_pending_reveal_transition()
         text = session.choose_mode(mode)
-        _push_question_or_hide()
+        # 이미 진행한 모드 재선택이면 choose_mode가 상태를 바꾸지 않고 재확인 요청만
+        # 돌려준다(2026-08-07) — 그때 화면을 건드리면 규칙 안내가 hide로 지워지므로,
+        # 모드가 실제로 확정된 경우에만 첫 문제를 push한다.
+        if session.mode == mode:
+            _push_question_or_hide()
         return text
 
     def submit_guess(speaker: str, guess_text: str) -> str:

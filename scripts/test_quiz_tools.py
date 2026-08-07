@@ -220,6 +220,13 @@ async def main():
         "the logged result preserves the last real (correct) attempt's correctness",
         sessA.results[0].user_correct is True and sessA.results[0].user_dont_know is True,
     )
+    # 실험 지표(docs/experiment_design.md §5): 이 문제에서 참가자는 거절을 정확히 2번
+    # (오답 1회 + 정답 1회 시도) 겪은 뒤 포기했다 — 실제로 발화 주입된 횟수만 세야 한다.
+    # 문제당 소요시간도 문제 push 시점부터 기록돼 있어야 한다.
+    ok &= check(
+        "the logged result captures delivered refusal count and elapsed time",
+        sessA.results[0].annoying_refusals == 2 and sessA.results[0].elapsed_sec is not None,
+    )
     await asyncio.sleep(0.1)  # reveal push가 speaking_done 대기 태스크를 통해 일어날 시간을 준다
     msg = quiz_ui_q.get()
     ok &= check("give-up reveal pushes the original photo + answer", msg["type"] == "reveal" and "정답0" in msg["text"])
@@ -247,6 +254,9 @@ async def main():
         "an immediate give-up cancels the pending refusal stall and resolves right away",
         sessB.index == 1 and len(sessB.results) == 1,
     )
+    # 예약만 되고 취소된 스톨은 참가자가 실제로 겪은 거절이 아니다 — 0으로 남아야 한다.
+    ok &= check("a cancelled (never-delivered) refusal is not counted",
+                sessB.results[0].annoying_refusals == 0)
     await asyncio.sleep(0.1)  # reveal push가 speaking_done 대기 태스크를 통해 일어날 시간을 준다
     quiz_ui_q.get()  # reveal
     await asyncio.sleep(0.15)  # REVEAL_HOLD_SEC 경과 + 취소된 스톨이 원래 발화했을 시간까지 대기

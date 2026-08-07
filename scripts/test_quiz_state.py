@@ -37,10 +37,17 @@ def main():
     ok &= check("invalid mode rejected", s.choose_mode("invalid") is None)
     txt = s.choose_mode("all_knowing")
     ok &= check("all_knowing reveals answer at mode-select", "정답0" in txt)
+    s.mark_question_shown()  # 실제로는 core/quiz_tools.py가 문제를 UI에 push할 때 호출
     txt = s.resolve_user_guess("땡땡땡")
     ok &= check("wrong guess reveals answer + advances", "정답0" in txt and s.index == 1)
+    ok &= check("elapsed time is recorded when the question was marked as shown",
+                s.results[0].elapsed_sec is not None and s.results[0].elapsed_sec >= 0)
+    ok &= check("annoying refusal count stays None outside annoying mode",
+                s.results[0].annoying_refusals is None)
     txt = s.resolve_user_guess("정답1")
     ok &= check("correct guess praised", "맞혔습니다" in txt and s.index == 2)
+    ok &= check("elapsed time stays None when the question was never marked as shown",
+                s.results[1].elapsed_sec is None)
     txt = s.resolve_user_guess("오답")
     ok &= check("last question ends session", "모든 문제가 끝났습니다" in txt and not s.active)
     ok &= check("all_knowing logged 3 results", len(s.results) == 3)
@@ -155,6 +162,10 @@ def main():
         "정답0" not in txt and s4b.index == 0 and len(s4b.results) == 0
         and s4b.pending_user_guess == "정답0" and s4b.annoying_pending_correct is True,
     )
+    # 두 번의 시도에 대해 거절 대사가 실제로 발화됐다고 가정(실제로는 core/quiz_tools.py의
+    # _delayed_refusal이 주입 직후 호출) — 포기 시점 로그에 2회로 남아야 한다.
+    s4b.note_refusal_delivered()
+    s4b.note_refusal_delivered()
     # 명시적으로 포기/스킵을 요청해야만 그 자리에서 곧장 정답이 공개되고 전진한다 —
     # 직전 실제 시도(정답0, 맞았음)의 정오는 로그에 보존된다.
     txt = s4b.resolve_user_guess("그냥 다음 문제로 넘어가줘")
@@ -173,6 +184,8 @@ def main():
         "reveal wording frames it as reading the screen, not the robot's own knowledge",
         "화면에 적힌" in txt,
     )
+    ok &= check("delivered refusal count is recorded on the give-up result",
+                r0.annoying_refusals == 2)
 
     # 두 번째(마지막) 문제 — 이번엔 실제 시도 없이 곧장 포기하면 correctness가 False로 남는다.
     txt = s4b.resolve_user_guess("정답 알려줘")
@@ -182,6 +195,8 @@ def main():
         and s4b.results[1].user_correct is False and s4b.results[1].user_dont_know is True
         and not s4b.active,
     )
+    ok &= check("refusal counter resets per question",
+                s4b.results[1].annoying_refusals == 0)
 
     # request_hint()도 정오 로그를 초기화해야 한다 — 힌트를 물었다는 건 실제로 맞힌 적이
     # 없다는 뜻이므로, 그 직후 포기하면 정확하게 False로 기록돼야 한다.
@@ -213,9 +228,11 @@ def main():
     ok &= check("skipping select_quiz_mode gives an actionable recovery message",
                 "select_quiz_mode" in txt)
 
-    # 6. export_log 필드
+    # 6. export_log 필드 — elapsed_sec/annoying_refusals는 실험 지표(docs/experiment_design.md §5)
     log = s2.export_log()
-    ok &= check("export_log has expected fields", len(log) == 3 and "question_id" in log[0] and "timestamp" in log[0])
+    ok &= check("export_log has expected fields",
+                len(log) == 3 and "question_id" in log[0] and "timestamp" in log[0]
+                and "elapsed_sec" in log[0] and "annoying_refusals" in log[0])
 
     # 8. 한 세션 안에서 여러 라운드(모드) 연속 진행 — 2026-07-31: 참가자가 1/2/3번 모드를
     # 로봇 재시작 없이 한 세션 안에서 이어서 진행하는 실험 운영 방식이 확정되면서, 라운드마다
@@ -251,13 +268,42 @@ def main():
     ok &= check("results from rounds 1 and 2 both accumulate in one session", len(s7.results) == 4)
 
     # 은행이 부족하면(4라운드째 요청 등) 경고를 남기고 처음부터 재사용 — 크래시하지 않아야 함.
+    # 이미 진행한 모드의 재선택은 한 번 되물어 확인받는다(2026-08-07 — 실험 설계상 각 모드는
+    # 참가자당 한 번이라, 말실수/STT 오인식으로 같은 모드를 두 번 도는 사고를 막기 위함).
     s7.resolve_user_guess("정답4")
     s7.resolve_user_guess("정답5")
     s7.start()
-    s7.choose_mode("all_knowing")
+    txt = s7.choose_mode("all_knowing")
+    ok &= check("re-choosing an already-played mode asks for confirmation, state unchanged",
+                "이미 진행했습니다" in txt and s7.mode is None and s7.index == -1)
+    txt = s7.choose_mode("all_knowing")
+    ok &= check("insisting on the same mode right after the warning proceeds",
+                s7.mode == "all_knowing" and s7.index == 0)
     round4_ids = [q.id for q in s7.questions]
     ok &= check("exhausted bank falls back to reusing questions instead of crashing",
                 round4_ids == round1_ids)
+
+    # 8b. 확인 요청 후 다른(아직 안 한) 모드를 고르면 경고 없이 진행되고, 대기 중이던
+    # 확인 상태는 해제된다 — 나중에 또 같은 모드를 시도하면 다시 경고부터 받아야 한다.
+    s8 = QuizSession(make_questions(6), num_questions=2)
+    s8.start()
+    s8.choose_mode("all_knowing")
+    s8.resolve_user_guess("정답0")
+    s8.resolve_user_guess("정답1")
+    s8.start()
+    txt = s8.choose_mode("all_knowing")  # 재선택 -> 경고
+    ok &= check("repeat warning issued in round 2", "이미 진행했습니다" in txt)
+    txt = s8.choose_mode("imperfect")  # 마음 바꿔 새 모드 -> 곧장 진행
+    ok &= check("choosing a fresh mode after the warning proceeds without confirmation",
+                s8.mode == "imperfect")
+    s8.resolve_user_guess("정답2")
+    s8.resolve_robot_guess("아무말")
+    s8.resolve_user_guess("정답3")
+    s8.resolve_robot_guess("아무말")
+    s8.start()
+    txt = s8.choose_mode("imperfect")  # 한참 뒤 또 재선택 -> 다시 경고부터
+    ok &= check("a later repeat attempt warns again (pending confirm was cleared)",
+                "이미 진행했습니다" in txt and s8.mode is None)
 
     print()
     if ok:

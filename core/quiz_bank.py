@@ -35,6 +35,17 @@ _DONT_KNOW_MARKERS = (
     "넘어가", "스킵", "공개해", "그만",
 )
 
+# 위 마커의 알려진 오탐 문맥 — 마커 검사 전에 이 부분 문자열을 먼저 지워 중화한다
+# (2026-08-07 전체 점검에서 발견). 단순 부분 문자열 매칭이라, 예를 들어:
+#   - "그만큼 어렵네요"의 "그만" — 난이도 얘기일 뿐 포기가 아님
+#   - "패스츄리 아니에요?"의 "패스" — 크로와상 사진에 충분히 나올 법한 실제 답 시도
+#   - "화면이 안 넘어가는데요?"의 "넘어가" — 스킵 요청이 아니라 문제 상황 신고
+# 가 포기 신호로 오인되면, 특히 짜증유발 모드에서 "매번 거절" 조작이 깨지고 즉시
+# 정답이 공개되어 실험 데이터가 오염된다. 새 오탐이 실험 중 발견되면 여기 추가할 것.
+_DONT_KNOW_FALSE_POSITIVES = (
+    "그만큼", "패스츄리", "패스트", "안 넘어가", "안넘어가", "못 넘어가", "못넘어가",
+)
+
 FUZZY_MATCH_THRESHOLD = 0.72
 
 
@@ -111,7 +122,10 @@ def judge_guess(guess_text: str, question: QuizQuestion) -> tuple[bool, bool]:
     했는지를 구분해야 자연스럽다(설계 문서 4.2절 "오답을 말하거나 모른다고 대답했을 때").
     """
     raw = guess_text.strip()
-    if any(marker in raw for marker in _DONT_KNOW_MARKERS):
+    scrubbed = raw
+    for fp in _DONT_KNOW_FALSE_POSITIVES:
+        scrubbed = scrubbed.replace(fp, " ")
+    if any(marker in scrubbed for marker in _DONT_KNOW_MARKERS):
         return False, True
 
     normalized_guess = normalize_guess(raw)

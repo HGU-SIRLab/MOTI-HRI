@@ -44,6 +44,7 @@ def save_quiz_results(user_name: str | None, quiz_log: list[dict]) -> None:
 
     for mode, entries in by_mode.items():
         label = MODE_LABELS.get(mode, mode)
+        elapsed_vals = [e.get("elapsed_sec") for e in entries if e.get("elapsed_sec") is not None]
         payload = {
             "mode": mode,
             "mode_label": label,
@@ -53,6 +54,12 @@ def save_quiz_results(user_name: str | None, quiz_log: list[dict]) -> None:
                 # §1) — 그래도 현장에서 바로 훑어볼 수 있게 요약만 같이 넣어둔다.
                 "user_correct_count": sum(1 for e in entries if e.get("user_correct")),
                 "hint_requested_count": sum(1 for e in entries if e.get("hint_requested")),
+                # docs/experiment_design.md §5의 로그 지표(2026-08-07 구현) — 문항별 값은
+                # results에 그대로 있고, 여기는 현장 확인용 요약만.
+                "avg_elapsed_sec": round(sum(elapsed_vals) / len(elapsed_vals), 1) if elapsed_vals else None,
+                "annoying_refusals_total": (
+                    sum(e.get("annoying_refusals") or 0 for e in entries) if mode == "annoying" else None
+                ),
             },
             "results": entries,
         }
