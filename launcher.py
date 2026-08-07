@@ -139,7 +139,8 @@ async def run_conversation(name_state: dict, facts_summary: str | None, emotion_
                             motion_tools: list | None = None, shared_state: dict | None = None, brain=None,
                             quiz_ui_q=None, quiz_busy: threading.Event | None = None,
                             port=None, pkt=None, lock=None, home_pan: int | None = None, home_tilt: int | None = None,
-                            quiz_num_questions: int = 5, quiz_log_out: list | None = None):
+                            quiz_num_questions: int = 5, quiz_session_out: dict | None = None,
+                            history_out: list | None = None):
     """Live 세션을 열고 대화가 끝날 때까지 실행한다. 종료 시 세션 로그를 반환.
 
     name_state: {"name": <세션 시작 시점 확정된 이름 또는 None>}. 처음 보는 사람이면
@@ -147,9 +148,14 @@ async def run_conversation(name_state: dict, facts_summary: str | None, emotion_
     호출자는 이 함수가 끝난 뒤 name_state["name"]으로 최종 확정 이름을 읽을 수 있다.
 
     quiz_ui_q가 None이면 퀴즈 모드 자체가 비활성(기존 호출부/테스트 스크립트와 호환) —
-    2026-07-28 하찮미 실험 2차용 기능이라 기본값은 항상 꺼져 있다. quiz_log_out을
-    넘기면(빈 리스트) 세션 종료 시 QuizSession.export_log() 결과로 채워 넣는다
-    (name_state와 같은 "가변 컨테이너로 결과 돌려받기" 패턴)."""
+    2026-07-28 하찮미 실험 2차용 기능이라 기본값은 항상 꺼져 있다.
+
+    quiz_session_out({"session": None})과 history_out(빈 리스트)은 name_state와 같은
+    "가변 컨테이너로 결과 돌려받기" 패턴 — 둘 다 세션이 **시작되는 시점에** 채워지므로,
+    세션이 정상 종료([대화종료])가 아니라 Ctrl+C/크래시로 끝나도 호출자가 그때까지 쌓인
+    퀴즈 결과(export_log)와 대화록을 잃지 않는다. 이전엔 정상 반환 경로에서만 결과를
+    복사해줘서, 참가자가 작별 인사 없이 끝나 실험자가 Ctrl+C로 세션을 끊으면 그 참가자의
+    퀴즈 데이터·대화록·결과지가 통째로 사라졌다(2026-08-07 전체 코드 검사로 발견)."""
     api_key = os.getenv("GOOGLE_API_KEY")
     if not api_key:
         print("⏭️  GOOGLE_API_KEY가 없어 대화를 시작할 수 없습니다.")
@@ -214,6 +220,10 @@ async def run_conversation(name_state: dict, facts_summary: str | None, emotion_
         for quiz_tool_fn in (start_quiz, select_quiz_mode, submit_guess, request_hint, end_quiz_early):
             tools.append(quiz_tool_fn)
             tool_fns[quiz_tool_fn.__name__] = quiz_tool_fn
+    if quiz_session_out is not None:
+        # 세션이 어떻게 끝나든 호출자가 export_log()를 뽑을 수 있도록 참조를 지금 넘겨둔다
+        # (위 docstring 참고 — 정상 반환 경로에서만 복사하면 Ctrl+C 시 데이터가 유실된다).
+        quiz_session_out["session"] = quiz_session
 
     set_emotion = make_set_emotion_tool(emotion_queue, quiz_session=quiz_session)
     tools.append(set_emotion)
@@ -232,7 +242,9 @@ async def run_conversation(name_state: dict, facts_summary: str | None, emotion_
         ),
     )
 
-    session_history: list[str] = []
+    # history_out이 주어지면 그 리스트에 직접 누적한다 — 세션이 Ctrl+C로 끊겨도
+    # 호출자가 그때까지의 턴 기록을 그대로 들고 있게 하기 위함(위 docstring 참고).
+    session_history: list[str] = history_out if history_out is not None else []
     stop_event = asyncio.Event()
 
     print(f"모델: {LIVE_MODEL} — 마이크에 대고 말해보세요. Ctrl+C로 언제든 종료.")
@@ -433,9 +445,6 @@ async def run_conversation(name_state: dict, facts_summary: str | None, emotion_
                 print(f"⚠️ 스피커 언더런 {speaker.underrun_count}회, 총 {speaker.underrun_ms_total:.0f}ms 무음 재생됨 "
                       f"— VoiceShifter 처리가 실시간을 못 따라간 신호. VOICE_SHIFT_BUFFER_MS를 늘려볼 것.")
 
-    if quiz_session is not None and quiz_log_out is not None:
-        quiz_log_out.extend(quiz_session.export_log())
-
     return session_history
 
 
@@ -505,21 +514,23 @@ def main():
     quiz_proc = multiprocessing.Process(target=quiz_window_process, args=(quiz_ui_q,), daemon=True)
     quiz_proc.start()
 
+    # 둘 다 run_conversation이 "시작 시점에" 채우는 가변 컨테이너 — 세션이 [대화종료]가
+    # 아니라 Ctrl+C로 끝나도 아래 finally에서 그때까지의 대화록/퀴즈 결과를 저장할 수 있다.
     session_history: list[str] = []
-    quiz_log: list = []
+    quiz_holder: dict = {"session": None}
     try:
-        session_history = asyncio.run(
+        asyncio.run(
             run_conversation(
                 name_state, facts_summary, emotion_queue,
                 motion_tools=[play_gesture, express_gesture],
                 shared_state=shared_state, brain=brain,
                 quiz_ui_q=quiz_ui_q, quiz_busy=motion_busy,
                 port=port, pkt=pkt, lock=lock, home_pan=home_pan, home_tilt=home_tilt,
-                quiz_log_out=quiz_log,
+                quiz_session_out=quiz_holder, history_out=session_history,
             )
         )
     except KeyboardInterrupt:
-        print("\n🛑 KeyboardInterrupt — 대화를 종료합니다.")
+        print("\n🛑 KeyboardInterrupt — 대화를 종료합니다(지금까지의 대화록/퀴즈 결과는 저장됩니다).")
     finally:
         display_stop.set()
 
@@ -551,6 +562,10 @@ def main():
 
         # 연구 데이터 — 문항별 모드/정답여부/힌트요청여부/타임스탬프(core/quiz_state.py
         # export_log() 참고)를 1/2/3번 모드별 파일로 나눠 저장한다(core/quiz_export.py).
+        # export_log()를 여기서(세션 종료 방식과 무관하게 항상 실행되는 finally에서) 직접
+        # 뽑는다 — Ctrl+C로 끊긴 세션도 그때까지 채점된 문항은 전부 보존된다.
+        quiz_session = quiz_holder["session"]
+        quiz_log = quiz_session.export_log() if quiz_session is not None else []
         save_quiz_results(final_name, quiz_log)
 
 
