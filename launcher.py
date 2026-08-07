@@ -52,7 +52,12 @@ from display.quiz_window import quiz_window_process
 from hardware import config as C
 from hardware import init as I
 from media.audio_manager import ENABLE_AEC, INPUT_RATE, OUTPUT_RATE, EchoCanceller, MicStreamer, Speaker
-from media.voice_shift import ENABLE_VOICE_SHIFT, VOICE_SHIFT_BUFFER_MS, VoiceShifter
+from media.voice_shift import (
+    ENABLE_VOICE_SHIFT,
+    POST_SPEECH_DRAIN_SEC,
+    VOICE_SHIFT_BUFFER_MS,
+    VoiceShifter,
+)
 from vision import face as F
 from vision.vision_brain import RobotBrain
 
@@ -62,8 +67,8 @@ LIVE_MODEL = os.getenv("LIVE_MODEL_NAME", "models/gemini-3.1-flash-live-preview"
 # 끊기거나 뭉개지는 사고가 난다(2026-07-30 실사용 중 발견, 하찮미 모드의 "저도 맞춰볼게요"
 # 이벤트처럼 발화가 길어질수록 REVEAL_HOLD_SEC 고정 지연만으로는 부족했음). turn_complete
 # 이후에도 VoiceShifter가 최대 VOICE_SHIFT_BUFFER_MS만큼 버퍼링한 오디오를 아직 재생 중일
-# 수 있어, 그 버퍼가 다 흘러나갈 시간을 넉넉히(2배) 더 기다린다.
-POST_SPEECH_DRAIN_SEC = (VOICE_SHIFT_BUFFER_MS * 2) / 1000
+# 수 있어, 그 버퍼가 다 흘러나갈 시간을 넉넉히(2배) 더 기다린다 — 계산 자체는
+# media/voice_shift.py에 있다(core/quiz_tools.py도 같은 상수를 공유해야 해서 그쪽으로 옮김).
 # 30종 프리셋 중 Fenrir + 피치/포먼트 시프트(media/voice_shift.py)가 "귀엽고 하찮은" 톤에
 # 제일 가깝다고 실제로 들어보고 결정했었으나(voice_picker 실험), 교수님 피드백으로 Zephyr로
 # 교체함(2026-07-28, docs/progress.md 참고).
@@ -204,7 +209,7 @@ async def run_conversation(name_state: dict, facts_summary: str | None, emotion_
         (start_quiz, select_quiz_mode, submit_guess, request_hint, end_quiz_early,
          quiz_session) = make_quiz_tools(
             quiz_ui_q, quiz_busy or threading.Event(), quiz_motion_ctx, inject_turn, loop,
-            emotion_queue=emotion_queue, num_questions=quiz_num_questions,
+            speaking_done, emotion_queue=emotion_queue, num_questions=quiz_num_questions,
         )
         for quiz_tool_fn in (start_quiz, select_quiz_mode, submit_guess, request_hint, end_quiz_early):
             tools.append(quiz_tool_fn)

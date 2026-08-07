@@ -86,8 +86,12 @@ async def run_scenario():
     quiz_ui_q: Queue = Queue()
     busy = threading.Event()
     motion_ctx = (None, None, threading.Lock(), {"mode": "tracking"}, 2081, 2071)
+    # 이 스크립트의 inject_turn은 launcher.py와 달리 speaking_done을 기다리지 않는
+    # 단순 버전이라(오디오 재생 자체가 없는 텍스트 시나리오 검증용) 항상 set된 채로 둔다.
+    speaking_done = asyncio.Event()
+    speaking_done.set()
     start_quiz, select_quiz_mode, submit_guess, request_hint, end_quiz_early, session_obj = make_quiz_tools(
-        quiz_ui_q, busy, motion_ctx, inject_turn, loop, emotion_queue=None, num_questions=1,
+        quiz_ui_q, busy, motion_ctx, inject_turn, loop, speaking_done, emotion_queue=None, num_questions=1,
     )
     for fn in (start_quiz, select_quiz_mode, submit_guess, request_hint, end_quiz_early):
         tool_fns[fn.__name__] = fn

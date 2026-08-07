@@ -75,16 +75,16 @@ def main():
                 "submit_guess" in txt and s2.pending_user_guess == "정답1")
     txt = s2.resolve_robot_guess("로봇오답")
     ok &= check(
-        "user correct + robot wrong -> robot is a little dejected but congratulates",
-        "부럽다" in txt and s2.results[1].user_correct is True and s2.results[1].robot_correct is False,
+        "user correct + robot wrong -> robot is sheepishly embarrassed but congratulates",
+        "어이쿠" in txt and s2.results[1].user_correct is True and s2.results[1].robot_correct is False,
     )
 
-    # 2a''. 둘 다 틀림 -> 함께 아쉬워함.
+    # 2a''. 둘 다 틀림 -> 로봇이 자기 오답을 더 재미있어하며 웃어넘김(하찮미다움 강화, 2026-07-31).
     s2.resolve_user_guess("땡땡")
     txt = s2.resolve_robot_guess("로봇도땡")
     ok &= check(
-        "both wrong -> mutual disappointment",
-        "둘 다 틀렸네요" in txt and s2.results[2].user_correct is False and s2.results[2].robot_correct is False,
+        "both wrong -> robot plays its own wrong guess for laughs instead of flat disappointment",
+        "낙제" in txt and s2.results[2].user_correct is False and s2.results[2].robot_correct is False,
     )
     ok &= check("round ends after all 3 questions", not s2.active)
 
@@ -105,7 +105,7 @@ def main():
     txt = s2b.resolve_user_guess("정답 알려줘")
     ok &= check("hand-it-to-me phrase also triggers kickoff event", "submit_guess" in txt and s2b.pending_user_guess == "정답 알려줘")
     txt = s2b.resolve_robot_guess("로봇오답")
-    ok &= check("robot guess wrong -> cutely disappointed (give-up path)", "아쉽다" in txt and not s2b.active)
+    ok &= check("robot guess wrong -> flustered but cute (give-up path)", "헤헤" in txt and not s2b.active)
     ok &= check("second result recorded (robot wrong)", s2b.results[1].robot_correct is False)
 
     # 2d. request_hint()도 같은 "저도 맞춰볼게요" 이벤트로 통일됨.

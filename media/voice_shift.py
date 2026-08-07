@@ -41,6 +41,11 @@ MIN_SHIFT_SAMPLES = 2400  # 24kHz 기준 100ms
 # 700으로 롤백.
 VOICE_SHIFT_BUFFER_MS = int(os.getenv("VOICE_SHIFT_BUFFER_MS", "1200"))
 
+# turn_complete 이후에도 이 버퍼만큼 오디오가 아직 재생 중일 수 있어, 그 뒤에야 다음 턴을
+# 안전하게 보내거나(launcher.py의 inject_turn) 정답 공개 화면을 띄울 수 있는(core/quiz_tools.py)
+# 곳이 여러 군데라 여기서 한 번만 계산해 공유한다(2배 여유).
+POST_SPEECH_DRAIN_SEC = (VOICE_SHIFT_BUFFER_MS * 2) / 1000
+
 
 def shift_pcm(pcm_bytes: bytes, sample_rate: int,
               pitch_semitones: float = VOICE_PITCH_SEMITONES,
