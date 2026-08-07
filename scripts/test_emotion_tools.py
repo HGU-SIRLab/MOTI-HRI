@@ -85,6 +85,26 @@ def main():
     set_emotion3("happy")
     ok &= check("emotion unclamped again once the annoying round has ended", q3.items[-1] == "HAPPY")
 
+    # 6. 척척박사(all_knowing) 모드는 neutral로 완전 고정된다(2026-08-07, 사용자 요청) —
+    # thinking조차 허용하지 않는다는 점이 짜증유발 모드와 다르다.
+    q6 = FakeQueue()
+    session6 = QuizSession(make_questions(1), num_questions=1)
+    set_emotion6 = make_set_emotion_tool(q6, quiz_session=session6)
+    session6.start()
+    session6.choose_mode("all_knowing")
+    set_emotion6("happy")
+    ok &= check("all_knowing mode clamps happy -> neutral", q6.items[-1] == "NEUTRAL")
+    set_emotion6("thinking")
+    ok &= check("all_knowing mode clamps even thinking -> neutral (stricter than annoying)",
+                q6.items[-1] == "NEUTRAL")
+    set_emotion6("neutral")
+    ok &= check("all_knowing mode allows neutral through", q6.items[-1] == "NEUTRAL")
+    session6.resolve_user_guess("정답0")  # 마지막 문제 채점 -> 퀴즈 자연 종료
+    ok &= check("all_knowing quiz naturally ended", not session6.active)
+    set_emotion6("happy")
+    ok &= check("emotion unclamped again once the all_knowing round has ended",
+                q6.items[-1] == "HAPPY")
+
     # 5. 알 수 없는 감정은 여전히 그냥 무시된다(클램프 로직과 무관, 기존 동작 보존).
     q5 = FakeQueue()
     set_emotion5 = make_set_emotion_tool(q5)

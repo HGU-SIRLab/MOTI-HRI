@@ -2,6 +2,14 @@
 
 `docs/architecture.md`의 로드맵(§10) 대비 실제 구현 상태를 기록한다. 설계 자체가 바뀌면 architecture.md를, 무엇을 언제 어떻게 만들었는지는 이 문서를 갱신한다.
 
+### 34단계 — 척척박사 모드 표정 neutral 고정 (2026-08-07)
+
+사용자 요청: 척척박사(all_knowing) 모드 중에는 로봇 표정을 neutral로 고정. 30단계의 톤/제스처 규칙(짧고 사무적, 감정적 제스처 금지)과 같은 취지의 시각 채널 마감.
+
+**구현**: `core/emotion_tools.py`의 짜증유발 전용 클램프(`_ANNOYING_ALLOWED_EMOTIONS`)를 모드별 허용표 `_MODE_ALLOWED_EMOTIONS`로 일반화 — annoying은 기존대로 neutral/thinking, **all_knowing은 neutral만**(thinking조차 불허, 짜증유발보다 엄격). imperfect/퀴즈 비활성은 기존대로 제한 없음. `core/utils.py`의 척척박사 톤 블록에도 "set_emotion을 neutral 이외로 호출하지 말 것(호출해도 시스템이 고정함)" 한 줄 추가 — 모델이 표정을 바꿨다고 착각한 채 말하는 어긋남 방지.
+
+**검증**: `scripts/test_emotion_tools.py`에 all_knowing 클램프/해제 케이스 5건 추가, 전부 통과. 기존 quiz_state/quiz_tools 테스트 회귀 무결 확인. **실물 미확인.**
+
 ### 33단계 — 실험 준비 최종 점검: 미구현 로그 지표 2종 + 데이터 오염 방지 3종 (2026-08-07)
 
 실험 직전 전체 기능 재점검(사용자 요청)에서 `docs/experiment_design.md` §5가 "실험 전에 구현 필요"라고 명시한 항목과, 앞선 전수 검사에서 보류했던 데이터 오염 리스크를 한 번에 정리.
