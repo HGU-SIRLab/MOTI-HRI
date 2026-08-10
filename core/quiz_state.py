@@ -18,6 +18,57 @@ from core.quiz_bank import QuizQuestion, judge_guess
 
 VALID_MODES = ("all_knowing", "imperfect", "annoying")
 
+# 실험 진행자가 참가자에게 배정하는 순서를 말할 때 쓰는 번호/이름(1번 척척박사 …).
+# 참가자에게 읽어주는 안내문과 .env의 QUIZ_MODE_ORDER 파싱이 이 표 하나를 공유한다.
+MODE_NUMBER = {"all_knowing": 1, "imperfect": 2, "annoying": 3}
+MODE_NAME = {"all_knowing": "척척박사", "imperfect": "하찮미", "annoying": "짜증유발"}
+_NUMBER_TO_MODE = {str(num): mode for mode, num in MODE_NUMBER.items()}
+_NAME_TO_MODE = {name: mode for mode, name in MODE_NAME.items()}
+
+# 진행자가 아무것도 지정하지 않았을 때의 순서 — 완전 카운터밸런싱(6순열)을 쓰는 실험에서는
+# 참가자마다 .env의 QUIZ_MODE_ORDER로 반드시 지정해야 한다(docs/experiment_design.md).
+DEFAULT_MODE_ORDER = ("all_knowing", "imperfect", "annoying")
+
+
+def mode_label(mode: str) -> str:
+    """'2번 하찮미'처럼 참가자에게 읽어줄 수 있는 라벨."""
+    return f"{MODE_NUMBER[mode]}번 {MODE_NAME[mode]}"
+
+
+def parse_mode_order(raw: str | None) -> list[str]:
+    """.env의 QUIZ_MODE_ORDER를 모드 리스트로 파싱한다.
+
+    허용 형식: "2,3,1" / "2 3 1" / "imperfect,annoying,all_knowing" / "하찮미,짜증유발,척척박사"
+    (섞어 써도 된다). 비어있으면 DEFAULT_MODE_ORDER.
+
+    **잘못된 값이면 조용히 기본값으로 넘어가지 않고 ValueError를 던진다** — 진행자가
+    오타를 낸 채로 실험이 진행되면 카운터밸런싱이 깨진 데이터가 나오는데, 그건 나중에
+    복구할 수 없다. 시작 시점에 죽는 편이 훨씬 낫다(launcher.py가 초기화 전에 미리
+    한 번 호출해 확인한다).
+    """
+    if raw is None or not raw.strip():
+        return list(DEFAULT_MODE_ORDER)
+
+    tokens = [t.strip() for t in raw.replace(",", " ").split() if t.strip()]
+    order = []
+    for token in tokens:
+        mode = _NUMBER_TO_MODE.get(token) or _NAME_TO_MODE.get(token)
+        if mode is None and token in VALID_MODES:
+            mode = token
+        if mode is None:
+            raise ValueError(
+                f"QUIZ_MODE_ORDER에 알 수 없는 값 '{token}'이 있습니다 — "
+                "1/2/3 또는 척척박사/하찮미/짜증유발로 적어주세요(예: QUIZ_MODE_ORDER=2,3,1)."
+            )
+        order.append(mode)
+
+    if sorted(order) != sorted(VALID_MODES):
+        raise ValueError(
+            f"QUIZ_MODE_ORDER는 세 모드를 정확히 한 번씩 나열해야 합니다(지금: {raw!r}) — "
+            "예: QUIZ_MODE_ORDER=2,3,1"
+        )
+    return order
+
 # 모드 3(짜증유발)의 거절 대사 — 정확히 이 문자열이어야 함(연구 일관성 요구사항).
 # core/quiz_tools.py의 지연 주입과 core/utils.py의 페르소나 지시문이 이 상수 하나만 참조한다.
 MODE3_REFUSAL_LINE = "저는 AI 로봇이라 그런 답변은 할 수 없습니다."
@@ -68,22 +119,32 @@ class _QuestionResult:
 
 class QuizSession:
     def __init__(self, questions: list[QuizQuestion], num_questions: int = 5,
-                 initial_round_offset: int = 0):
+                 initial_round_offset: int = 0, mode_order: list[str] | None = None):
         # 모든 참가자에게 같은 문제 은행/같은 순서 — 셔플하지 않는다. 실제 라운드별
-        # 슬라이스는 start()가 _pick_round_questions()로 매번 새로 정한다(아래 참고).
+        # 슬라이스는 begin_next_round()가 _pick_round_questions()로 매번 새로 정한다.
+        #
+        # mode_order: 실험 진행자가 이 참가자에게 배정한 모드 순서(예: ["imperfect",
+        # "annoying", "all_knowing"] = 2-3-1). 2026-08-10 교수님 지시로 참가자가 말로
+        # 모드를 고르는 방식을 폐기하고, 진행자가 .env(QUIZ_MODE_ORDER)로 미리 정한
+        # 순서대로 5문제씩 3라운드(총 15문제)가 한 번에 이어서 진행된다.
+        #
         # initial_round_offset: 세션이 도중에 크래시해 launcher를 재시작해야 할 때,
-        # 참가자가 이미 소모한 라운드 수를 지정해 이미 정답이 공개된 사진 슬라이스를
-        # 건너뛰게 한다(core/quiz_tools.py가 QUIZ_ROUND_OFFSET env로 전달) — 안 그러면
-        # 재시작한 세션이 슬라이스 0부터 다시 배분해 앞 라운드에서 공개된 사진을
-        # 다음 모드에서 또 보여주는 오염이 생긴다.
+        # 참가자가 이미 마친 라운드 수를 지정해 (a) 이미 정답이 공개된 사진 슬라이스와
+        # (b) 이미 진행한 모드를 둘 다 건너뛴다(core/quiz_tools.py가 QUIZ_ROUND_OFFSET
+        # env로 전달) — 안 그러면 재시작한 세션이 1라운드부터 다시 시작해 같은 사진과
+        # 같은 모드를 반복하는 오염이 생긴다.
         self.all_questions = questions
         self.num_questions = num_questions
+        self.mode_order: list[str] = list(mode_order or DEFAULT_MODE_ORDER)
         self.questions: list[QuizQuestion] = []
-        self._rounds_played: int = initial_round_offset
+        # 다음에 시작할 라운드 번호(0-based) — begin_next_round()가 하나 진행할 때마다 +1.
+        self.round_index: int = initial_round_offset
         self.mode: str | None = None
         self.index: int = -1
         self.active: bool = False
-        self.awaiting_mode_choice: bool = False
+        # 이번 라운드의 문제를 다 소진했지만 아직 다음 라운드가 시작되지 않은 상태.
+        # core/quiz_tools.py가 정답 공개를 마친 뒤 이 플래그를 보고 모드 전환을 진행한다.
+        self.round_finished: bool = False
         self.pending_user_guess: str | None = None
         # 짜증유발 모드 전용 — 실제 답 시도(맞았든 틀렸든)의 정오를 기억해뒀다가, 나중에
         # 참가자가 포기/스킵을 요청하면 그 시점의 로그에 반영한다(2026-07-31, 응답 자체는
@@ -97,11 +158,6 @@ class QuizSession:
         self.pending_reveal_speech: str | None = None
         self.results: list[_QuestionResult] = []
         self._hint_requested_this_question: bool = False
-        # 실험 설계상 각 모드는 참가자당 정확히 한 번씩이다 — 이미 진행한 모드를 다시
-        # 선택하려는 시도(사용자 말실수/STT 오인식/모델 매핑 실수)는 한 번 되물어 확인
-        # 받게 한다. 같은 모드로 곧바로 재호출하면 그때는 의도로 보고 허용(아래 참고).
-        self.modes_played: list[str] = []
-        self._pending_repeat_mode: str | None = None
         # "문제당 소요시간" 지표용 — 화면에 문제가 실제로 표시된 순간(mark_question_shown)
         # 의 monotonic 시각. 채점/포기로 확정될 때 elapsed_sec으로 기록된다.
         self._question_shown_at: float | None = None
@@ -119,13 +175,22 @@ class QuizSession:
     def total_questions(self) -> int:
         return len(self.questions)
 
+    @property
+    def total_rounds(self) -> int:
+        return len(self.mode_order)
+
+    @property
+    def grand_total_questions(self) -> int:
+        """세 라운드를 합친 전체 문항 수(5문제 × 3모드 = 15) — 참가자 안내문에 쓴다."""
+        return self.num_questions * self.total_rounds
+
     def _pick_round_questions(self) -> list[QuizQuestion]:
-        """세션 하나 안에서 참가자가 1/2/3번 모드를 연속으로 진행할 때(실험 운영 방식,
-        2026-07-31 확정), 매 라운드(=매 start() 호출)마다 앞선 라운드와 겹치지 않는
-        문제 세트를 돌려준다. 같은 사진을 다음 라운드에 또 보여주면, 척척박사 라운드에서
-        이미 정답 공개(reveal)를 본 참가자가 다음 모드에서 정답을 이미 아는 채로 반응하게
-        되어 하찮미/짜증유발 효과 자체를 가리는 심각한 교란요인이 된다(코드 리뷰로 발견,
-        이전엔 한 참가자가 한 라운드만 한다고 가정하고 짠 코드였음).
+        """세션 하나 안에서 참가자가 3개 모드를 연속으로 진행할 때(실험 운영 방식,
+        2026-07-31 확정), 매 라운드마다 앞선 라운드와 겹치지 않는 문제 세트를 돌려준다.
+        같은 사진을 다음 라운드에 또 보여주면, 척척박사 라운드에서 이미 정답 공개(reveal)를
+        본 참가자가 다음 모드에서 정답을 이미 아는 채로 반응하게 되어 하찮미/짜증유발
+        효과 자체를 가리는 심각한 교란요인이 된다(코드 리뷰로 발견, 이전엔 한 참가자가
+        한 라운드만 한다고 가정하고 짠 코드였음).
 
         문제 은행이 num_questions * (몇 번째 라운드인지)만큼 충분하면 완전히 겹치지 않는
         세트가 나온다. 은행이 부족하면(예: 준비된 사진이 모자라 3라운드 분량이 안 되는
@@ -134,69 +199,120 @@ class QuizSession:
         """
         total = len(self.all_questions)
         n = self.num_questions
-        start_idx = self._rounds_played * n
-        self._rounds_played += 1
+        start_idx = self.round_index * n
         if total and start_idx >= total:
             print(
                 f"⚠️ 문제 은행({total}개)이 부족해 이번 라운드가 이전 라운드와 겹치는 문제를 "
                 f"재사용합니다 — assets/quiz/questions.json에 문제를 추가하세요."
             )
             start_idx %= total
-        return self.all_questions[start_idx:start_idx + n]
+        picked = self.all_questions[start_idx:start_idx + n]
+        if len(picked) < n:
+            # 은행이 라운드 경계에 딱 안 떨어지면 마지막 라운드만 조용히 짧아진다
+            # (예: 12문항 은행 + 라운드당 5문항 -> 3라운드가 2문항). 조건 간 문항 수가
+            # 달라지면 비교 자체가 흔들리므로 반드시 눈에 띄게 알린다 — 15장 기준으로는
+            # 정확히 3라운드로 떨어지지만, 사진을 더하거나 빼면 곧바로 발생할 수 있다.
+            print(
+                f"⚠️ 이번 라운드에 문제가 {len(picked)}개뿐입니다(라운드당 {n}개여야 함) — "
+                f"문제 은행이 {total}개라 라운드 경계에 맞지 않습니다. 조건 간 문항 수가 "
+                f"달라지므로 assets/quiz/questions.json을 {n * len(self.mode_order)}개로 맞추세요."
+            )
+        return picked
 
     def start(self) -> str:
+        """퀴즈 전체를 시작한다 — 참가자에게 읽어줄 전체 안내문만 지시하고, 첫 라운드는
+        아직 시작하지 않는다.
+
+        2026-08-10(교수님 지시)로 운영 방식이 바뀌었다: 예전에는 참가자가 실험자에게
+        들은 모드 번호를 말하면 그 라운드만 진행했지만(select_quiz_mode), 이제는
+        진행자가 .env의 QUIZ_MODE_ORDER로 미리 정한 순서대로 5문제씩 3라운드가 한 번에
+        이어서 진행된다. 참가자는 모드를 고르지 않는다.
+
+        첫 라운드는 core/quiz_tools.py가 이 안내 발화가 실제로 끝나는 것을 확인한 뒤
+        begin_next_round()로 시작한다 — 안내를 말하는 도중에 사진이 먼저 떠버리면
+        참가자가 안내를 안 듣고 화면부터 보게 되기 때문(이미지-발화 순서를 Python이
+        직접 통제하는 39단계 구조와 같은 이유).
+        """
         self.active = True
-        self.awaiting_mode_choice = True
         self.mode = None
         self.index = -1
-        self._pending_repeat_mode = None
-        self.questions = self._pick_round_questions()
+        self.questions = []
+        self.round_finished = False
+        self.pending_user_guess = None
+        self.pending_reveal_speech = None
+
+        total = self.grand_total_questions
+        n = self.num_questions
         return (
-            "지금부터 '부분 확대 사진 퀴즈'를 시작합니다. 규칙: 화면에 사물의 일부를 "
-            "확대한 사진이 나오면 무엇인지 맞히는 게임입니다. 사용자에게 다음과 같이 "
-            "정확히 안내하세요: \"저와 어떤 모드로 퀴즈를 푸시겠어요? 1번 척척박사, "
-            "2번 하찮미, 3번 짜증유발 모드가 준비되어 있습니다!\" 실험자가 알려준 번호를 "
-            "사용자가 말할 때까지 기다리세요."
+            "지금부터 '부분 확대 사진 퀴즈'를 시작합니다. 사용자에게 아래 내용을 당신의 "
+            "말투로 자연스럽게, 빠짐없이 안내하세요:\n"
+            "(1) 화면에 사물의 일부를 확대한 사진이 나오면 그게 무엇인지 맞히는 게임입니다.\n"
+            f"(2) 퀴즈는 총 {total}문제이고, {n}문제씩 서로 다른 모드의 저와 함께 풀게 됩니다.\n"
+            "(3) 척척박사, 하찮미, 짜증유발 — 이렇게 3가지 모드의 저와 문제를 풀게 됩니다.\n"
+            "(4) 1번 척척박사 모드에서는 제가 정답을 알고 있습니다.\n"
+            "(5) 2번 하찮미 모드와 3번 짜증유발 모드에서는 저도 정답을 모르는 채로 "
+            "사용자님과 함께 문제를 풀게 됩니다.\n"
+            "이 안내만 하고 곧바로 멈추세요 — 어떤 모드로 할지 묻지 말고(순서는 이미 "
+            "정해져 있습니다), 첫 문제를 소개하거나 사진이 나왔다고 말하지도 마세요. "
+            "안내를 마치면 잠시 후 제가 다음 지시를 드립니다."
         )
 
-    def choose_mode(self, mode: str) -> str | None:
-        """유효하지 않은 모드면 상태를 바꾸지 않고 None을 반환한다(호출부가 재질문 처리)."""
-        if mode not in VALID_MODES:
+    def current_round_number(self) -> int:
+        """지금 진행 중인 라운드가 몇 번째인지(1-based). 아직 시작 전이면 0."""
+        return self.round_index
+
+    def begin_next_round(self) -> str | None:
+        """다음 라운드를 시작하고 그 모드 안내 지시문을 돌려준다. 남은 라운드가 없으면
+        세션을 끝내고 None을 반환한다(호출부가 마무리 처리).
+
+        core/quiz_tools.py만 호출한다 — (a) start_quiz() 직후 전체 안내 발화가 끝난 뒤
+        첫 라운드로, (b) 한 라운드의 마지막 문제 정답 공개가 끝난 뒤 다음 모드로.
+        """
+        if self.round_index >= len(self.mode_order):
+            self.active = False
+            self.round_finished = False
             return None
 
-        if mode in self.modes_played and self._pending_repeat_mode != mode:
-            # 이미 진행한 모드의 재선택 — 실험 설계상 각 모드는 참가자당 한 번이므로,
-            # 사용자 말실수나 STT 오인식일 가능성이 크다(같은 모드를 두 번 돌리면 문제
-            # 슬라이스가 낭비되고 결과 파일에 두 라운드가 섞인다). 상태를 바꾸지 않고
-            # 한 번 되물어 확인받게 하되, 정말 의도라면(같은 모드로 곧바로 재호출) 허용
-            # — 하드 차단하면 재실험 같은 정당한 예외 상황에서 복구 경로가 없어진다.
-            self._pending_repeat_mode = mode
-            print(f"⚠️ 이미 진행한 모드({mode}) 재선택 시도 — 사용자 재확인을 요청합니다.")
-            return (
-                f"주의: '{mode}' 모드는 이번 세션에서 이미 진행했습니다. 실험 설계상 각 "
-                "모드는 참가자당 한 번씩입니다 — 사용자가 번호를 잘못 말했거나 당신이 "
-                "잘못 들었을 가능성이 큽니다. 사용자에게 실험자가 알려준 번호가 정말 "
-                "맞는지 한 번만 다시 확인하고, 맞다고 하면 같은 모드로 이 툴을 다시 "
-                "호출하세요(그때는 진행됩니다)."
-            )
-        self._pending_repeat_mode = None
-        self.modes_played.append(mode)
+        mode = self.mode_order[self.round_index]
+        self.questions = self._pick_round_questions()
+        self.round_index += 1
 
         self.mode = mode
-        self.awaiting_mode_choice = False
         self.index = 0
+        self.active = True
+        self.round_finished = False
+        self.pending_user_guess = None
+        self.annoying_pending_correct = False
         self._hint_requested_this_question = False
         self._question_shown_at = None
         self.annoying_refusals_this_question = 0
         self.pending_reveal_speech = None
 
+        label = mode_label(mode)
+        if self.round_index == 1:
+            opening = (
+                f"첫 번째 모드는 {label} 모드입니다. 사용자에게 \"그럼 먼저 {label} "
+                "모드로 시작해볼게요!\"처럼 지금부터 어떤 모드인지 분명히 알려주세요."
+            )
+        else:
+            opening = (
+                f"방금 {self.num_questions}문제를 모두 마쳤습니다. 이제 모드가 바뀝니다 — "
+                f"사용자에게 \"{self.num_questions}문제가 끝났어요! 지금부터는 {label} "
+                "모드로 바뀝니다.\"처럼 **모드가 바뀌었다는 것과 그게 몇 번 무슨 모드인지를 "
+                "반드시 분명하게** 알려주세요."
+            )
+        tail = (
+            " 이 안내까지만 말하고 곧바로 멈추세요 — 문제 사진은 아직 화면에 뜨지 "
+            "않았으니 문제를 소개하거나 \"이 물건은 무엇일까요?\"라고 미리 묻지 마세요. "
+            "사진이 실제로 뜨면 그때 제가 따로 알려드립니다."
+        )
+
         question = self.current_question
-        base = f"모드가 확정됐습니다. 사용자에게 첫 문제를 보여주고 \"이 물건은 무엇일까요?\"라고 물어보세요."
         if mode == "all_knowing":
             return (
-                f"{base} [내부 전용 — 사용자에게 먼저 알려주지 마세요] 이 문제의 정답은 "
-                f"'{question.answer}'입니다. 사용자가 틀리거나 모른다고 하면 망설임 없이 "
-                f"정답을 정확하게 알려주세요."
+                f"{opening} [내부 전용 — 사용자에게 먼저 알려주지 마세요] 이 라운드 첫 "
+                f"문제의 정답은 '{question.answer}'입니다. 사용자가 틀리거나 모른다고 하면 "
+                f"망설임 없이 정답을 정확하게 알려주세요.{tail}"
             )
         # imperfect / annoying: 정답을 여기서 알려주지 않는다. 2026-08-10 사용자 요청 —
         # 2·3번 모드는 시작하는 순간 "나도 정답을 모른다"를 사용자에게 분명히 밝힌다
@@ -205,29 +321,35 @@ class QuizSession:
         # 하찮미는 밝고 친근하게, 짜증유발은 담백하고 무뚝뚝하게.
         if mode == "imperfect":
             return (
-                "모드가 확정됐습니다. 첫 문제를 보여주기 전에 사용자에게 \"저도 정답을 모르는 "
-                "상태입니다. 함께 맞춰봐요!\"라는 뜻을 밝고 친근한 말투로 분명히 밝히세요. "
-                "그런 다음 첫 문제를 보여주고 \"이 물건은 무엇일까요?\"라고 물어보세요. "
-                "당신은 이 문제의 정답을 아직 모릅니다."
+                f"{opening} 이어서 \"저도 정답을 모르는 상태예요. 함께 맞춰봐요!\"라는 뜻을 "
+                "밝고 친근한 말투로 분명히 밝히고, **문제가 어려우면 언제든 저에게 도와달라고 "
+                "말씀해달라**고 안내하세요(예: \"너무 어려우면 '모르겠어요', '같이 맞춰봐요' "
+                "하고 말씀해주세요. 그럼 저도 같이 추측해볼게요!\"). 당신은 이 라운드의 "
+                f"정답을 전혀 모릅니다.{tail}"
             )
         return (
-            "모드가 확정됐습니다. 첫 문제를 보여주기 전에 사용자에게 \"저도 정답을 모르는 "
-            "상태입니다. 함께 맞춰봐요.\"라는 뜻을 담백하고 무뚝뚝한 말투로 알리세요"
-            "(들뜨거나 친근하게 굴지 마세요). 그런 다음 첫 문제를 보여주고 \"이 물건은 "
-            "무엇일까요?\"라고 물어보세요. 당신은 이 문제의 정답을 아직 모릅니다."
+            f"{opening} 이어서 \"저도 정답을 모르는 상태입니다. 함께 맞춰봐요.\"라는 뜻을 "
+            "담백하고 무뚝뚝한 말투로 알리세요(들뜨거나 친근하게 굴지 마세요). 당신은 이 "
+            f"라운드의 정답을 전혀 모릅니다.{tail}"
         )
 
     def resolve_user_guess(self, guess_text: str) -> str:
         if not self.active:
             return "지금은 퀴즈가 진행 중이 아닙니다 — 이 툴을 호출하지 마세요."
         if self.mode is None:
-            # mode가 None이면 index도 항상 -1(choose_mode가 둘을 같이 세팅하므로) —
-            # current_question도 자동으로 None이 된다. 그래서 이 체크가 반드시 아래
-            # current_question 체크보다 먼저 와야 한다 — 순서가 바뀌면 이 분기가 죽은
-            # 코드가 되어(항상 current_question is None 쪽에 먼저 걸림), select_quiz_mode를
-            # 실제로 호출하지 않고 사진이 나온 것처럼 말해버린 경우(실제로 겪었던 사고,
-            # 화면엔 아무것도 안 뜬 채 방치됨)에 정작 이 구체적인 안내가 나가지 못한다.
-            return "아직 모드가 선택되지 않았습니다 — 사진이 나왔다고 말하기 전에 반드시 select_quiz_mode(mode=...)를 먼저 호출하세요."
+            # mode가 None이면 index도 항상 -1(start/begin_next_round가 둘을 같이 세팅하므로)
+            # — current_question도 자동으로 None이 된다. 그래서 이 체크가 반드시 아래
+            # current_question 체크보다 먼저 와야 한다(순서가 바뀌면 이 분기가 죽은 코드가
+            # 되어 아래의 막연한 문구만 나간다).
+            return (
+                "아직 전체 안내 중이라 첫 문제가 화면에 뜨지 않았습니다 — 이 툴을 부르지 말고, "
+                "안내를 마친 뒤 다음 지시가 올 때까지 조용히 기다리세요."
+            )
+        if self.round_finished:
+            return (
+                "이번 라운드의 문제가 모두 끝나 지금은 모드 전환 중입니다 — 이 툴을 부르지 "
+                "말고, 다음 모드 안내 지시가 올 때까지 조용히 기다리세요."
+            )
         if self.current_question is None:
             return "지금은 퀴즈가 진행 중이 아닙니다 — 이 툴을 호출하지 마세요."
 
@@ -315,7 +437,7 @@ class QuizSession:
     def resolve_robot_guess(self, guess_text: str) -> str:
         """하찮미 모드에서만 의미가 있다 — 로봇 자신의 추측을 채점하고 사용자 추측과 함께 공개한다."""
         if self.mode is None:
-            return "아직 모드가 선택되지 않았습니다 — 먼저 select_quiz_mode(mode=...)를 호출하세요."
+            return "아직 첫 문제가 시작되지 않았습니다 — 이 툴을 부르지 말고 다음 지시를 기다리세요."
         if self.mode != "imperfect" or self.pending_user_guess is None or self.current_question is None:
             return "지금은 이 툴을 호출할 상황이 아닙니다 — 무시하세요."
 
@@ -464,7 +586,7 @@ class QuizSession:
 
     def request_hint(self) -> str:
         if self.mode is None:
-            return "아직 모드가 선택되지 않았습니다 — 먼저 select_quiz_mode(mode=...)를 호출하세요."
+            return "아직 첫 문제가 시작되지 않았습니다 — 이 툴을 부르지 말고 다음 지시를 기다리세요."
         if self.current_question is None:
             return "지금은 힌트를 줄 상황이 아닙니다."
 
@@ -510,8 +632,16 @@ class QuizSession:
         self.annoying_refusals_this_question += 1
 
     def end_early(self) -> str:
+        """조기 종료 — 진행 중이던 라운드를 여기서 끊는다.
+
+        round_index는 일부러 건드리지 않는다: 모델이 이 툴을 실수로 부르는 사고가
+        생기더라도(다른 툴에서 실제로 겪었던 부류) start_quiz()로 남은 라운드부터 다시
+        이어갈 수 있어야 하기 때문 — 여기서 라운드를 통째로 소진시켜버리면 그 참가자의
+        세션이 복구 불가능해진다. 진행 중이던 라운드 전환 태스크는 core/quiz_tools.py의
+        end_quiz_early()가 취소하므로, 끊긴 라운드가 뒤늦게 되살아나지는 않는다.
+        """
         self.active = False
-        self.awaiting_mode_choice = False
+        self.round_finished = False
         return "퀴즈를 여기서 마칩니다. 참여해줘서 고맙다고 자연스럽게 마무리하고 평소 대화로 돌아가세요."
 
     def export_log(self) -> list[dict]:
@@ -533,20 +663,34 @@ class QuizSession:
         self.annoying_refusals_this_question = 0
         self.index += 1
         if self.index >= len(self.questions):
-            self.active = False
+            # 이번 라운드 소진 — 다음 모드가 남아있으면 active를 유지한 채 전환 대기
+            # 상태로 둔다(core/quiz_tools.py가 정답 공개를 마친 뒤 begin_next_round()를
+            # 호출한다). active를 여기서 끄면 전환 사이에 idle-sleep이 걸리거나
+            # (core/idle_watcher.py) 마이크 게이트가 풀리는 등 "퀴즈 중이 아님"으로
+            # 오해받는 부작용이 생긴다.
+            self.round_finished = True
+            if self.round_index >= len(self.mode_order):
+                self.active = False
 
     def final_wrapup_prompt(self) -> str:
-        """마지막 문제까지 정답 반응(pending_reveal_speech)이 끝나고 REVEAL_HOLD_SEC이
-        지난 뒤, core/quiz_tools.py의 _delayed_reveal_and_advance가 hidden turn으로
-        주입한다(더 이상 보여줄 다음 문제가 없을 때 next_question_prompt() 대신 이걸 쓴다)."""
-        return "이걸로 모든 문제가 끝났습니다. 참여해줘서 고맙다고 자연스럽게 마무리하고 평소 대화로 돌아가세요."
+        """마지막 라운드의 마지막 문제까지 정답 반응(pending_reveal_speech)이 끝나고
+        REVEAL_HOLD_SEC이 지난 뒤, core/quiz_tools.py의 _delayed_reveal_and_advance가
+        hidden turn으로 주입한다(더 이상 진행할 라운드가 없을 때)."""
+        return (
+            f"이걸로 {self.grand_total_questions}문제가 모두 끝났습니다. 참여해줘서 고맙다고 "
+            "자연스럽게 마무리하고 평소 대화로 돌아가세요."
+        )
 
     def next_question_prompt(self) -> str:
         """reveal-hold 타이머가 끝나 화면에 실제로 다음 문제가 뜬 순간에만 호출해 hidden
         turn으로 주입한다(core/quiz_tools.py의 _delayed_reveal_and_advance) — 정답 반응
         (pending_reveal_speech)이 끝난 다음에 오는 짝. 호출 시점의 self.index는 이미
-        _record_and_advance에서 다음 문제로 넘어가 있으므로 추가로 증가시키지 않는다."""
+        _record_and_advance에서 다음 문제로 넘어가 있으므로 추가로 증가시키지 않는다.
+
+        라운드가 막 시작된 직후(begin_next_round -> 첫 문제 push)에도 같은 함수를 쓴다 —
+        그때는 "다음 문제"가 아니라 "첫 문제"여야 자연스럽다."""
+        ordinal = "첫 문제" if self.index == 0 else "다음 문제"
         return (
-            f"화면에 다음 문제({self.index + 1}/{self.total_questions})가 떴습니다. "
+            f"화면에 {ordinal}({self.index + 1}/{self.total_questions})가 떴습니다. "
             "\"이 물건은 무엇일까요?\"라고 자연스럽게 물어보세요."
         )

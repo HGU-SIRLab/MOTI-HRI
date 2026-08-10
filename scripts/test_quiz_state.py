@@ -1,6 +1,7 @@
 """core/quiz_state.py의 QuizSession을 3개 모드 전체 흐름으로 구동해 검증한다.
-API 키/로봇 불필요 — 모드별 정보 비대칭(척척박사만 정답을 앎)과 하찮미 모드의
-페어드 리빌(사용자 추측 + 로봇 추측을 함께 채점) 로직이 이 테스트의 핵심.
+API 키/로봇 불필요 — 모드별 정보 비대칭(척척박사만 정답을 앎), 하찮미 모드의
+페어드 리빌(사용자 추측 + 로봇 추측을 함께 채점), 그리고 진행자가 정한 순서대로
+3라운드가 자동으로 이어지는 흐름(45단계)이 이 테스트의 핵심.
 
 사용: python scripts/test_quiz_state.py
 """
@@ -15,12 +16,22 @@ from bootstrap import ensure_utf8_console
 ensure_utf8_console()
 
 from core.quiz_bank import QuizQuestion
-from core.quiz_state import MODE3_REFUSAL_LINE, QuizSession
+from core.quiz_state import (DEFAULT_MODE_ORDER, MODE3_REFUSAL_LINE, QuizSession,
+                             mode_label, parse_mode_order)
 
 
 def make_questions(n):
     return [QuizQuestion(id=f"q{i}", image_path=f"q{i}.jpg", answer=f"정답{i}", alternates=[f"답{i}"])
             for i in range(n)]
+
+
+def new_session(bank_size, num_questions, modes):
+    """한 모드짜리(또는 여러 모드짜리) 세션을 만들고 첫 라운드까지 시작해 돌려준다 —
+    실제로는 core/quiz_tools.py가 전체 안내 발화가 끝난 뒤 begin_next_round()를 부른다."""
+    s = QuizSession(make_questions(bank_size), num_questions=num_questions, mode_order=modes)
+    s.start()
+    intro = s.begin_next_round()
+    return s, intro
 
 
 def check(label, condition):
@@ -31,16 +42,50 @@ def check(label, condition):
 def main():
     ok = True
 
+    # 0. .env의 QUIZ_MODE_ORDER 파싱 — 진행자가 오타를 내면 조용히 기본값으로 넘어가지
+    # 않고 반드시 예외를 던져야 한다(카운터밸런싱이 깨진 데이터는 나중에 복구 불가).
+    ok &= check("mode order parses numbers", parse_mode_order("2,3,1") == ["imperfect", "annoying", "all_knowing"])
+    ok &= check("mode order parses Korean names",
+                parse_mode_order("하찮미 짜증유발 척척박사") == ["imperfect", "annoying", "all_knowing"])
+    ok &= check("empty mode order falls back to the default", parse_mode_order(None) == list(DEFAULT_MODE_ORDER))
+    for bad in ("1,2", "1,2,2", "4,1,2", "척척박사,하찮미,없는모드"):
+        try:
+            parse_mode_order(bad)
+            ok &= check(f"invalid mode order rejected: {bad!r}", False)
+        except ValueError:
+            ok &= check(f"invalid mode order rejected: {bad!r}", True)
+
+    # 0b. 전체 안내(start) — 참가자에게 읽어줄 총 문항 수와 모드 구성이 들어있어야 한다.
+    s0 = QuizSession(make_questions(15), num_questions=5)
+    intro = s0.start()
+    ok &= check("start() announces the total question count (5 x 3 = 15)", "15문제" in intro)
+    ok &= check("start() announces 5 questions per mode", "5문제씩" in intro)
+    ok &= check("start() names all three modes",
+                all(n in intro for n in ("척척박사", "하찮미", "짜증유발")))
+    ok &= check("start() states that mode 1 knows the answer and 2/3 do not",
+                "1번 척척박사 모드에서는 제가 정답을 알고" in intro
+                and "2번 하찮미 모드와 3번 짜증유발 모드에서는 저도 정답을 모르는" in intro)
+    # 모드는 진행자가 미리 정한다(45단계) — 안내문은 "어떤 모드로 할지 묻지 말라"고
+    # 명시해야 한다(예전 select_quiz_mode 시절의 "몇 번 모드로 하시겠어요?"가 남으면
+    # 참가자가 순서를 고르려 들어 카운터밸런싱이 깨진다).
+    ok &= check("start() tells the robot not to ask the user to pick a mode",
+                "묻지 말고" in intro and "순서는 이미 정해져 있습니다" in intro)
+    ok &= check("start() leaves no round running yet (the first round begins after the intro is spoken)",
+                s0.mode is None and s0.current_question is None and s0.round_index == 0)
+    txt = s0.resolve_user_guess("아무말")
+    ok &= check("guessing during the intro is refused with an actionable message",
+                "안내 중" in txt and len(s0.results) == 0)
+
     # 1. 척척박사 — 정답을 처음부터 알고, 오답이면 바로 공개.
     # 2026-08-08부터 판정 툴의 즉시 응답은 침묵 지시(_HOLD_FOR_REVEAL)뿐이고, 실제 정답/
     # 반응 텍스트는 core/quiz_tools.py가 정답 이미지를 띄운 뒤 별도 히든 턴으로 주입할 수
     # 있도록 session.pending_reveal_speech에 담긴다(구조 변경 이유는 core/quiz_state.py
     # 상단 _HOLD_FOR_REVEAL 주석 참고 — 정답 공개가 로봇이 말하기도 전에 뜨던 사고 대응).
-    s = QuizSession(make_questions(3), num_questions=3)
-    s.start()
-    ok &= check("invalid mode rejected", s.choose_mode("invalid") is None)
-    txt = s.choose_mode("all_knowing")
-    ok &= check("all_knowing reveals answer at mode-select", "정답0" in txt)
+    s, txt = new_session(3, 3, ["all_knowing"])
+    ok &= check("all_knowing round intro reveals the first answer (internal use only)", "정답0" in txt)
+    ok &= check("round intro tells the robot to stop before introducing the question",
+                "미리 묻지 마세요" in txt)
+    ok &= check("round intro announces which mode it is", mode_label("all_knowing") in txt)
     s.mark_question_shown()  # 실제로는 core/quiz_tools.py가 문제를 UI에 push할 때 호출
     txt = s.resolve_user_guess("땡땡땡")
     ok &= check("wrong guess withholds the answer from the immediate response",
@@ -59,20 +104,25 @@ def main():
     ok &= check("elapsed time stays None when the question was never marked as shown",
                 s.results[1].elapsed_sec is None)
     txt = s.resolve_user_guess("오답")
-    ok &= check("last question ends session, immediate response stays silent",
-                "모든 문제가 끝났습니다" not in txt and not s.active)
+    ok &= check("last question of the last round ends the quiz, immediate response stays silent",
+                "모든 문제가 끝났습니다" not in txt and not s.active and s.round_finished)
     ok &= check("all_knowing logged 3 results", len(s.results) == 3)
     ok &= check("final_wrapup_prompt announces the quiz is over",
-                "모든 문제가 끝났습니다" in s.final_wrapup_prompt())
+                "모두 끝났습니다" in s.final_wrapup_prompt())
+    ok &= check("no round is left to begin", s.begin_next_round() is None)
 
     # 2. 하찮미 — 2026-07-31부터 포기/위임 신호든 실제 답 시도든 전부 "로봇도 같이
     # 추측해서 나란히 비교" 이벤트로 통일됐다. 즉시 정오를 알려주면(19~20단계 방식) 로봇이
     # 이미 정답을 아는 것처럼 보여 조작 점검 문항("로봇이 정답을 모르는 상태로 함께
     # 풀었다")과 모순된다는 실물 테스트 피드백으로 재설계.
-    s2 = QuizSession(make_questions(3), num_questions=3)
-    s2.start()
-    txt = s2.choose_mode("imperfect")
-    ok &= check("imperfect withholds answer at mode-select", "정답0" not in txt)
+    s2, txt = new_session(3, 3, ["imperfect"])
+    ok &= check("imperfect round intro withholds the answer", "정답0" not in txt)
+    ok &= check("imperfect round intro states the robot does not know the answer either",
+                "저도 정답을 모르는 상태" in txt)
+    # 2026-08-10(교수님 지시): 어려운 문제에서 참가자가 로봇에게 도움을 요청할 수 있다는
+    # 걸 참가자가 알아야 한다 — 안내에 그 문장이 반드시 들어가야 한다.
+    ok &= check("imperfect round intro invites the user to ask for help on hard questions",
+                "도와달라고" in txt and "모르겠어요" in txt)
 
     # 2a. 진짜 답 시도도(맞았든 틀렸든) 즉시 정오를 알려주지 않고 로봇도 같이 추측하는
     # 이벤트로 감 — 여기서는 사용자가 실제로 맞혔고 로봇도 맞히면 "둘 다 맞음" 팀워크 반응.
@@ -91,7 +141,7 @@ def main():
     ok &= check("teamwork reaction lands in pending_reveal_speech",
                 s2.pending_reveal_speech is not None and "팀워크" in s2.pending_reveal_speech)
 
-    # 2a'. 사용자는 맞혔지만 로봇은 틀림 -> 로봇이 살짝 시무룩하되 사용자를 인정.
+    # 2a'. 사용자는 맞혔지만 로봇은 틀림 -> 로봇이 자기 오답을 웃음거리로 삼으며 사용자를 인정.
     txt = s2.resolve_user_guess("정답1")
     ok &= check("real correct guess also triggers the kickoff event (not judged immediately)",
                 "submit_guess" in txt and s2.pending_user_guess == "정답1")
@@ -112,13 +162,11 @@ def main():
     )
     ok &= check("both-wrong-for-laughs reaction lands in pending_reveal_speech",
                 "낙제" in s2.pending_reveal_speech)
-    ok &= check("round ends after all 3 questions", not s2.active)
+    ok &= check("round ends after all 3 questions", s2.round_finished and not s2.active)
 
     # 2b. "모르겠어요" — 포기 신호는 실제 답이 없으므로 "둘 다"라는 비교 틀이 안 맞아,
     # 기존처럼 로봇 자신의 결과만으로 반응한다.
-    s2b = QuizSession(make_questions(2), num_questions=2)
-    s2b.start()
-    s2b.choose_mode("imperfect")
+    s2b, _ = new_session(2, 2, ["imperfect"])
     txt = s2b.resolve_user_guess("모르겠어요")
     ok &= check("give-up phrase triggers kickoff event", "submit_guess" in txt and s2b.pending_user_guess == "모르겠어요")
     txt = s2b.resolve_robot_guess("정답0")
@@ -140,9 +188,7 @@ def main():
     ok &= check("second result recorded (robot wrong)", s2b.results[1].robot_correct is False)
 
     # 2d. request_hint()도 같은 "저도 맞춰볼게요" 이벤트로 통일됨.
-    s2c = QuizSession(make_questions(1), num_questions=1)
-    s2c.start()
-    s2c.choose_mode("imperfect")
+    s2c, _ = new_session(1, 1, ["imperfect"])
     txt = s2c.request_hint()
     ok &= check(
         "imperfect hint request triggers kickoff event",
@@ -155,16 +201,14 @@ def main():
                 "뿌듯" in s2c.pending_reveal_speech)
 
     # 3. 방어 가드 — imperfect 아닐 때 resolve_robot_guess는 무시
-    s3 = QuizSession(make_questions(1), num_questions=1)
-    s3.start()
-    s3.choose_mode("all_knowing")
+    s3, _ = new_session(1, 1, ["all_knowing"])
     txt = s3.resolve_robot_guess("아무말")
     ok &= check("resolve_robot_guess ignored outside imperfect mode", "무시" in txt)
 
     # 4. 짜증유발 — quiz_state.py 자체는 필러만 반환, 거절 대사는 core/quiz_tools.py가 지연 주입으로 처리
-    s4 = QuizSession(make_questions(1), num_questions=1)
-    s4.start()
-    s4.choose_mode("annoying")
+    s4, txt = new_session(1, 1, ["annoying"])
+    ok &= check("annoying round intro states the robot does not know the answer either, bluntly",
+                "저도 정답을 모르는 상태" in txt and "무뚝뚝한" in txt)
     txt = s4.request_hint()
     ok &= check("annoying hint does NOT contain the refusal line itself", MODE3_REFUSAL_LINE not in txt)
 
@@ -173,9 +217,7 @@ def main():
     # 사실 알고 있었던 것처럼 보인다"는 지적으로, 이전(1~2차)의 "거절 후 자동 공개" 설계를
     # 되돌렸다. 참가자가 명시적으로 포기/스킵을 요청할 때만(judge_guess의 is_dont_know)
     # 그 자리에서 곧장 정답을 공개하고 전진한다("나는 모르지만 화면 정보를 전달한다" 서사).
-    s4b = QuizSession(make_questions(2), num_questions=2)
-    s4b.start()
-    s4b.choose_mode("annoying")
+    s4b, _ = new_session(2, 2, ["annoying"])
     txt = s4b.resolve_user_guess("땡땡땡")
     ok &= check(
         "annoying wrong guess withholds answer, does not advance, filler only",
@@ -230,9 +272,7 @@ def main():
 
     # request_hint()도 정오 로그를 초기화해야 한다 — 힌트를 물었다는 건 실제로 맞힌 적이
     # 없다는 뜻이므로, 그 직후 포기하면 정확하게 False로 기록돼야 한다.
-    s4c = QuizSession(make_questions(1), num_questions=1)
-    s4c.start()
-    s4c.choose_mode("annoying")
+    s4c, _ = new_session(1, 1, ["annoying"])
     s4c.resolve_user_guess("정답0")  # 실제로 맞혔지만
     s4c.request_hint()  # 그 뒤 힌트를 물었으니 "맞힌 적 없음"으로 리셋돼야 함
     ok &= check("hint request resets the pending-correct flag even after a correct guess",
@@ -241,22 +281,12 @@ def main():
     ok &= check("give-up after a hint request records user_correct=False",
                 s4c.results[0].user_correct is False)
 
-    # 5. 조기 종료
-    s5 = QuizSession(make_questions(5), num_questions=5)
-    s5.start()
-    s5.choose_mode("all_knowing")
+    # 5. 조기 종료 — 남은 라운드를 소진시키지 않아야 한다(모델이 실수로 불러도 복구 가능해야 함).
+    s5, _ = new_session(15, 5, ["all_knowing", "imperfect", "annoying"])
     s5.end_early()
     ok &= check("end_early deactivates session", not s5.active)
-
-    # 7. select_quiz_mode를 건너뛰고(모델이 실제로 호출하지 않고 말로만 진행한 척한
-    # 경우, 2026-07-29 실물 테스트에서 실제로 발생) submit_guess를 부르면, "퀴즈가
-    # 진행 중이 아닙니다"라는 막연한 문구가 아니라 "먼저 select_quiz_mode를 호출하라"는
-    # 구체적인 복구 지시가 나와야 한다.
-    s6 = QuizSession(make_questions(1), num_questions=1)
-    s6.start()  # choose_mode를 의도적으로 호출하지 않음
-    txt = s6.resolve_user_guess("아무말")
-    ok &= check("skipping select_quiz_mode gives an actionable recovery message",
-                "select_quiz_mode" in txt)
+    ok &= check("end_early keeps the remaining rounds recoverable",
+                s5.round_index == 1 and s5.begin_next_round() is not None)
 
     # 6. export_log 필드 — elapsed_sec/annoying_refusals는 실험 지표(docs/experiment_design.md §5)
     log = s2.export_log()
@@ -264,76 +294,66 @@ def main():
                 len(log) == 3 and "question_id" in log[0] and "timestamp" in log[0]
                 and "elapsed_sec" in log[0] and "annoying_refusals" in log[0])
 
-    # 8. 한 세션 안에서 여러 라운드(모드) 연속 진행 — 2026-07-31: 참가자가 1/2/3번 모드를
-    # 로봇 재시작 없이 한 세션 안에서 이어서 진행하는 실험 운영 방식이 확정되면서, 라운드마다
-    # 다른 문제 세트를 보여줘야 앞 라운드에서 공개된 정답이 다음 라운드를 오염시키지 않는다.
-    s7 = QuizSession(make_questions(6), num_questions=2)  # 은행 6개, 라운드당 2개 -> 3라운드 정확히 소진
+    # 7. 진행자가 정한 순서대로 3라운드가 한 세션에서 자동으로 이어진다(45단계).
+    # 라운드마다 겹치지 않는 문제 세트를 써야 앞 라운드에서 공개된 정답이 다음 라운드를
+    # 오염시키지 않는다(2026-07-31 도입, 여전히 유효).
+    order = ["imperfect", "annoying", "all_knowing"]  # 2-3-1 배정
+    s7 = QuizSession(make_questions(6), num_questions=2, mode_order=order)
     s7.start()
-    s7.choose_mode("all_knowing")
-    round1_ids = [q.id for q in s7.questions]
-    s7.resolve_user_guess("정답0")
-    s7.resolve_user_guess("정답1")  # 라운드1 종료(2문제 다 풀림)
-    ok &= check("round 1 ends session", not s7.active)
+    seen_ids = []
+    for round_no, expected_mode in enumerate(order, start=1):
+        txt = s7.begin_next_round()
+        ok &= check(f"round {round_no} starts in the assigned mode ({expected_mode})",
+                    txt is not None and s7.mode == expected_mode and s7.index == 0 and s7.active)
+        ok &= check(f"round {round_no} intro names the mode to the participant",
+                    mode_label(expected_mode) in txt)
+        if round_no > 1:
+            ok &= check(f"round {round_no} intro explicitly announces the mode change",
+                        "모드가 바뀝니다" in txt)
+        ids = [q.id for q in s7.questions]
+        ok &= check(f"round {round_no} uses a question set disjoint from every earlier round",
+                    set(ids).isdisjoint(seen_ids))
+        seen_ids += ids
+        # 두 문제를 소진 — 모드마다 "전진하는 조건"이 다르다: 하찮미는 로봇 추측까지
+        # 있어야 하고, 짜증유발은 명시적 포기/스킵 요청에만 전진한다(그 외에는 매번 거절).
+        for _ in range(2):
+            if expected_mode == "annoying":
+                s7.resolve_user_guess("그냥 다음 문제로 넘어가줘")
+                continue
+            s7.resolve_user_guess("아무답")
+            if expected_mode == "imperfect":
+                s7.resolve_robot_guess("아무추측")
+        if round_no < len(order):
+            ok &= check(f"quiz stays active between round {round_no} and {round_no + 1}",
+                        s7.active and s7.round_finished)
+    ok &= check("all rounds accumulate into one result log", len(s7.results) == 6)
+    ok &= check("quiz deactivates only after the final round", not s7.active)
+    ok &= check("no extra round is started past the assigned order", s7.begin_next_round() is None)
+    modes_logged = [r.mode for r in s7.results]
+    ok &= check("results are logged under the mode that was actually running",
+                modes_logged == ["imperfect"] * 2 + ["annoying"] * 2 + ["all_knowing"] * 2)
 
-    s7.start()  # 라운드 2 시작 — 다음 모드
-    s7.choose_mode("imperfect")
-    round2_ids = [q.id for q in s7.questions]
-    ok &= check("round 2 uses a disjoint question set from round 1",
-                set(round1_ids).isdisjoint(round2_ids))
-
-    # 2026-07-31 재설계: 하찮미 모드는 이제 답 시도만으로 전진하지 않고, 로봇도 같이
-    # 추측해야(resolve_robot_guess) 비로소 기록/전진한다.
-    s7.resolve_user_guess("정답2")
-    s7.resolve_robot_guess("아무말")
-    s7.resolve_user_guess("정답3")
-    s7.resolve_robot_guess("아무말")  # 라운드2 종료
-
-    s7.start()  # 라운드 3 시작 — 마지막 모드
-    s7.choose_mode("annoying")
-    round3_ids = [q.id for q in s7.questions]
-    ok &= check("round 3 uses a disjoint question set from rounds 1 and 2",
-                set(round1_ids).isdisjoint(round3_ids) and set(round2_ids).isdisjoint(round3_ids))
-    # 라운드1(2문항) + 라운드2(2문항) 결과가 세션 하나에 계속 쌓여있어야 한다(export_log가
-    # 세션 종료 시 3라운드치를 한 번에 모드별로 나눌 수 있는 전제).
-    ok &= check("results from rounds 1 and 2 both accumulate in one session", len(s7.results) == 4)
-
-    # 은행이 부족하면(4라운드째 요청 등) 경고를 남기고 처음부터 재사용 — 크래시하지 않아야 함.
-    # 이미 진행한 모드의 재선택은 한 번 되물어 확인받는다(2026-08-07 — 실험 설계상 각 모드는
-    # 참가자당 한 번이라, 말실수/STT 오인식으로 같은 모드를 두 번 도는 사고를 막기 위함).
-    s7.resolve_user_guess("정답4")
-    s7.resolve_user_guess("정답5")
-    s7.start()
-    txt = s7.choose_mode("all_knowing")
-    ok &= check("re-choosing an already-played mode asks for confirmation, state unchanged",
-                "이미 진행했습니다" in txt and s7.mode is None and s7.index == -1)
-    txt = s7.choose_mode("all_knowing")
-    ok &= check("insisting on the same mode right after the warning proceeds",
-                s7.mode == "all_knowing" and s7.index == 0)
-    round4_ids = [q.id for q in s7.questions]
-    ok &= check("exhausted bank falls back to reusing questions instead of crashing",
-                round4_ids == round1_ids)
-
-    # 8b. 확인 요청 후 다른(아직 안 한) 모드를 고르면 경고 없이 진행되고, 대기 중이던
-    # 확인 상태는 해제된다 — 나중에 또 같은 모드를 시도하면 다시 경고부터 받아야 한다.
-    s8 = QuizSession(make_questions(6), num_questions=2)
+    # 7b. 라운드 사이(전환 대기 중)에 사용자가 답을 말해도 그게 다음 라운드 문항으로
+    # 채점되면 안 된다 — 전환 중이라는 안내만 돌려주고 아무것도 소모하지 않아야 한다.
+    s8 = QuizSession(make_questions(4), num_questions=2, mode_order=["all_knowing", "imperfect"])
     s8.start()
-    s8.choose_mode("all_knowing")
+    s8.begin_next_round()
     s8.resolve_user_guess("정답0")
-    s8.resolve_user_guess("정답1")
-    s8.start()
-    txt = s8.choose_mode("all_knowing")  # 재선택 -> 경고
-    ok &= check("repeat warning issued in round 2", "이미 진행했습니다" in txt)
-    txt = s8.choose_mode("imperfect")  # 마음 바꿔 새 모드 -> 곧장 진행
-    ok &= check("choosing a fresh mode after the warning proceeds without confirmation",
-                s8.mode == "imperfect")
-    s8.resolve_user_guess("정답2")
-    s8.resolve_robot_guess("아무말")
-    s8.resolve_user_guess("정답3")
-    s8.resolve_robot_guess("아무말")
-    s8.start()
-    txt = s8.choose_mode("imperfect")  # 한참 뒤 또 재선택 -> 다시 경고부터
-    ok &= check("a later repeat attempt warns again (pending confirm was cleared)",
-                "이미 진행했습니다" in txt and s8.mode is None)
+    s8.resolve_user_guess("정답1")  # 1라운드 소진 -> 전환 대기
+    ok &= check("between rounds the quiz is still active but has no current question",
+                s8.active and s8.round_finished and s8.current_question is None)
+    before = len(s8.results)
+    txt = s8.resolve_user_guess("아무말")
+    ok &= check("guessing between rounds is refused and consumes nothing",
+                "모드 전환 중" in txt and len(s8.results) == before)
+
+    # 7c. 크래시 복구(QUIZ_ROUND_OFFSET) — 이미 마친 라운드 수만큼 모드와 사진을 함께 건너뛴다.
+    s9 = QuizSession(make_questions(6), num_questions=2, mode_order=order, initial_round_offset=1)
+    s9.start()
+    s9.begin_next_round()
+    ok &= check("round offset skips the already-played mode", s9.mode == order[1])
+    ok &= check("round offset also skips the already-shown photos",
+                [q.id for q in s9.questions] == ["q2", "q3"])
 
     print()
     if ok:

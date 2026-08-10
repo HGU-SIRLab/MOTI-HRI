@@ -17,7 +17,8 @@ from bootstrap import ensure_utf8_console
 
 ensure_utf8_console()
 
-from core.mic_gate import MAX_MIC_WITHHOLD_SEC, decide_withhold_mic
+from core.mic_gate import (MAX_MIC_WITHHOLD_SEC, SLEEP_MIC_RMS_THRESHOLD,
+                            decide_withhold_mic, should_send_while_sleeping)
 
 
 def check(label, condition):
@@ -57,6 +58,34 @@ def main():
     ok &= check("세션이 한 번도 말한 적 없는 초기 상태(아주 큰 경과시간)에서도 열려 있다",
                 decide_withhold_mic(quiz_active=True, robot_speaking=True,
                                     sec_since_last_audio=1e9) is False)
+
+    # --- SLEEPY 상태의 마이크 업로드 게이트(2026-08-10, 토큰 절감) ---
+    # 여기서도 실패 대가가 비대칭적이다: 너무 안 막으면 조용한 시간이 토큰으로 새고,
+    # 너무 막으면 **로봇이 영영 안 깨어난다**(깨우기 신호가 바로 이 오디오의 전사다).
+    # 그래서 "깨어 있을 때는 무조건 통과"와 "발화 크기는 무조건 통과"가 핵심 불변식.
+    import numpy as np
+
+    def rms(arr):
+        a = arr.astype(np.float32)
+        return float(np.sqrt(np.mean(a * a)))
+
+    silence = np.zeros(1600, dtype=np.int16)
+    room_noise = np.random.normal(0, 150, 1600).astype(np.int16)   # 조용한 실내
+    speech = np.random.normal(0, 3000, 1600).astype(np.int16)      # 근거리 발화
+
+    ok &= check("깨어 있을 때는 무음이든 뭐든 항상 서버로 보낸다(기존 동작 보존)",
+                should_send_while_sleeping(False, rms(silence)) is True
+                and should_send_while_sleeping(False, rms(room_noise)) is True)
+    ok &= check("잠든 동안 무음/실내소음은 올리지 않는다",
+                should_send_while_sleeping(True, rms(silence)) is False
+                and should_send_while_sleeping(True, rms(room_noise)) is False)
+    ok &= check("잠든 동안에도 사람 목소리 크기면 반드시 올린다(깨우기 경로 보존)",
+                should_send_while_sleeping(True, rms(speech)) is True)
+    ok &= check("문턱값을 0으로 두면 기능이 꺼져 예전처럼 전부 올린다",
+                should_send_while_sleeping(True, 0.0, threshold=0.0) is True)
+    ok &= check("문턱값 경계에서는 같거나 크면 통과한다",
+                should_send_while_sleeping(True, SLEEP_MIC_RMS_THRESHOLD) is True
+                and should_send_while_sleeping(True, SLEEP_MIC_RMS_THRESHOLD - 1) is False)
 
     print()
     if ok:

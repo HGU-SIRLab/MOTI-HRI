@@ -1,7 +1,8 @@
-"""세션 종료 보고서(core/report_manager.py) 독립 테스트 도구.
+"""세션 종료 대화록 저장(core/report_manager.py) 독립 테스트.
 
-GOOGLE_API_KEY가 있어야 실제로 결과지를 생성해볼 수 있다(batch generate_content 호출).
-로봇 불필요.
+**2026-08-10부터 API 키가 필요 없다** — '마음 처방전'(LLM 결과지) 생성을 제거하고 대화록
+파일 저장만 남겼기 때문(제거 이유는 core/report_manager.py 상단 주석 참고). 따라서 이제
+이 스크립트도 완전한 오프라인 테스트다.
 
 사용:
     python scripts/test_report.py
@@ -16,49 +17,60 @@ from bootstrap import ensure_utf8_console
 
 ensure_utf8_console()
 
-from core import profile_manager as profiles
 from core import report_manager
 
 TEST_USER = "__테스트유저__"
 
 
+def check(label, condition):
+    print(("OK  " if condition else "FAIL") + ": " + label)
+    return condition
+
+
 def main():
-    try:
-        from dotenv import load_dotenv
-        load_dotenv()
-    except ImportError:
-        pass
+    ok = True
+    result_dir = os.path.join(_REPO_ROOT, "user_result")
 
-    api_key = os.getenv("GOOGLE_API_KEY")
-    if not api_key:
-        print("⏭️  GOOGLE_API_KEY가 설정되지 않아 건너뜁니다. (.env.example 참고)")
-        return
+    def test_files():
+        if not os.path.exists(result_dir):
+            return []
+        return [f for f in os.listdir(result_dir) if TEST_USER in f]
 
-    import google.generativeai as genai
-    genai.configure(api_key=api_key)
-
-    profiles.forget_user(TEST_USER)
-    profiles.remember_fact(TEST_USER, "grade", "1학년", "certain")
-    profiles.remember_fact(TEST_USER, "major", "전산전자공학부", "certain")
-    profiles.remember_fact(TEST_USER, "mbti", "INFP", "inferred")
-    facts_summary = profiles.load_profile_for_chat(TEST_USER)
-    print("facts_summary:\n", facts_summary)
+    # 이전 실행이 남긴 파일만 골라서 지운다 — 공유 폴더를 통째로 비우지 않는다
+    # (실제 참가자 데이터가 같은 폴더에 있다).
+    for f in test_files():
+        os.remove(os.path.join(result_dir, f))
 
     conversation_log = (
         "User: 안녕 모티야, 오늘 팀플 때문에 너무 지쳐 | Moti: 팀플 때문에 많이 지치셨군요, 어떤 부분이 제일 힘드셨어요?\n"
-        "User: 조원들이 다 잠수타서 나 혼자 다 했어 | Moti: 혼자서 다 짊어지셨다니 정말 고생 많으셨어요. 오늘 밤엔 좀 쉬어야겠어요."
+        "User: 조원들이 다 잠수타서 나 혼자 다 했어 | Moti: 혼자서 다 짊어지셨다니 정말 고생 많으셨어요."
     )
+    report_manager.save_conversation_log(TEST_USER, conversation_log)
 
-    print("⏳ 보고서 생성 중 (Gemini 호출)...")
-    report_manager.generate_and_save_reports(TEST_USER, conversation_log, facts_summary)
+    files = test_files()
+    ok &= check(f"대화록 파일 1개가 생성된다 ({files})", len(files) == 1)
+    if files:
+        text = open(os.path.join(result_dir, files[0]), encoding="utf-8").read()
+        ok &= check("대화록에 사용자 발화와 모티 응답이 모두 들어있다",
+                    "조원들이 다 잠수타서" in text and "혼자서 다 짊어지셨다니" in text)
+        # 회귀 방지: 결과지(마음 처방전)는 더 이상 만들지 않는다 — 다시 생기면 세션마다
+        # 대화록 전체를 프롬프트에 넣는 배치 호출이 부활한 것이다.
+        ok &= check("'마음 처방전' 결과지는 더 이상 생성되지 않는다",
+                    not any("결과지" in f for f in files))
 
-    result_dir = os.path.join(_REPO_ROOT, "user_result")
-    files = [f for f in os.listdir(result_dir) if TEST_USER in f] if os.path.exists(result_dir) else []
-    print(f"\n생성된 파일: {files}")
-    assert len(files) == 2, f"대화록+결과지 2개가 생성되어야 하는데 {len(files)}개 생성됨"
-    print("✅ 통과 — 대화록과 결과지가 모두 생성되었습니다. 내용은 user_result/ 폴더에서 직접 확인하세요.")
+    ok &= check("이름을 모르면 아무것도 저장하지 않는다",
+                report_manager.save_conversation_log("", conversation_log) is None
+                and len(test_files()) == len(files))
 
-    profiles.forget_user(TEST_USER)
+    for f in test_files():
+        os.remove(os.path.join(result_dir, f))
+
+    print()
+    if ok:
+        print("✅ 전부 통과")
+    else:
+        print("❌ 일부 실패")
+        sys.exit(1)
 
 
 if __name__ == "__main__":

@@ -49,21 +49,21 @@ def main():
     # 2. quiz_session은 있지만 아직 짜증유발 모드가 아니면(다른 모드거나 퀴즈 시작 전)
     # 역시 제한 없음.
     q2 = FakeQueue()
-    session2 = QuizSession(make_questions(1), num_questions=1)
+    session2 = QuizSession(make_questions(1), num_questions=1, mode_order=["imperfect"])
     set_emotion2 = make_set_emotion_tool(q2, quiz_session=session2)
     set_emotion2("excited")
     ok &= check("quiz_session before any mode chosen -> unclamped", q2.items == ["EXCITED"])
     session2.start()
-    session2.choose_mode("imperfect")
+    session2.begin_next_round()
     set_emotion2("sad")
     ok &= check("quiz_session in a non-annoying mode -> unclamped", q2.items[-1] == "SAD")
 
     # 3. 짜증유발 모드가 활성화된 동안엔 neutral/thinking 이외는 neutral로 클램프된다.
     q3 = FakeQueue()
-    session3 = QuizSession(make_questions(2), num_questions=2)
+    session3 = QuizSession(make_questions(2), num_questions=2, mode_order=["annoying"])
     set_emotion3 = make_set_emotion_tool(q3, quiz_session=session3)
     session3.start()
-    session3.choose_mode("annoying")
+    session3.begin_next_round()
     set_emotion3("happy")
     ok &= check("annoying mode clamps happy -> neutral", q3.items[-1] == "NEUTRAL")
     set_emotion3("thinking")
@@ -88,10 +88,10 @@ def main():
     # 6. 척척박사(all_knowing) 모드는 neutral로 완전 고정된다(2026-08-07, 사용자 요청) —
     # thinking조차 허용하지 않는다는 점이 짜증유발 모드와 다르다.
     q6 = FakeQueue()
-    session6 = QuizSession(make_questions(1), num_questions=1)
+    session6 = QuizSession(make_questions(1), num_questions=1, mode_order=["all_knowing"])
     set_emotion6 = make_set_emotion_tool(q6, quiz_session=session6)
     session6.start()
-    session6.choose_mode("all_knowing")
+    session6.begin_next_round()
     set_emotion6("happy")
     ok &= check("all_knowing mode clamps happy -> neutral", q6.items[-1] == "NEUTRAL")
     set_emotion6("thinking")

@@ -21,6 +21,29 @@
 # 수 없는 여유 있는 상한이다.
 MAX_MIC_WITHHOLD_SEC = 3.0
 
+# SLEEPY 상태에서 조용한 마이크 오디오를 서버로 안 보내기 위한 문턱값(int16 RMS).
+# 배경(2026-08-10): 로봇은 잠들어 있는 동안에도 마이크를 초당 계속 서버로 올리고 있었고,
+# Live API는 그 오디오를 전부 입력 토큰으로 과금한다 — 참가자 사이사이 로봇을 켜둔 시간이
+# 그대로 비용이 된다. 다만 **깨우기 경로가 바로 이 오디오**라는 점이 핵심 제약이다:
+# 서버가 사용자 발화를 전사(input_transcription)해줘야 launcher가 깨어나므로, 무조건
+# 막으면 로봇이 영영 안 깨어난다. 그래서 "조용한 구간만" 버리고 사람 목소리 크기면
+# 그대로 올린다. int16 풀스케일이 32768이므로 500은 약 1.5% — 조용한 실내 소음(보통
+# 1% 미만)보다는 위이고 근거리 발화(보통 5~30%)보다는 훨씬 아래라, 말을 걸면 반드시
+# 통과한다. 의심스러우면 .env의 SLEEP_MIC_RMS_THRESHOLD=0으로 이 기능만 끌 수 있다.
+SLEEP_MIC_RMS_THRESHOLD = 500.0
+
+
+def should_send_while_sleeping(is_sleeping: bool, chunk_rms: float,
+                               threshold: float = SLEEP_MIC_RMS_THRESHOLD) -> bool:
+    """SLEEPY 상태에서 이 마이크 청크를 서버로 보내야 하면 True.
+
+    깨어있을 때는 항상 True(기존 동작 그대로) — 이 게이트는 오직 잠든 동안에만 작동한다.
+    threshold가 0 이하면 기능 자체가 꺼진 것으로 보고 항상 보낸다.
+    """
+    if not is_sleeping or threshold <= 0:
+        return True
+    return chunk_rms >= threshold
+
 
 def decide_withhold_mic(quiz_active: bool, robot_speaking: bool,
                         sec_since_last_audio: float,

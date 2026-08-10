@@ -86,29 +86,31 @@ async def run_scenario():
     quiz_ui_q: Queue = Queue()
     busy = threading.Event()
     motion_ctx = (None, None, threading.Lock(), {"mode": "tracking"}, 2081, 2071)
-    # 이 스크립트의 inject_turn은 launcher.py와 달리 speaking_done을 기다리지 않는
-    # 단순 버전이라(오디오 재생 자체가 없는 텍스트 시나리오 검증용) 항상 set된 채로 둔다.
-    speaking_done = asyncio.Event()
-    speaking_done.set()
-    start_quiz, select_quiz_mode, submit_guess, request_hint, end_quiz_early, session_obj = make_quiz_tools(
-        quiz_ui_q, busy, motion_ctx, inject_turn, loop, speaking_done, emotion_queue=None, num_questions=1,
+    # launcher.py의 recv_loop가 관리하는 것과 같은 1칸짜리 턴 카운터 — 아래 run_turn이
+    # turn_complete를 받을 때마다 올린다(core/quiz_tools.py의 _wait_for_turn_after가
+    # 이 값으로 "지금 진행 중인 응답이 끝났는지"를 판단한다).
+    turn_seq = [0]
+    # 진행자가 이 참가자를 3번(짜증유발)부터 시작하도록 배정한 시나리오.
+    start_quiz, submit_guess, request_hint, end_quiz_early, session_obj = make_quiz_tools(
+        quiz_ui_q, busy, motion_ctx, inject_turn, loop, turn_seq, emotion_queue=None,
+        num_questions=1, mode_order=["annoying"],
     )
-    for fn in (start_quiz, select_quiz_mode, submit_guess, request_hint, end_quiz_early):
+    for fn in (start_quiz, submit_guess, request_hint, end_quiz_early):
         tool_fns[fn.__name__] = fn
 
     config = types.LiveConnectConfig(
         response_modalities=[types.Modality.AUDIO],
         output_audio_transcription=types.AudioTranscriptionConfig(),
         system_instruction=build_persona_system_instruction(name=None, facts_summary=None),
-        tools=[remember_fact, set_emotion, start_quiz, select_quiz_mode, submit_guess, request_hint, end_quiz_early],
+        tools=[remember_fact, set_emotion, start_quiz, submit_guess, request_hint, end_quiz_early],
     )
 
-    # 실험자가 참가자를 3번(짜증유발) 모드에 배정한 시나리오 — 힌트 요청까지 몰고 가서
+    # 45단계(2026-08-10)부터 참가자는 모드를 고르지 않는다 — start_quiz 하나로 전체 안내가
+    # 나가고 진행자가 배정한 순서대로 라운드가 자동으로 시작된다. 힌트 요청까지 몰고 가서
     # ~10~12초 뒤 도착하는 거절 대사 지연 주입이 실제로 발화되는지 확인하는 게 목적.
     turns = [
         "어 안녕 모티야, 나 김한동이야.",
         "나 심심한데 재밌는 퀴즈 풀자!",
-        "실험자가 3번, 짜증유발 모드로 하라고 했어.",
         "음... 잘 모르겠는데? 힌트 좀 줘.",
     ]
 
@@ -117,11 +119,8 @@ async def run_scenario():
         session_holder["session"] = session
         print(f"✅ 연결 성공")
 
-        async def run_turn(text):
-            print(f"\n사용자: {text}")
-            await session.send_client_content(
-                turns=types.Content(role="user", parts=[types.Part(text=text)]), turn_complete=True,
-            )
+        async def consume_one_turn() -> str:
+            """턴 하나가 끝날 때까지 받아 처리하고, 그 턴의 전사 텍스트를 돌려준다."""
             reply_text = ""
             async for message in session.receive():
                 sc = message.server_content
@@ -136,12 +135,42 @@ async def run_scenario():
                         responses.append(types.FunctionResponse(id=fc.id, name=fc.name, response={"result": result}))
                     await session.send_tool_response(function_responses=responses)
                 if sc and sc.turn_complete:
+                    # launcher.py의 recv_loop와 같은 지점에서 올린다 — 이게 없으면
+                    # core/quiz_tools.py의 라운드 전환/정답 공개 대기가 영원히 안 풀린다.
+                    turn_seq[0] += 1
                     break
+            return reply_text
+
+        async def run_turn(text):
+            print(f"\n사용자: {text}")
+            await session.send_client_content(
+                turns=types.Content(role="user", parts=[types.Part(text=text)]), turn_complete=True,
+            )
+            reply_text = await consume_one_turn()
             print(f"모티: {reply_text.strip()}")
             return reply_text
 
+        async def pump(seconds: float):
+            """사용자 발화 없이, Python이 스스로 주입하는 히든 턴(라운드 안내 -> 첫 문제
+            질문)들을 그 시간만큼 받아 처리한다 — 45단계부터 퀴즈 시작 직후의 흐름이
+            사용자 턴이 아니라 이 히든 턴들로 이어지기 때문."""
+            deadline = time.monotonic() + seconds
+            while time.monotonic() < deadline:
+                try:
+                    async with asyncio.timeout(max(0.1, deadline - time.monotonic())):
+                        reply = await consume_one_turn()
+                except (asyncio.TimeoutError, TimeoutError):
+                    return
+                if reply.strip():
+                    print(f"모티(자동 진행): {reply.strip()}")
+
         for turn in turns:
             await run_turn(turn)
+            if "퀴즈" in turn:
+                # 전체 안내 -> 라운드 안내 -> 첫 문제 질문까지 자동으로 이어지는 구간
+                print("\n(라운드 자동 시작을 기다리는 중...)")
+                await pump(20)
+                print(f"  📺 화면 큐: {[m.get('type') for m in list(quiz_ui_q.queue)]}")
 
         # 지연 주입은 request_hint() 호출 시점부터 10~12초 뒤 별도 히든 턴으로 도착한다 —
         # 그동안 새 사용자 턴 없이 계속 receive()만 돌며 기다린다.
@@ -164,6 +193,7 @@ async def run_scenario():
                                     types.FunctionResponse(id=fc.id, name=fc.name, response={"result": result})
                                 ])
                         if sc and sc.turn_complete:
+                            turn_seq[0] += 1
                             break
             except (asyncio.TimeoutError, TimeoutError):
                 break

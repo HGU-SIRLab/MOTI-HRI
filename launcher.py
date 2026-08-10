@@ -29,6 +29,7 @@ import threading
 import time
 import wave
 
+import numpy as np
 from dynamixel_sdk import PacketHandler, PortHandler
 from websockets.exceptions import ConnectionClosed
 
@@ -44,9 +45,11 @@ from core import report_manager
 from core.emotion_tools import make_set_emotion_tool
 from core.idle_watcher import IDLE_SLEEP_SEC, decide_idle_action
 from core.memory_tools import make_forget_me_tool, make_remember_fact_tool
-from core.mic_gate import MAX_MIC_WITHHOLD_SEC, decide_withhold_mic
+from core.mic_gate import (MAX_MIC_WITHHOLD_SEC, SLEEP_MIC_RMS_THRESHOLD,
+                            decide_withhold_mic, should_send_while_sleeping)
 from core.motion_tools import make_motion_tools
 from core.quiz_export import save_quiz_results
+from core.quiz_state import mode_label, parse_mode_order
 from core.quiz_tools import make_quiz_tools
 from core.utils import build_persona_system_instruction, extract_exit_tag
 from display.main import RobotFaceApp
@@ -98,6 +101,19 @@ QUIZ_DISABLE_BARGE_IN = os.getenv("QUIZ_DISABLE_BARGE_IN", "true").lower() not i
 # SLEEPY로 전환하고 팬/틸트 추적도 멈춘다 — 사용자 요청(2026-07-29). display/emotions/
 # sleepy.py·wake.py는 v1(capston_mk1/motirobotics)에서 재이식.
 IDLE_WATCHER_POLL_SEC = 1.0
+# 잠든 동안 조용한 마이크 오디오를 서버로 안 올리기 위한 문턱값(core/mic_gate.py 주석에
+# 근거와 실패 모드가 있다). 0으로 두면 기능이 꺼져 예전처럼 항상 올린다.
+SLEEP_MIC_RMS_THRESHOLD = float(os.getenv("SLEEP_MIC_RMS_THRESHOLD", str(SLEEP_MIC_RMS_THRESHOLD)))
+
+
+def _chunk_rms(chunk: bytes) -> float:
+    """마이크 청크(16-bit mono PCM)의 RMS. 빈 청크는 0."""
+    if not chunk:
+        return 0.0
+    samples = np.frombuffer(chunk, dtype=np.int16).astype(np.float32)
+    if samples.size == 0:
+        return 0.0
+    return float(np.sqrt(np.mean(samples * samples)))
 # SLEEPY 상태 배경음("드르렁... 쿠우...") — scripts/generate_snore_audio.py로 한 번 생성해
 # 캐싱해둔 파일을 읽기만 한다(런타임에 API를 다시 부르지 않음, 반복 간격도 그래야 안정적).
 SNORE_CLIP_PATH = os.path.join(_REPO_ROOT, "assets", "audio", "snore.wav")
@@ -274,13 +290,13 @@ async def run_conversation(name_state: dict, facts_summary: str | None, emotion_
     quiz_session = None
     if quiz_ui_q is not None:
         quiz_motion_ctx = (port, pkt, lock, shared_state, home_pan, home_tilt)
-        (start_quiz, select_quiz_mode, submit_guess, request_hint, end_quiz_early,
+        (start_quiz, submit_guess, request_hint, end_quiz_early,
          quiz_session) = make_quiz_tools(
             quiz_ui_q, quiz_busy or threading.Event(), quiz_motion_ctx, inject_turn, loop,
             turn_seq, emotion_queue=emotion_queue, num_questions=quiz_num_questions,
             drain_playback=drain_playback, mute_speech=mute_speech, user_spoke=user_spoke,
         )
-        for quiz_tool_fn in (start_quiz, select_quiz_mode, submit_guess, request_hint, end_quiz_early):
+        for quiz_tool_fn in (start_quiz, submit_guess, request_hint, end_quiz_early):
             tools.append(quiz_tool_fn)
             tool_fns[quiz_tool_fn.__name__] = quiz_tool_fn
     if quiz_session_out is not None:
@@ -455,6 +471,13 @@ async def run_conversation(name_state: dict, facts_summary: str | None, emotion_
                                 if should_withhold_mic():
                                     # 퀴즈 중 로봇이 말하는 동안은 서버로 안 보낸다 —
                                     # barge-in 차단(위 should_withhold_mic 주석).
+                                    continue
+                                if not should_send_while_sleeping(is_sleeping[0], _chunk_rms(chunk),
+                                                                  SLEEP_MIC_RMS_THRESHOLD):
+                                    # 잠든 동안의 조용한 오디오는 올리지 않는다 — Live API는
+                                    # 마이크 오디오를 전부 입력 토큰으로 과금하므로, 아무도
+                                    # 없는 시간이 그대로 비용이 된다(2026-08-10). 사람이 말을
+                                    # 걸면 문턱값을 넘어 그대로 올라가고 평소처럼 깨어난다.
                                     continue
                                 await session.send_realtime_input(
                                     audio=types.Blob(data=chunk, mime_type=f"audio/pcm;rate={INPUT_RATE}")
@@ -680,6 +703,18 @@ def main():
     except ImportError:
         pass
 
+    # 퀴즈 모드 순서(.env의 QUIZ_MODE_ORDER)는 **로봇을 만지기 전에** 확인한다 — 진행자가
+    # 오타를 냈다면 모터/카메라/모델을 다 띄운 뒤 대화 도중에 알게 되는 것보다, 여기서
+    # 즉시 죽어서 고치는 편이 훨씬 낫다(카운터밸런싱이 깨진 데이터는 나중에 복구 불가).
+    try:
+        mode_order = parse_mode_order(os.getenv("QUIZ_MODE_ORDER"))
+    except ValueError as e:
+        print(f"❌ {e}")
+        sys.exit(1)
+    print("🎯 이번 참가자 퀴즈 모드 순서: "
+          + " → ".join(mode_label(m) for m in mode_order)
+          + f"  (.env QUIZ_MODE_ORDER={os.getenv('QUIZ_MODE_ORDER') or '미지정, 기본값'})")
+
     port, pkt = open_port()
     lock = threading.Lock()
     shared_state = {"mode": "tracking"}
@@ -791,13 +826,11 @@ def main():
             profiles.consolidate_facts(final_name)
 
         if final_name and session_history:
-            print("💾 대화 결과지를 생성합니다...")
-            # 대화 중 remember_fact로 새로 저장된 사실을 반영하려면 세션 시작 전에
-            # 로드해둔 facts_summary가 아니라 지금 시점 기준으로 다시 읽어야 한다.
-            latest_facts_summary = profiles.load_profile_for_chat(final_name)
-            report_manager.generate_and_save_reports(final_name, "\n".join(session_history), latest_facts_summary)
+            # 2026-08-10: '마음 처방전'(LLM 결과지) 생성은 제거했다 — 대화록 원문만 저장한다
+            # (core/report_manager.py 상단 주석 참고). 파일 쓰기뿐이라 API를 쓰지 않는다.
+            report_manager.save_conversation_log(final_name, "\n".join(session_history))
         elif session_history:
-            print("ℹ️  이름을 몰라 결과지는 생성하지 않습니다 (대화 자체는 정상 진행됨).")
+            print("ℹ️  이름을 몰라 대화록은 저장하지 않습니다 (대화 자체는 정상 진행됨).")
 
         # 연구 데이터 — 문항별 모드/정답여부/힌트요청여부/타임스탬프(core/quiz_state.py
         # export_log() 참고)를 1/2/3번 모드별 파일로 나눠 저장한다(core/quiz_export.py).
