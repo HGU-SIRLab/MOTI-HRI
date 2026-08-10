@@ -27,16 +27,20 @@ REVEAL_HOLD_SEC = 4.0
 
 
 def make_quiz_tools(quiz_ui_q, busy: threading.Event, motion_ctx, inject_turn, loop,
-                     speaking_done: asyncio.Event, emotion_queue=None, num_questions: int = 5):
+                     turn_seq: list, emotion_queue=None, num_questions: int = 5):
     """motion_ctx = (port, pkt, lock, shared_state, home_pan, home_tilt) — launcher.py가
     core.motion_tools.make_motion_tools에 넘기는 것과 같은 튜플. busy도 그쪽과 같은
     threading.Event를 공유해야 퀴즈 리액션 모션과 LLM이 부르는 제스처가 같은 모터를
     동시에 건드리지 않는다. inject_turn(text)는 launcher.py가 만드는 코루틴으로,
     session.send_client_content(...)를 호출해 새 히든 턴을 보낸다. loop는 이 코루틴이
     도는 asyncio 이벤트 루프(asyncio.get_event_loop()) — request_hint의 지연 태스크
-    예약에 쓰인다. speaking_done은 launcher.py가 recv_loop에서 갱신하는 이벤트로,
-    로봇이 지금 발화 중이 아닐 때만 set되어 있다(inject_turn()이 이미 이걸로 겹쳐
-    말하기를 막고 있음) — 정답 공개 타이밍도 같은 신호를 재사용한다.
+    예약에 쓰인다. turn_seq는 launcher.py가 recv_loop에서 관리하는 1칸짜리 리스트
+    ([0])로, 로봇의 턴이 끝날 때마다(turn_complete 또는 interrupted) 1씩 증가한다 —
+    "지금 이 순간 이후로 턴이 몇 번 더 끝났는지"를 셀 수 있어, "지금 진행 중인(또는
+    막 시작되려는) 응답이 끝날 때까지 기다린다"를 speaking_done 같은 단일 불리언
+    Event보다 정확하게 표현한다(아래 _wait_for_turn_after 참고 — Event는 "이미 끝난
+    상태"와 "아직 시작 전이라 우연히 끝난 것처럼 보이는 상태"를 구분 못 해 정답 공개가
+    로봇이 말하기도 전에 뜨는 경합이 있었다, 2026-08-08).
     """
     port, pkt, lock, shared_state, home_pan, home_tilt = motion_ctx
     # 크래시 복구용(docs/experiment_design.md §1-1): 세션이 도중에 죽어 launcher를
@@ -87,17 +91,37 @@ def make_quiz_tools(quiz_ui_q, busy: threading.Event, motion_ctx, inject_turn, l
             task.cancel()
         _pending_reveal_transition["task"] = None
 
-    async def _delayed_reveal_and_advance(question):
-        # 툴 호출 시점(예: submit_guess(robot, ...))엔 로봇이 아직 직전 문장("제 생각엔
-        # 이거 같아요! 비교해볼까요?")을 말하는 도중이거나, 이 호출의 응답으로 받은
-        # 정답 공개/반응 대사를 이제 막 말하기 시작하려는 참이다 — 곧장 화면을 바꾸면
-        # 로봇이 입을 열기도 전에 정답 사진이 뜨고, REVEAL_HOLD_SEC이 그 시점부터
-        # 흘러버려서 로봇이 정답을 다 말하기도 전에 다음 문제로 넘어가버렸다(2026-07-31
-        # 실사용 피드백). inject_turn()과 같은 speaking_done 신호로 이 턴의 발화가 실제로
-        # 끝나길 기다린 뒤에야 화면을 바꾸고, 그 시점부터 REVEAL_HOLD_SEC을 센다.
-        await speaking_done.wait()
+    async def _wait_for_turn_after(baseline: int, poll: float = 0.05):
+        """turn_seq[0]이 baseline보다 커질 때까지(=baseline을 기록한 시점 이후로 로봇의
+        턴이 적어도 한 번 끝날 때까지) 기다린다. speaking_done 같은 단일 Event를 매번
+        "지금부터 새로 기다리기" 용도로 재사용하면, 정확히 언제 clear해야 하는지가
+        호출부마다 미묘하게 달라 경합이 반복적으로 생겼다(2026-08-08, 아래 참고) — 대신
+        baseline을 "이 시점 기준"으로 캡처해두고 그 이후의 증가만 보므로 호출 시점과
+        무관하게 항상 정확하다."""
+        while turn_seq[0] <= baseline:
+            await asyncio.sleep(poll)
+
+    async def _delayed_reveal_and_advance(question, reveal_speech: str | None):
+        # 2026-08-08 구조 변경 — 예전엔 판정 툴 호출의 응답 자체가 정답/반응 텍스트라
+        # 모델이 곧장 그걸 말했는데, Live API는 여러 툴 호출을 오디오 한 마디 없이 연달아
+        # 처리한 뒤에야 한꺼번에 말할 수 있어서(하찮미 모드의 사용자 채점 툴 -> 로봇 채점
+        # 툴이 실제로 이렇게 배치되는 게 실물 로그로 확인됨), "이 턴이 끝나면 이미지를
+        # 띄운다"는 예전 동기화가 무의미해졌다 — 그 "이 턴"에 이미 반응 텍스트와 "다음
+        # 문제로 가볼까요" 필러까지 다 말해버린 뒤였기 때문. 이제 판정 시점의 툴 응답은
+        # core/quiz_state.py의 _HOLD_FOR_REVEAL(침묵 지시)뿐이고, 실제 반응 텍스트
+        # (reveal_speech)는 이미지가 뜬 뒤에 우리가 직접 새 히든 턴으로 주입한다 — 모델이
+        # 툴 호출을 어떻게 몰아서 처리하든, 이미지->반응 순서는 항상 Python이 보장한다.
+        baseline = turn_seq[0]
+        await _wait_for_turn_after(baseline)  # 침묵 지시를 받은 턴이 끝나길 기다림
         await asyncio.sleep(POST_SPEECH_DRAIN_SEC)
         _push_reveal(question)
+        if reveal_speech:
+            reveal_baseline = turn_seq[0]
+            await inject_turn(reveal_speech)
+            # 반응 발화가 실제로 끝날 때까지 기다린 뒤에야 REVEAL_HOLD_SEC(사진을 유지하는
+            # 시간)을 세기 시작한다 — 안 그러면 로봇이 아직 반응을 말하는 도중에 사진이
+            # 넘어가버린다.
+            await _wait_for_turn_after(reveal_baseline)
         await asyncio.sleep(REVEAL_HOLD_SEC)
         _pending_reveal_transition["task"] = None
         _push_question_or_hide()
@@ -106,10 +130,14 @@ def make_quiz_tools(quiz_ui_q, busy: threading.Event, motion_ctx, inject_turn, l
         # 모델이 먼저 물어봐서 말/화면이 어긋나는 문제(2026-07-30)가 있었다.
         if session.active and session.current_question is not None:
             await inject_turn(session.next_question_prompt())
+        else:
+            await inject_turn(session.final_wrapup_prompt())
 
-    def _schedule_reveal(question):
+    def _schedule_reveal(question, reveal_speech: str | None):
         _cancel_pending_reveal_transition()
-        _pending_reveal_transition["task"] = loop.create_task(_delayed_reveal_and_advance(question))
+        _pending_reveal_transition["task"] = loop.create_task(
+            _delayed_reveal_and_advance(question, reveal_speech)
+        )
 
     def _run_guarded(fn, *args):
         """busy가 이미 set이면(다른 제스처/퀴즈 모션 실행 중) 아무것도 안 하고 스킵한다."""
@@ -278,7 +306,13 @@ def make_quiz_tools(quiz_ui_q, busy: threading.Event, motion_ctx, inject_turn, l
             # 무효/staging 호출에 reveal을 띄우면 아직 안 풀린 문제의 "정답 공개" 화면이
             # 잘못 뜨는 사고가 난다.
             _cancel_pending_stall()
-            _schedule_reveal(question_before_call)
+            # session.resolve_*_guess()가 방금 채워둔 반응 지시문 — 판정 툴의 응답 자체는
+            # 침묵 지시(_HOLD_FOR_REVEAL)뿐이고, 이 텍스트는 이미지가 뜬 뒤에 별도의 히든
+            # 턴으로 주입된다(core/quiz_state.py 상단 주석 참고). 다음 판정에 잘못 재사용되지
+            # 않도록 여기서 즉시 꺼내고 지운다(pending_user_guess와 같은 read-once 패턴).
+            reveal_speech = session.pending_reveal_speech
+            session.pending_reveal_speech = None
+            _schedule_reveal(question_before_call, reveal_speech)
 
         return text
 

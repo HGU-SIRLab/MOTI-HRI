@@ -2,6 +2,50 @@
 
 `docs/architecture.md`의 로드맵(§10) 대비 실제 구현 상태를 기록한다. 설계 자체가 바뀌면 architecture.md를, 무엇을 언제 어떻게 만들었는지는 이 문서를 갱신한다.
 
+### 39단계 — 정답 공개 타이밍 구조 개편(37단계로 완전히 안 고쳐졌던 근본 원인) + 하찮미 로봇 추측 모호함 수정 (2026-08-08)
+
+37단계에서 `speaking_done` clear 버그를 고쳤는데도 실물 재확인에서 여전히 타이밍이 안 맞았음(사용자 보고). 하찮미(imperfect) 모드 실사용 로그 분석 결과, 진짜 원인은 별개였다: Live API가 `submit_guess(user,...)` -> `submit_guess(robot,...)` 두 툴 호출을 오디오 한 마디 없이 연달아 처리한 뒤에야 "제 생각엔 ~ 같아요! 비교해볼까요? 어 저도 틀렸네요! 다음 문제로 가볼까요?"를 전부 한 턴에 몰아 말해버리는 게 실제로 관찰됨(로그의 `[모티]` 블록 하나에 다 뭉쳐 있었음, 즉 turn_complete가 그 사이에 한 번도 안 걸렸다는 뜻) — "이 턴이 끝나면 이미지를 띄운다"는 동기화 자체가, 모델이 몇 개의 툴을 어떻게 몰아 부르는지에 따라 이미 다 말해버린 뒤에 이미지가 뜨는 걸로 무의미해질 수 있었다. 37단계의 수정은 진짜 원인이 아니라 그 위의 증상 하나(clear 안 하는 버그)만 고친 것이었음.
+
+**구조 변경**: 판정 툴(submit_guess 등)의 즉시 응답을 정답/반응 텍스트에서 **침묵 지시**(`core/quiz_state.py`의 `_HOLD_FOR_REVEAL` 상수)로 바꿈 — all_knowing 정상채점, annoying 포기시 공개, imperfect 페어드 리빌 세 곳 전부. 실제 반응 텍스트는 `session.pending_reveal_speech`에 저장해뒀다가, `core/quiz_tools.py`가 (1) 판정 턴이 끝나길 기다리고 (2) 정답 이미지를 먼저 띄운 뒤 (3) 별도의 히든 턴(`inject_turn`)으로 반응 텍스트를 주입한다 — 모델이 툴 호출을 어떻게 몰아 처리하든 이미지→반응 순서를 Python이 직접 통제하므로 더 이상 턴 경계에 의존하지 않는다. `_next_step_text()`(다음 문제 안내를 흐리게 겸했던 문구)는 제거하고 `final_wrapup_prompt()`(마지막 문제용)를 신설 — 다음 문제/마무리 안내는 여전히 REVEAL_HOLD_SEC 이후 별도 히든 턴으로 주입(기존 메커니즘 유지).
+
+**두 번째 대기 타이밍 버그도 같이 발견**: 반응 텍스트를 주입한 뒤 REVEAL_HOLD_SEC(사진 유지 시간)을 곧장 세기 시작하면 로봇이 아직 반응을 말하는 도중에 사진이 넘어갈 수 있음 — 여기서도 "지금 이 시점 이후로 턴이 몇 번 끝났는지"를 정확히 아는 수단이 필요했는데, `speaking_done`(단일 Event) 방식을 또 쓰면 37단계와 같은 클래스의 경합이 재발할 게 뻔해서, 이번엔 아예 새 메커니즘으로 교체: `launcher.py`에 `turn_seq`(1칸짜리 리스트, 턴이 끝날 때마다 `+1`)를 추가하고 `core/quiz_tools.py`가 baseline을 캡처해두고 그 이후의 증가만 보는 `_wait_for_turn_after()`로 두 번의 대기(판정 턴 종료, 반응 턴 종료)를 전부 처리 — Event의 "이미 끝난 상태"와 "아직 시작 전이라 우연히 끝난 것처럼 보이는 상태"를 구분 못 하는 근본 문제 자체를 제거했다. `speaking_done`은 이제 quiz 관련 코드에서 완전히 빠지고(`launcher.py`의 다른 용도— inject_turn의 일반적인 "지금 안 말하는 중" 체크, idle_watcher 등 — 는 그대로 유지), quiz_tools.py는 turn_seq만 받는다.
+
+**하찮미 로봇 추측이 모호했던 문제도 같이 수정**: 실물 로그에서 로봇이 "귀여운 제 친구 같아요"처럼 사물 이름이 아닌 서술로 추측해서 사용자가 뭘 골랐는지 전혀 알 수 없었다는 피드백 + "사용자 대답에 대한 리액션이 확실하지 않아서 하찮미가 덜 느껴진다"는 피드백. `core/quiz_state.py`의 `_robot_guess_kickoff_text()`를 재작성: (1) 사용자 답변을 그대로 언급하며 확실하게 반응하도록 구체화, (2) 로봇 자신의 추측은 **반드시 구체적이고 명확한 사물 이름 하나**여야 한다고 명시(반례 "귀여운 제 친구"/"동그란 무언가" 직접 금지, 예시 "음료수 캔"/"빗자루" 제시), (3) 정확히 "정답을 확인해볼까요?"로 말을 마치도록 통일.
+
+**검증**: `core/quiz_state.py`/`core/quiz_tools.py`/`launcher.py` 전부 `py_compile` 통과. `scripts/test_quiz_state.py`(53개 케이스, pending_reveal_speech/final_wrapup_prompt 검증 추가)와 `scripts/test_quiz_tools.py`(55개 케이스, `speaking_done` 기반 가짜 이벤트를 `turn_seq` ticker로 교체하고 침묵 응답/지연 주입 검증 추가) 전부 재작성 후 통과. `scripts/test_quiz_bank.py`/`scripts/test_snore_clip.py`도 회귀 없음 확인. **실물 로봇 확인 필요** — 이번엔 정말로 정답 이미지가 로봇이 반응을 다 말한 뒤(또는 반응과 거의 동시에, 반응은 이미지가 뜬 다음에 시작)에 나오는지, 하찮미 모드에서 로봇의 추측이 구체적인 사물 이름으로 들리는지, 사용자 답변에 대한 반응이 확실하게 느껴지는지 세 모드 다 확인할 것.
+
+### 38단계 — 36단계 재연결 기능이 실물에서 즉시 크래시하던 버그 수정: transparent는 Gemini API 미지원 (2026-08-08)
+
+36단계에서 붙인 `session_resumption=SessionResumptionConfig(transparent=True, handle=...)`를 실물로 처음 돌리자마자 최초 연결(`client.aio.live.connect()`)부터 `ValueError: transparent parameter is not supported in Gemini API.`로 즉시 크래시. 원인은 `transparent`가 Vertex AI 전용 옵션이라, `genai.Client(api_key=...)`로 만드는 Gemini 개발자 API 클라이언트(이 프로젝트가 쓰는 유일한 경로)에서는 SDK가 그 필드를 값과 무관하게(`None`이 아니기만 하면 True든 False든) 곧장 거부하도록 짜여 있었던 것 — 36단계 작업 당시 SDK 필드 존재만 확인하고 실제 API 경로별 지원 여부는 확인하지 않았던 게 원인.
+
+**수정**: `SessionResumptionConfig(handle=resumption_handle["value"])`로 `transparent` 자체를 아예 안 넘기도록 변경(`launcher.py`). `handle` 기반 재개는 Gemini API에서도 지원되므로 36단계의 재연결 취지(GoAway 시 handle로 이어붙이기)는 그대로 유효 — 다만 transparent가 없으면 서버가 `last_consumed_client_message_index`를 안 보내주므로, 재연결 시 아주 짧은 구간(마지막 handle 이후 클라이언트가 보낸 오디오 일부)이 유실될 수 있음(투명하지 않은 일반 재개의 알려진 트레이드오프, 크래시보다는 훨씬 나음).
+
+**검증**: `python -c`로 `_SessionResumptionConfig_to_mldev`에 `handle=None`/`handle="abc123"` 둘 다 직접 넣어 더 이상 예외가 안 남을 확인, `py_compile` 통과, `scripts/test_snore_clip.py`(launcher.py를 import하는 유일한 오프라인 테스트) 재통과. **재연결 로직 자체(GoAway 상황)는 여전히 실물 확인 필요** — 이번 수정으로 최소한 최초 연결부터 죽는 문제는 없어졌을 것으로 예상.
+
+### 37단계 — 정답 공개가 로봇이 말하기도 전에 뜨던 근본 원인 수정 (2026-08-07)
+
+사용자 요청: 1(척척박사)/2(하찮미)/3(짜증유발) 세 모드 전반에 걸쳐 퀴즈 화면과 로봇 발화의 싱크(정답이 너무 일찍/늦게 뜨지 않고, 로봇이 하는 말에 맞춰 넘어가는지)를 다시 점검해달라는 요청. 코드를 다시 읽다가 `core/quiz_tools.py`의 `_delayed_reveal_and_advance()`에서 실제로 동작하지 않고 있던 버그를 발견함.
+
+**원인**: 이 함수는 `await speaking_done.wait()`로 "이번 응답을 로봇이 다 말할 때까지" 기다린 뒤에야 정답 사진을 띄우도록 설계돼 있었다(주석에 그 의도가 이미 적혀 있었음). 그런데 이 함수가 시작되는 시점(툴 호출 직후)엔 **이번 응답의 오디오가 아직 한 청크도 도착 전**이라, `speaking_done`은 직전 턴이 끝난 뒤로 계속 set(=True)인 상태 그대로다 — `launcher.py`의 `recv_loop`는 실제 오디오 청크(`message.data`)가 도착해야만 clear하기 때문이다. 즉 `wait()`가 "이번 응답이 끝나길" 기다리는 게 아니라 그냥 즉시 통과해버려서, 의도한 동기화가 처음부터 실질적으로 동작하지 않고 있었다 — 정답 사진이 로봇이 말을 시작하기도 전에(또는 말하는 도중) 뜨는 사고의 근본 원인. `submit_guess()`를 통해 이 함수가 트리거되는 경로는 모드 무관(all_knowing의 즉시 채점, imperfect의 로봇-사용자 추측 비교 공개, annoying의 포기 시 정답 공개) 전부 공유하므로 세 모드 다 같은 결함을 안고 있었음.
+
+**수정**: `speaking_done.clear()`를 `wait()` 바로 앞에 강제로 추가(`core/quiz_tools.py`). 이러면 곧 도착할 이번 응답의 오디오(또는 오디오가 없더라도 반드시 오는 turn_complete)가 최소 한 번은 clear→set 사이클을 만들게 되어, `wait()`가 실제로 "이번 턴이 끝날 때까지"를 기다리게 된다. `inject_turn()`(퀴즈 힌트턴/다음 문제 안내)의 기존 `speaking_done.wait()`는 이미 실제 침묵 구간(10~12초 스톨, REVEAL_HOLD_SEC 이후)에서만 호출돼 원래도 정상 동작이었으므로 건드리지 않음 — 이 함수 하나만의 결함이었다.
+
+**검증**: `scripts/test_quiz_tools.py`의 `speaking_done`이 지금까지 계속 set인 채로 방치돼 있어서(오디오 시뮬레이션을 안 하니 굳이 건드릴 필요가 없었던 것) 수정 직후 대부분의 reveal 관련 테스트가 무한 대기로 깨짐 — `_auto_finish_speech()`(신규, clear를 감지하면 20ms 뒤 다시 set해 "짧게 말하고 끝냄"을 흉내내는 백그라운드 태스크)를 테스트에 추가해 실제 recv_loop의 clear→set 사이클을 흉내내도록 보강. 전체 53개 케이스(기존 회귀 포함) 통과, `test_quiz_state.py`/`test_quiz_bank.py`도 재통과. **실물 로봇 확인 필요** — 특히 정답 공개 사진이 이제 로봇의 "정답은 ~입니다" 류 발화가 실제로 끝난 뒤에 뜨는지(체감상 살짝 늦어질 수 있음, 의도된 지연), 세 모드 모두에서 확인할 것.
+
+### 36단계 — Live API 세션 시간 제한(GoAway) 대응: session_resumption 재연결 (2026-08-07)
+
+실물 테스트 중 3단계(짜증유발) 진행 후반부에서 launcher.py 전체가 죽는 사고가 실제로 재현됨 — 참가자가 "그만하자"며 포기해 정답 공개 턴이 나가려는 순간
+`websockets.exceptions.ConnectionClosedError: received 1008 (policy violation) ... failed to close the connection after receiving a GoAway signal`로 크래시. 이건 2026-08-07 앞선 세션에서 "실험하는 데 큰 지장 없으니 고치지 말자"고 보류해뒀던 로봇 본체 잠재 이슈 ①(Live API 연결 끊김/세션 시간 제한 시 재연결 없음)이 실제로 터진 것 — 한 세션 안에서 3모드 퀴즈를 연속 진행하는 실험 운영 방식(§quiz-experiment-design 참고) 때문에 대화가 길어져 세션 시간 제한에 걸리기 쉬웠던 것으로 보임.
+
+**원인**: Live API는 세션 지속시간이 얼마 안 남으면 서버가 먼저 `go_away`(GoAway) 메시지로 알려주는데, `launcher.py`가 이 신호에 아무 반응을 안 하고 있었다 — 결국 서버가 강제로 연결을 끊고(1008), 그 예외가 `recv_loop`에서 `asyncio.gather`를 타고 전파되어 `run_conversation()` 전체가 죽었다(KeyboardInterrupt가 아니므로 `main()`의 except도 못 잡고 트레이스백과 함께 프로세스 종료 — 다만 `finally`는 예외 종류와 무관하게 항상 실행되므로 대화록/퀴즈 결과 저장(31단계) 자체는 이번에도 정상적으로 됐음, 사라진 건 "그 이후로 계속 대화하는 능력"뿐).
+
+**수정**: `launcher.py`에 `session_resumption`(transparent) 기반 재연결 도입.
+- `connection_manager()` 신설 — `client.aio.live.connect()`를 while 루프로 감싸, `LiveConnectConfig(session_resumption=SessionResumptionConfig(transparent=True, handle=...))`로 연결. `recv_loop`가 `session_resumption_update` 메시지(resumable=True일 때만)를 받을 때마다 최신 handle을 저장해두고, 다음 재연결 때 그 handle을 실어 보내 서버가 대화 맥락을 최대한 이어붙이게 한다.
+- `recv_loop`가 `go_away` 메시지를 보면 강제종료를 기다리지 않고 즉시 `_SessionExpired`(신설 예외)를 raise — `connection_manager`가 이를 잡아 곧장 재연결한다. 진짜 예기치 않은 연결 끊김(`ConnectionClosed`)도 같은 방식으로 잡아 재연결(핸들이 없으면 새 세션으로라도 계속 — 대화 맥락은 끊기지만 크래시보다는 낫다는 판단).
+- mic/speaker/VoiceShifter/코골이 재생 등은 `connection_manager()` 바깥(대화 전체 스코프)에 남겨둬서 재연결 사이에도 계속 살아있게 하고, `send_loop`/`recv_loop`만 세션마다 새로 만든다. 재연결 시 이전 세션의 send/recv 태스크를 명시적으로 취소·정리(`finally`)해서, 새 세션의 `send_loop`가 mic 큐를 먼저 채가려는 이전 태스크와 경합하지 않게 함. 세션이 말하는 도중 끊기면 `speaking_done`이 영원히 clear된 채 남아 퀴즈 히든 턴 주입(`inject_turn`)이 무한 대기할 수 있어, 재연결 처리 시 항상 `speaking_done.set()`으로 풀어줌. 최초 연결에만 로봇이 먼저 인사하도록 트리거(재연결 시엔 생략 — 진행 중이던 대화에 또 "먼저 인사하라"고 지시하면 어색해짐).
+
+**검증**: `py_compile` 통과, `scripts/test_snore_clip.py`(launcher.py를 import하는 유일한 오프라인 테스트) 재통과. `session_resumption`은 `google-genai` SDK(1.61.0)가 필드로 지원함을 직접 확인. **재연결 로직 자체는 실물 로봇 + 실제 GoAway 상황이 있어야 검증 가능 — 다음 실물 테스트에서 긴 대화(3모드 연속 진행)를 다시 돌려 크래시 없이 재연결되는지, 재연결 메시지("🔄 세션 재연결됨")가 뜨는지, 재연결 후에도 대화 맥락이 자연스럽게 이어지는지 확인 필요.**
+
 ### 35단계 — 짜증유발 모드 거절 시퀀스에 THINKING 표정 삽입 (2026-08-07)
 
 사용자 요청: 짜증유발 모드가 답을 거절하기 전 "뜸들이는 동안"에는 THINKING 표정을, 실제로 거절 대사("저는 AI 로봇이라 그런 답변은 할 수 없습니다")를 말하는 순간에는 다시 NEUTRAL로 — "고민해봤지만 결국 기계적으로 거절"하는 서사를 표정으로도 드러냄. 확정 시퀀스: neutral(기본) → 답/힌트/풀어달라 요청 시 THINKING → 거절 대사 발화 직전(또는 포기로 정답 공개될 때) NEUTRAL 복귀.

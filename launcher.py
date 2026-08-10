@@ -30,6 +30,7 @@ import time
 import wave
 
 from dynamixel_sdk import PacketHandler, PortHandler
+from websockets.exceptions import ConnectionClosed
 
 _REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _REPO_ROOT)
@@ -60,6 +61,13 @@ from media.voice_shift import (
 )
 from vision import face as F
 from vision.vision_brain import RobotBrain
+
+class _SessionExpired(Exception):
+    """Live API가 GoAway(세션 시간 제한 임박)를 보내오면 raise해서 asyncio.gather에
+    묶인 send_loop/recv_loop를 한번에 취소시키는 내부 흐름제어용 신호(2026-08-07 —
+    실제 실험 중 GoAway 이후 강제종료(1008)로 launcher.py 전체가 죽는 사고가 나서 대응).
+    바깥의 재연결 루프가 이 예외를 받으면 session_resumption 핸들로 새 세션을 연다."""
+
 
 LIVE_MODEL = os.getenv("LIVE_MODEL_NAME", "models/gemini-3.1-flash-live-preview")
 # 퀴즈 모드가 히든 턴을 주입(inject_turn)할 때, 로봇이 아직 이전 턴을 말하는 도중이면 곧장
@@ -177,6 +185,12 @@ async def run_conversation(name_state: dict, facts_summary: str | None, emotion_
     # 유일한 신호. 초기값은 set(아직 아무도 말하지 않음).
     speaking_done = asyncio.Event()
     speaking_done.set()
+    # turn_seq[0]은 로봇의 턴이 끝날 때마다(turn_complete 또는 interrupted) 1씩 증가한다 —
+    # core/quiz_tools.py가 "지금 이 시점 이후로 턴이 몇 번 끝났는지"를 baseline과 비교해
+    # 정확히 판단하는 데 쓴다(speaking_done 같은 단일 Event는 "이미 끝난 상태"와 "아직
+    # 시작 전이라 우연히 끝난 것처럼 보이는 상태"를 구분 못 해, 정답 공개 이미지가 로봇이
+    # 말하기도 전에 뜨는 경합이 있었다 — 2026-08-08, core/quiz_tools.py 참고).
+    turn_seq = [0]
 
     async def inject_turn(text: str):
         s = session_holder["session"]
@@ -215,7 +229,7 @@ async def run_conversation(name_state: dict, facts_summary: str | None, emotion_
         (start_quiz, select_quiz_mode, submit_guess, request_hint, end_quiz_early,
          quiz_session) = make_quiz_tools(
             quiz_ui_q, quiz_busy or threading.Event(), quiz_motion_ctx, inject_turn, loop,
-            speaking_done, emotion_queue=emotion_queue, num_questions=quiz_num_questions,
+            turn_seq, emotion_queue=emotion_queue, num_questions=quiz_num_questions,
         )
         for quiz_tool_fn in (start_quiz, select_quiz_mode, submit_guess, request_hint, end_quiz_early):
             tools.append(quiz_tool_fn)
@@ -229,19 +243,6 @@ async def run_conversation(name_state: dict, facts_summary: str | None, emotion_
     tools.append(set_emotion)
     tool_fns["set_emotion"] = set_emotion
 
-    config = types.LiveConnectConfig(
-        response_modalities=[types.Modality.AUDIO],
-        output_audio_transcription=types.AudioTranscriptionConfig(),
-        input_audio_transcription=types.AudioTranscriptionConfig(),
-        system_instruction=build_persona_system_instruction(name=name_state["name"], facts_summary=facts_summary),
-        tools=tools,
-        speech_config=types.SpeechConfig(
-            voice_config=types.VoiceConfig(
-                prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name=LIVE_VOICE_NAME)
-            )
-        ),
-    )
-
     # history_out이 주어지면 그 리스트에 직접 누적한다 — 세션이 Ctrl+C로 끊겨도
     # 호출자가 그때까지의 턴 기록을 그대로 들고 있게 하기 위함(위 docstring 참고).
     session_history: list[str] = history_out if history_out is not None else []
@@ -253,197 +254,296 @@ async def run_conversation(name_state: dict, facts_summary: str | None, emotion_
     # 엔진 하나를 만들어 마이크/스피커 콜백이 공유한다. ENABLE_AEC=false로 끌 수 있다.
     echo_canceller = EchoCanceller() if ENABLE_AEC else None
 
-    async with client.aio.live.connect(model=LIVE_MODEL, config=config) as session:
-        session_holder["session"] = session
-        with MicStreamer(loop, echo_canceller=echo_canceller) as mic, Speaker(echo_canceller=echo_canceller) as speaker:
-            # Fenrir 프리셋은 여전히 성인 성우 음색이라, 재생 직전에 피치+포먼트를 시프트해
-            # 더 앳된 톤으로 바꾼다(media/voice_shift.py). 버퍼링 때문에 발화 시작마다
-            # ~0.5~0.8초 지연이 추가되지만, 스트리밍 자체가 계속 밀리지는 않는다.
-            shifter = VoiceShifter(speaker.play, sample_rate=OUTPUT_RATE) if ENABLE_VOICE_SHIFT else None
-            if shifter:
-                shifter.start()
+    # session_resumption 핸들 — GoAway/연결끊김으로 재연결할 때 이 값을 넘기면 서버가
+    # 대화 맥락을 최대한 이어붙여준다(session_resumption_update 메시지로 주기적으로
+    # 갱신됨, transparent=True). None이면(최초 연결이거나 핸들을 한 번도 못 받은 채
+    # 끊긴 경우) 새 세션으로 시작한다 — 대화 맥락은 끊기지만 launcher.py 전체가
+    # 죽는 것보단 낫다(2026-08-07, 아래 connection_manager 참고).
+    resumption_handle = {"value": None}
+    greeted = {"value": False}
 
-            # SLEEPY 배경음 — API를 다시 부르지 않고 캐시된 클립만 읽는다(_load_snore_clip
-            # 참고). 파일이 없으면 (None, None)이라 snore_player()가 그냥 아무것도 안 함.
-            snore_pcm, snore_duration_sec = _load_snore_clip()
+    with MicStreamer(loop, echo_canceller=echo_canceller) as mic, Speaker(echo_canceller=echo_canceller) as speaker:
+        # Fenrir 프리셋은 여전히 성인 성우 음색이라, 재생 직전에 피치+포먼트를 시프트해
+        # 더 앳된 톤으로 바꾼다(media/voice_shift.py). 버퍼링 때문에 발화 시작마다
+        # ~0.5~0.8초 지연이 추가되지만, 스트리밍 자체가 계속 밀리지는 않는다.
+        shifter = VoiceShifter(speaker.play, sample_rate=OUTPUT_RATE) if ENABLE_VOICE_SHIFT else None
+        if shifter:
+            shifter.start()
 
-            turn_user, turn_moti = [], []
-            # idle_watcher()와 recv_loop() 둘 다 읽고/쓰는 공유 상태라 nonlocal 없이
-            # 클로저에서 갱신 가능하도록 리스트(가변 컨테이너)로 감싼다(core/quiz_tools.py의
-            # _pending_stall 딕셔너리 패턴과 같은 이유). "활동"은 사용자 발화뿐 아니라
-            # 로봇이 말하는 중(오디오 청크 도착)이거나 제스처/춤/퀴즈 리액션 모션을
-            # 실행 중인(quiz_busy가 곧 motion_busy) 경우도 포함한다 — 로봇이 뭔가
-            # 하고 있는 동안은 사용자가 IDLE_SLEEP_SEC만큼 조용해도 잠들면 안 된다는 요구사항.
-            last_activity_time = [time.monotonic()]
-            is_sleeping = [False]
+        # SLEEPY 배경음 — API를 다시 부르지 않고 캐시된 클립만 읽는다(_load_snore_clip
+        # 참고). 파일이 없으면 (None, None)이라 snore_player()가 그냥 아무것도 안 함.
+        snore_pcm, snore_duration_sec = _load_snore_clip()
 
-            # Live API는 기본적으로 사용자 입력을 기다렸다가 응답한다 — 로봇이 먼저 인사를
-            # 건네게 하려면 연결 직후 텍스트 턴을 하나 보내 말문을 열어줘야 한다(공식 가이드
-            # 권장 패턴). 오디오 경로가 아니라 input_transcription에도 안 잡힌다.
-            await session.send_client_content(
-                turns=types.Content(
-                    role="user",
-                    parts=[types.Part(text="(방금 사용자가 로봇 앞에 도착했습니다. 사용자가 말하기를 기다리지 말고, 당신이 먼저 자연스럽게 인사를 건네며 대화를 시작하세요.)")],
-                ),
-                turn_complete=True,
-            )
+        turn_user, turn_moti = [], []
+        # idle_watcher()와 recv_loop() 둘 다 읽고/쓰는 공유 상태라 nonlocal 없이
+        # 클로저에서 갱신 가능하도록 리스트(가변 컨테이너)로 감싼다(core/quiz_tools.py의
+        # _pending_stall 딕셔너리 패턴과 같은 이유). "활동"은 사용자 발화뿐 아니라
+        # 로봇이 말하는 중(오디오 청크 도착)이거나 제스처/춤/퀴즈 리액션 모션을
+        # 실행 중인(quiz_busy가 곧 motion_busy) 경우도 포함한다 — 로봇이 뭔가
+        # 하고 있는 동안은 사용자가 IDLE_SLEEP_SEC만큼 조용해도 잠들면 안 된다는 요구사항.
+        last_activity_time = [time.monotonic()]
+        is_sleeping = [False]
 
-            async def send_loop():
-                while not stop_event.is_set():
-                    try:
-                        chunk = await asyncio.wait_for(mic.queue.get(), timeout=0.5)
-                    except asyncio.TimeoutError:
-                        continue
-                    await session.send_realtime_input(
-                        audio=types.Blob(data=chunk, mime_type=f"audio/pcm;rate={INPUT_RATE}")
-                    )
+        async def connection_manager():
+            """Live 세션을 열고 send/recv 루프를 돌린다. 세션 시간 제한이 다가오면
+            서버가 먼저 GoAway를 보내주는데, 여기 반응 안 하면 결국 서버가 강제로
+            연결을 끊어(1008 policy violation) websockets가 예외를 던지고, 그게
+            asyncio.gather를 타고 전파되어 launcher.py 전체가 죽는다 — 실제로
+            2026-08-07 실험 테스트 중 3단계(짜증유발) 진행 중 이 사고가 재현됐다.
+            GoAway를 받는 즉시(또는 예기치 않게 연결이 끊기면) session_resumption
+            핸들로 새 세션을 열어 이어간다 — mic/speaker/shifter 등은 이 함수 바깥
+            (run_conversation 스코프)에 있어 재연결 사이에도 계속 살아있다."""
+            while not stop_event.is_set():
+                config = types.LiveConnectConfig(
+                    response_modalities=[types.Modality.AUDIO],
+                    output_audio_transcription=types.AudioTranscriptionConfig(),
+                    input_audio_transcription=types.AudioTranscriptionConfig(),
+                    system_instruction=build_persona_system_instruction(
+                        name=name_state["name"], facts_summary=facts_summary),
+                    tools=tools,
+                    speech_config=types.SpeechConfig(
+                        voice_config=types.VoiceConfig(
+                            prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name=LIVE_VOICE_NAME)
+                        )
+                    ),
+                    # transparent=True는 Vertex AI 전용 옵션 — Gemini 개발자 API
+                    # (genai.Client(api_key=...), 이 프로젝트가 쓰는 경로)에 그 필드를
+                    # 넣으면 SDK가 곧장 ValueError를 던진다(2026-08-08, 실물 테스트로
+                    # 발견: "transparent parameter is not supported in Gemini API.").
+                    # handle만 넘겨도 재개 자체는 동작한다(last_consumed_client_message_index
+                    # 없이도 handle 기반 재개는 지원됨) — 다만 transparent가 없으면 그
+                    # 인덱스가 안 와서 recv_loop의 resumable 체크 없이도 그냥 최신 handle을
+                    # 계속 저장해두면 된다(아래 참고).
+                    session_resumption=types.SessionResumptionConfig(
+                        handle=resumption_handle["value"],
+                    ),
+                )
+                try:
+                    async with client.aio.live.connect(model=LIVE_MODEL, config=config) as session:
+                        session_holder["session"] = session
 
-            async def recv_loop():
-                # session.receive()는 턴 하나짜리 스트림이라 턴이 끝나면 for문이 종료된다.
-                # 다음 턴을 계속 받으려면 stop_event가 설 때까지 receive()를 다시 호출해야 한다.
-                while not stop_event.is_set():
-                    async for message in session.receive():
-                        sc = message.server_content
-                        if sc and sc.interrupted:
-                            speaker.stop_immediately()
-                            if shifter:
-                                shifter.reset()
-                            # 재생을 강제로 끊었으니(barge-in 등) 더 이상 "말하는 중"이 아니다 —
-                            # inject_turn()이 여기서 계속 기다리며 멈춰있지 않게 한다.
-                            speaking_done.set()
+                        if not greeted["value"]:
+                            # Live API는 기본적으로 사용자 입력을 기다렸다가 응답한다 —
+                            # 로봇이 먼저 인사를 건네게 하려면 연결 직후 텍스트 턴을 하나
+                            # 보내 말문을 열어줘야 한다(공식 가이드 권장 패턴). 재연결
+                            # 때는 다시 보내지 않는다 — 이미 진행 중이던 대화를 또
+                            # "먼저 인사하라"고 지시하면 어색해진다.
+                            await session.send_client_content(
+                                turns=types.Content(
+                                    role="user",
+                                    parts=[types.Part(text="(방금 사용자가 로봇 앞에 도착했습니다. 사용자가 말하기를 기다리지 말고, 당신이 먼저 자연스럽게 인사를 건네며 대화를 시작하세요.)")],
+                                ),
+                                turn_complete=True,
+                            )
+                            greeted["value"] = True
+                        else:
+                            print("🔄 세션 재연결됨 — 대화를 계속합니다.")
 
-                        if message.data:
-                            if shifter:
-                                shifter.feed(message.data)
-                            else:
-                                speaker.play(message.data)
-                            # 로봇이 말하는 중 — 사용자가 조용히 듣고만 있어도 idle-sleep이
-                            # 끼어들면 안 되고, inject_turn()도 이 턴이 끝날 때까지 기다려야
-                            # 겹쳐 말하지 않는다(2026-07-30).
-                            last_activity_time[0] = time.monotonic()
-                            speaking_done.clear()
-
-                        if sc and sc.input_transcription and sc.input_transcription.text:
-                            turn_user.append(sc.input_transcription.text)
-                            last_activity_time[0] = time.monotonic()
-                        if sc and sc.output_transcription and sc.output_transcription.text:
-                            turn_moti.append(sc.output_transcription.text)
-
-                        if message.tool_call:
-                            responses = []
-                            for fc in message.tool_call.function_calls:
-                                fn = tool_fns.get(fc.name)
+                        async def send_loop():
+                            while not stop_event.is_set():
                                 try:
-                                    result = fn(**(fc.args or {})) if fn else f"unknown tool {fc.name}"
-                                except Exception as e:
-                                    # 2026-07-31 코드 리뷰로 발견: 여기서 예외가 나면(툴 구현
-                                    # 버그, 모델이 잘못된 인자를 준 경우 등) asyncio.gather를
-                                    # 통해 전파되어 세션 전체가 죽고, session_history/quiz_log가
-                                    # 빈 채로 남아 대화록·결과지·퀴즈 결과가 통째로 유실됐다
-                                    # (물리적 안전 정리는 launcher.py의 finally가 여전히 실행
-                                    # 하므로 모터 쪽은 안전함 — 유실되는 건 연구/대화 데이터).
-                                    # 툴 하나의 실패를 그 자리에서 흡수해 세션이 계속되게 한다.
-                                    print(f"❌ 툴 호출 실패: {fc.name}({fc.args}) -> {e!r}")
-                                    result = f"tool call failed: {e}"
-                                print(f"\n  🔧 {fc.name}({fc.args}) -> {result}")
-                                responses.append(
-                                    types.FunctionResponse(id=fc.id, name=fc.name, response={"result": result})
+                                    chunk = await asyncio.wait_for(mic.queue.get(), timeout=0.5)
+                                except asyncio.TimeoutError:
+                                    continue
+                                await session.send_realtime_input(
+                                    audio=types.Blob(data=chunk, mime_type=f"audio/pcm;rate={INPUT_RATE}")
                                 )
-                            await session.send_tool_response(function_responses=responses)
 
-                        if sc and sc.turn_complete:
-                            if shifter:
-                                # 버퍼 임계값(기본 500ms) 미만으로 남은 발화 꼬리를 흘려보낸다
-                                # — 안 하면 매 턴 마지막 조각이 조용히 잘려나간다.
-                                shifter.flush()
-                            # 서버가 이 턴의 생성을 끝냈다 — inject_turn()이 기다리고 있었다면
-                            # 이제 진행해도 된다(POST_SPEECH_DRAIN_SEC만큼 더 기다려 로컬
-                            # 버퍼/재생 꼬리까지 흘려보낸 뒤 다음 턴을 보낸다).
-                            speaking_done.set()
-                            u = "".join(turn_user).strip()
-                            m_raw = "".join(turn_moti).strip()
-                            m_clean, should_end = extract_exit_tag(m_raw)
-                            if u or m_clean:
-                                session_history.append(f"User: {u} | Moti: {m_clean}")
-                                print(f"\n[나] {u}\n[모티] {m_clean}")
-                            turn_user.clear()
-                            turn_moti.clear()
-                            if should_end:
-                                print("\n👋 [대화종료] 감지 — 세션을 마칩니다.")
-                                stop_event.set()
-                                break
-                        if stop_event.is_set():
-                            break
+                        async def recv_loop():
+                            # session.receive()는 턴 하나짜리 스트림이라 턴이 끝나면 for문이
+                            # 종료된다. 다음 턴을 계속 받으려면 stop_event가 설 때까지
+                            # receive()를 다시 호출해야 한다.
+                            while not stop_event.is_set():
+                                async for message in session.receive():
+                                    if (message.session_resumption_update
+                                            and message.session_resumption_update.resumable):
+                                        # 서버가 주기적으로 "여기까지는 재개 가능"이라는
+                                        # 체크포인트를 보내준다 — 다음 재연결 때 이 값을 쓴다.
+                                        resumption_handle["value"] = message.session_resumption_update.new_handle
 
-            async def idle_watcher():
-                """기본 대화 상태(퀴즈 제외)에서 IDLE_SLEEP_SEC 동안 아무 활동도 없으면
-                SLEEPY로 전환하고 팬/틸트 추적을 멈춘다(shared_state['mode']='sleeping' —
-                vision/face.py가 'tracking'이 아닌 모드는 추적을 자동으로 건너뜀, 퀴즈 모드의
-                시선회피 모션과 같은 방식). "활동"은 사용자 발화뿐 아니라 로봇이 말하는 중
-                (recv_loop의 message.data 처리부에서 갱신)이거나 제스처/춤/퀴즈 리액션 모션을
-                실행 중인 경우도 포함 — 로봇이 뭔가 하고 있으면 사용자가 조용해도 잠들면 안
-                된다는 요구사항(quiz_busy는 core/motion_tools.py/core/quiz_tools.py가 공유하는
-                busy 게이트라 Layer 1/2 제스처든 퀴즈 리액션이든 전부 여기서 잡힌다).
-                판단 자체는 core/idle_watcher.py의 순수 함수가 하고, 여기서는 그 결과에 따라
-                emotion_queue/shared_state만 건드린다. 사용자가 다시 말하기 시작하면
-                (quiz_session 진행 중이든 아니든 우선 깨움) 즉시 추적을 재개하고 AWAKENING을
-                한 번 보여준다 — WAKE 애니메이션(약 2.5초)이 끝나면 시각적으로 NEUTRAL과
-                동일해지므로(display/emotions/wake.py) 별도로 되돌릴 필요 없음(모델이 이어서
-                set_emotion을 부르면 그게 그대로 반영됨)."""
-                while not stop_event.is_set():
-                    await asyncio.sleep(IDLE_WATCHER_POLL_SEC)
-                    quiz_active = quiz_session is not None and quiz_session.active
-                    # 퀴즈 진행 중엔(문제를 오래 들여다보며 생각하는 조용한 구간 포함) 그
-                    # 자체를 활동으로 본다 — 안 그러면 사용자/로봇 둘 다 조용한 "생각하는
-                    # 시간"이 누적되다가, 퀴즈가 막 끝난 시점에 그 누적된 idle_for가 그대로
-                    # 남아 있어 곧바로(대기하던 타이머가) SLEEPY로 튀어버리는 사고가 났었음
-                    # (실측으로 재현: 퀴즈 종료 직후 즉시 sleepy 전환).
-                    if quiz_active or (quiz_busy is not None and quiz_busy.is_set()):
-                        last_activity_time[0] = time.monotonic()
-                    idle_for = time.monotonic() - last_activity_time[0]
-                    action = decide_idle_action(idle_for, is_sleeping[0], quiz_active)
+                                    if message.go_away:
+                                        # 강제종료를 기다리지 않고 지금 먼저 재연결한다 —
+                                        # 위 connection_manager 독스트링 참고.
+                                        print(f"⏳ 세션 종료 임박(GoAway, 남은 시간 {message.go_away.time_left}) "
+                                              f"— 재연결합니다...")
+                                        raise _SessionExpired()
 
-                    if action == "wake":
-                        is_sleeping[0] = False
-                        print("👀 사용자 발화 감지 — 깨어납니다.")
-                        if shared_state is not None:
-                            shared_state['mode'] = 'tracking'
-                        emotion_queue.put("AWAKENING")
-                        # 코골이 소리가 재생/대기 중이었다면 즉시 끊는다 — snore_player()의
-                        # 다음 폴링을 기다리면(최대 SNORE_POLL_SEC) 깬 직후에도 잠깐 더
-                        # 들릴 수 있어서, 깨우는 시점에 확실하게 끊어준다.
-                        speaker.stop_immediately()
-                    elif action == "sleep":
-                        is_sleeping[0] = True
-                        print(f"💤 {IDLE_SLEEP_SEC:.0f}초간 조용해서 sleepy 상태로 전환합니다.")
-                        if shared_state is not None:
-                            shared_state['mode'] = 'sleeping'
-                        emotion_queue.put("SLEEPY")
+                                    sc = message.server_content
+                                    if sc and sc.interrupted:
+                                        speaker.stop_immediately()
+                                        if shifter:
+                                            shifter.reset()
+                                        # 재생을 강제로 끊었으니(barge-in 등) 더 이상 "말하는 중"이 아니다 —
+                                        # inject_turn()이 여기서 계속 기다리며 멈춰있지 않게 한다.
+                                        speaking_done.set()
+                                        turn_seq[0] += 1
 
-            async def snore_player():
-                """SLEEPY인 동안 캐시된 코골이 클립을 SNORE_GAP_SEC 간격으로 반복 재생한다
-                ("드르렁... 쿠우..." 1초 정적 반복, 사용자 요청). 큰 통짜 sleep 대신
-                SNORE_POLL_SEC 단위로 쪼개 대기해야, 자는 도중 깨어났을 때(is_sleeping[0]이
-                False로 바뀔 때) 다음 재생 전에 빠르게 멈출 수 있다(추가로 idle_watcher의
-                wake 분기가 speaker.stop_immediately()로 즉시 끊기도 함)."""
-                if snore_pcm is None:
-                    return
-                while not stop_event.is_set():
-                    if not is_sleeping[0]:
-                        await asyncio.sleep(SNORE_POLL_SEC)
-                        continue
-                    speaker.play(snore_pcm)
-                    remaining = snore_duration_sec + SNORE_GAP_SEC
-                    while remaining > 0 and is_sleeping[0] and not stop_event.is_set():
-                        await asyncio.sleep(SNORE_POLL_SEC)
-                        remaining -= SNORE_POLL_SEC
+                                    if message.data:
+                                        if shifter:
+                                            shifter.feed(message.data)
+                                        else:
+                                            speaker.play(message.data)
+                                        # 로봇이 말하는 중 — 사용자가 조용히 듣고만 있어도 idle-sleep이
+                                        # 끼어들면 안 되고, inject_turn()도 이 턴이 끝날 때까지 기다려야
+                                        # 겹쳐 말하지 않는다(2026-07-30).
+                                        last_activity_time[0] = time.monotonic()
+                                        speaking_done.clear()
 
-            await asyncio.gather(send_loop(), recv_loop(), idle_watcher(), snore_player())
-            if shifter:
-                shifter.close()
-            if speaker.underrun_count:
-                print(f"⚠️ 스피커 언더런 {speaker.underrun_count}회, 총 {speaker.underrun_ms_total:.0f}ms 무음 재생됨 "
-                      f"— VoiceShifter 처리가 실시간을 못 따라간 신호. VOICE_SHIFT_BUFFER_MS를 늘려볼 것.")
+                                    if sc and sc.input_transcription and sc.input_transcription.text:
+                                        turn_user.append(sc.input_transcription.text)
+                                        last_activity_time[0] = time.monotonic()
+                                    if sc and sc.output_transcription and sc.output_transcription.text:
+                                        turn_moti.append(sc.output_transcription.text)
+
+                                    if message.tool_call:
+                                        responses = []
+                                        for fc in message.tool_call.function_calls:
+                                            fn = tool_fns.get(fc.name)
+                                            try:
+                                                result = fn(**(fc.args or {})) if fn else f"unknown tool {fc.name}"
+                                            except Exception as e:
+                                                # 2026-07-31 코드 리뷰로 발견: 여기서 예외가 나면(툴 구현
+                                                # 버그, 모델이 잘못된 인자를 준 경우 등) asyncio.gather를
+                                                # 통해 전파되어 세션 전체가 죽고, session_history/quiz_log가
+                                                # 빈 채로 남아 대화록·결과지·퀴즈 결과가 통째로 유실됐다
+                                                # (물리적 안전 정리는 launcher.py의 finally가 여전히 실행
+                                                # 하므로 모터 쪽은 안전함 — 유실되는 건 연구/대화 데이터).
+                                                # 툴 하나의 실패를 그 자리에서 흡수해 세션이 계속되게 한다.
+                                                print(f"❌ 툴 호출 실패: {fc.name}({fc.args}) -> {e!r}")
+                                                result = f"tool call failed: {e}"
+                                            print(f"\n  🔧 {fc.name}({fc.args}) -> {result}")
+                                            responses.append(
+                                                types.FunctionResponse(id=fc.id, name=fc.name, response={"result": result})
+                                            )
+                                        await session.send_tool_response(function_responses=responses)
+
+                                    if sc and sc.turn_complete:
+                                        if shifter:
+                                            # 버퍼 임계값(기본 500ms) 미만으로 남은 발화 꼬리를 흘려보낸다
+                                            # — 안 하면 매 턴 마지막 조각이 조용히 잘려나간다.
+                                            shifter.flush()
+                                        # 서버가 이 턴의 생성을 끝냈다 — inject_turn()이 기다리고 있었다면
+                                        # 이제 진행해도 된다(POST_SPEECH_DRAIN_SEC만큼 더 기다려 로컬
+                                        # 버퍼/재생 꼬리까지 흘려보낸 뒤 다음 턴을 보낸다).
+                                        speaking_done.set()
+                                        turn_seq[0] += 1
+                                        u = "".join(turn_user).strip()
+                                        m_raw = "".join(turn_moti).strip()
+                                        m_clean, should_end = extract_exit_tag(m_raw)
+                                        if u or m_clean:
+                                            session_history.append(f"User: {u} | Moti: {m_clean}")
+                                            print(f"\n[나] {u}\n[모티] {m_clean}")
+                                        turn_user.clear()
+                                        turn_moti.clear()
+                                        if should_end:
+                                            print("\n👋 [대화종료] 감지 — 세션을 마칩니다.")
+                                            stop_event.set()
+                                            break
+                                    if stop_event.is_set():
+                                        break
+
+                        send_task = asyncio.create_task(send_loop())
+                        recv_task = asyncio.create_task(recv_loop())
+                        try:
+                            await asyncio.gather(send_task, recv_task)
+                        finally:
+                            # 둘 중 하나가 먼저 끝나면(재연결 필요 등) 나머지 하나가 계속
+                            # 살아남아 다음 반복의 mic.queue를 먼저 채가는 경합을 막는다 —
+                            # mic/speaker는 반복(재연결) 사이에도 계속 살아있는 공유 자원이라
+                            # (위 connection_manager 독스트링 참고) 이전 태스크를 확실히
+                            # 정리하고 넘어가야 한다.
+                            for t in (send_task, recv_task):
+                                if not t.done():
+                                    t.cancel()
+                            await asyncio.gather(send_task, recv_task, return_exceptions=True)
+                except _SessionExpired:
+                    # 끊긴 세션의 turn_complete/interrupted는 다시 오지 않는다 — 로봇이
+                    # 말하는 도중 끊겼다면 speaking_done이 clear된 채로 영영 안 풀려서
+                    # inject_turn()(퀴즈 히든 턴)이 무한정 멈춰있을 수 있으므로 풀어준다.
+                    # turn_seq도 같은 이유로 올려서, core/quiz_tools.py의
+                    # _wait_for_turn_after()가 다시는 안 올 turn_complete를 무한정
+                    # 기다리지 않게 한다.
+                    speaking_done.set()
+                    turn_seq[0] += 1
+                    continue
+                except ConnectionClosed as e:
+                    if stop_event.is_set():
+                        break
+                    speaking_done.set()
+                    turn_seq[0] += 1
+                    handle_note = "재개 핸들로" if resumption_handle["value"] else "핸들 없이 새 세션으로"
+                    print(f"⚠️ 세션 연결이 예기치 않게 끊겼습니다({e!r}) — {handle_note} 재연결 시도...")
+                    continue
+
+        async def idle_watcher():
+            """기본 대화 상태(퀴즈 제외)에서 IDLE_SLEEP_SEC 동안 아무 활동도 없으면
+            SLEEPY로 전환하고 팬/틸트 추적을 멈춘다(shared_state['mode']='sleeping' —
+            vision/face.py가 'tracking'이 아닌 모드는 추적을 자동으로 건너뜀, 퀴즈 모드의
+            시선회피 모션과 같은 방식). "활동"은 사용자 발화뿐 아니라 로봇이 말하는 중
+            (recv_loop의 message.data 처리부에서 갱신)이거나 제스처/춤/퀴즈 리액션 모션을
+            실행 중인 경우도 포함 — 로봇이 뭔가 하고 있으면 사용자가 조용해도 잠들면 안
+            된다는 요구사항(quiz_busy는 core/motion_tools.py/core/quiz_tools.py가 공유하는
+            busy 게이트라 Layer 1/2 제스처든 퀴즈 리액션이든 전부 여기서 잡힌다).
+            판단 자체는 core/idle_watcher.py의 순수 함수가 하고, 여기서는 그 결과에 따라
+            emotion_queue/shared_state만 건드린다. 사용자가 다시 말하기 시작하면
+            (quiz_session 진행 중이든 아니든 우선 깨움) 즉시 추적을 재개하고 AWAKENING을
+            한 번 보여준다 — WAKE 애니메이션(약 2.5초)이 끝나면 시각적으로 NEUTRAL과
+            동일해지므로(display/emotions/wake.py) 별도로 되돌릴 필요 없음(모델이 이어서
+            set_emotion을 부르면 그게 그대로 반영됨)."""
+            while not stop_event.is_set():
+                await asyncio.sleep(IDLE_WATCHER_POLL_SEC)
+                quiz_active = quiz_session is not None and quiz_session.active
+                # 퀴즈 진행 중엔(문제를 오래 들여다보며 생각하는 조용한 구간 포함) 그
+                # 자체를 활동으로 본다 — 안 그러면 사용자/로봇 둘 다 조용한 "생각하는
+                # 시간"이 누적되다가, 퀴즈가 막 끝난 시점에 그 누적된 idle_for가 그대로
+                # 남아 있어 곧바로(대기하던 타이머가) SLEEPY로 튀어버리는 사고가 났었음
+                # (실측으로 재현: 퀴즈 종료 직후 즉시 sleepy 전환).
+                if quiz_active or (quiz_busy is not None and quiz_busy.is_set()):
+                    last_activity_time[0] = time.monotonic()
+                idle_for = time.monotonic() - last_activity_time[0]
+                action = decide_idle_action(idle_for, is_sleeping[0], quiz_active)
+
+                if action == "wake":
+                    is_sleeping[0] = False
+                    print("👀 사용자 발화 감지 — 깨어납니다.")
+                    if shared_state is not None:
+                        shared_state['mode'] = 'tracking'
+                    emotion_queue.put("AWAKENING")
+                    # 코골이 소리가 재생/대기 중이었다면 즉시 끊는다 — snore_player()의
+                    # 다음 폴링을 기다리면(최대 SNORE_POLL_SEC) 깬 직후에도 잠깐 더
+                    # 들릴 수 있어서, 깨우는 시점에 확실하게 끊어준다.
+                    speaker.stop_immediately()
+                elif action == "sleep":
+                    is_sleeping[0] = True
+                    print(f"💤 {IDLE_SLEEP_SEC:.0f}초간 조용해서 sleepy 상태로 전환합니다.")
+                    if shared_state is not None:
+                        shared_state['mode'] = 'sleeping'
+                    emotion_queue.put("SLEEPY")
+
+        async def snore_player():
+            """SLEEPY인 동안 캐시된 코골이 클립을 SNORE_GAP_SEC 간격으로 반복 재생한다
+            ("드르렁... 쿠우..." 1초 정적 반복, 사용자 요청). 큰 통짜 sleep 대신
+            SNORE_POLL_SEC 단위로 쪼개 대기해야, 자는 도중 깨어났을 때(is_sleeping[0]이
+            False로 바뀔 때) 다음 재생 전에 빠르게 멈출 수 있다(추가로 idle_watcher의
+            wake 분기가 speaker.stop_immediately()로 즉시 끊기도 함)."""
+            if snore_pcm is None:
+                return
+            while not stop_event.is_set():
+                if not is_sleeping[0]:
+                    await asyncio.sleep(SNORE_POLL_SEC)
+                    continue
+                speaker.play(snore_pcm)
+                remaining = snore_duration_sec + SNORE_GAP_SEC
+                while remaining > 0 and is_sleeping[0] and not stop_event.is_set():
+                    await asyncio.sleep(SNORE_POLL_SEC)
+                    remaining -= SNORE_POLL_SEC
+
+        await asyncio.gather(connection_manager(), idle_watcher(), snore_player())
+        if shifter:
+            shifter.close()
+        if speaker.underrun_count:
+            print(f"⚠️ 스피커 언더런 {speaker.underrun_count}회, 총 {speaker.underrun_ms_total:.0f}ms 무음 재생됨 "
+                  f"— VoiceShifter 처리가 실시간을 못 따라간 신호. VOICE_SHIFT_BUFFER_MS를 늘려볼 것.")
 
     return session_history
 

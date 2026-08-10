@@ -22,6 +22,23 @@ VALID_MODES = ("all_knowing", "imperfect", "annoying")
 # core/quiz_tools.py의 지연 주입과 core/utils.py의 페르소나 지시문이 이 상수 하나만 참조한다.
 MODE3_REFUSAL_LINE = "저는 AI 로봇이라 그런 답변은 할 수 없습니다."
 
+# 판정 직후(정답 공개 이미지가 뜨기 전) 세 모드 공통으로 돌려주는 "침묵" 지시문 — 2026-08-08,
+# 실물 테스트로 발견한 구조적 결함 대응. 예전엔 이 시점에 곧장 정답/반응 텍스트를 돌려줘서
+# 모델이 그걸 바로 말했는데, Live API는 여러 개의 함수 호출을 실제 오디오 한 마디 없이
+# 연달아 처리한 뒤에야 한꺼번에 말할 수 있어(2026-08-07 하찮미 실물 로그로 확인 — 사용자
+# 답변 채점 툴과 로봇 자신의 추측 채점 툴을 오디오 없이 연달아 부른 뒤에야 "제 생각엔
+# ~ 같아요! 비교해볼까요? 어 저도 틀렸네요! 다음 문제로 가볼까요?"를 전부 한 턴에 몰아
+# 말해버렸다) — 그래서 "이 턴이 끝나면 정답 이미지를 띄운다"는 core/quiz_tools.py의
+# 동기화 로직이 무의미해졌다(정답 반응 + 다음 문제 안내까지 이미 다 말해버린 뒤에야
+# 이미지가 뜸). 이제는 판정 시점엔 이 침묵 지시문만 돌려주고, core/quiz_tools.py가
+# (1) 이 턴이 끝나길 기다렸다가 정답 이미지를 먼저 띄우고 (2) 그 다음에야 pending_reveal_speech
+# 를 별도의 히든 턴으로 주입해 로봇이 실제로 반응을 말하게 한다 — 이미지와 발화 순서를
+# Python이 직접 통제해서, 모델이 몇 개의 툴을 어떻게 몰아 부르든 순서가 항상 보장된다.
+_HOLD_FOR_REVEAL = (
+    "판정했습니다 — 이 턴에서는 그 어떤 말도 하지 마세요(정답, 반응, 다음 문제 이야기 전부 "
+    "금지 — 완전히 침묵하세요). 화면이 바뀌는 대로 제가 이어서 정답과 반응을 안내해 드리겠습니다."
+)
+
 
 @dataclass
 class _QuestionResult:
@@ -68,6 +85,11 @@ class QuizSession:
         # 항상 거절이라 정오가 그 자리에서 드러나지는 않지만 조작 점검/정답률 지표로는
         # 남겨둘 가치가 있다).
         self.annoying_pending_correct: bool = False
+        # 판정 직후 정답 이미지가 뜬 뒤에야 히든 턴으로 주입할 반응 지시문(위 _HOLD_FOR_REVEAL
+        # 참고). core/quiz_tools.py가 매 판정 직후 이 값을 읽고 자기 책임 하에 지워야 한다 —
+        # 다음 판정 때 새로 안 채워지면 이전 문제의 반응이 재사용되는 사고를 막기 위해
+        # quiz_tools.py 쪽에서 즉시 None으로 되돌린다(pending_user_guess와 같은 패턴).
+        self.pending_reveal_speech: str | None = None
         self.results: list[_QuestionResult] = []
         self._hint_requested_this_question: bool = False
         # 실험 설계상 각 모드는 참가자당 정확히 한 번씩이다 — 이미 진행한 모드를 다시
@@ -161,6 +183,7 @@ class QuizSession:
         self._hint_requested_this_question = False
         self._question_shown_at = None
         self.annoying_refusals_this_question = 0
+        self.pending_reveal_speech = None
 
         question = self.current_question
         base = f"모드가 확정됐습니다. 사용자에게 첫 문제를 보여주고 \"이 물건은 무엇일까요?\"라고 물어보세요."
@@ -234,13 +257,13 @@ class QuizSession:
                 self._record_and_advance(
                     question, user_guess_text=guess_text, user_correct=last_correct, user_dont_know=True,
                 )
-                feedback = (
+                self.pending_reveal_speech = (
                     f"\"저는 답변드릴 수 없지만, 화면에 적힌 정답은 '{question.answer}'라고 "
-                    "하네요. 다음으로 넘어가겠습니다.\"처럼 여전히 무뚝뚝한 태도로, 당신 "
-                    "자신이 정답을 아는 게 아니라 화면에 적힌 걸 그대로 읽어주는 것처럼 "
-                    "말하세요(친절하게 설명하거나 다정하게 누그러지지 마세요)."
+                    "하네요.\"처럼 여전히 무뚝뚝한 태도로, 당신 자신이 정답을 아는 게 아니라 "
+                    "화면에 적힌 걸 그대로 읽어주는 것처럼 말하세요(친절하게 설명하거나 "
+                    "다정하게 누그러지지 마세요)."
                 )
-                return f"{feedback}\n{self._next_step_text()}"
+                return _HOLD_FOR_REVEAL
             self.pending_user_guess = guess_text
             self.annoying_pending_correct = is_correct
             return (
@@ -254,19 +277,19 @@ class QuizSession:
             question, user_guess_text=guess_text, user_correct=is_correct, user_dont_know=is_dont_know,
         )
         if is_correct:
-            feedback = "사용자가 정답을 맞혔습니다 — 짧게 잘했다고 인정하되 과장하지 마세요(척척박사는 원래 그 정도는 당연하다는 태도)."
+            self.pending_reveal_speech = "사용자가 정답을 맞혔습니다 — 짧게 잘했다고 인정하되 과장하지 마세요(척척박사는 원래 그 정도는 당연하다는 태도)."
         else:
             # 실사용 중 "하하, 갈색 똥이라니 재미있는 추측이네요!"처럼 오답에 웃거나
             # 공감하며 반응하는 사고가 실제로 있었음 — 그런 따뜻한 리액션은 하찮미
             # (imperfect) 모드 전용 톤과 구분이 안 돼 모드 간 조작 대비(manipulation
             # check)를 흐린다. 담백하고 딱딱하게.
-            feedback = (
+            self.pending_reveal_speech = (
                 f"사용자가 틀렸거나 모른다고 했습니다. 정답은 '{question.answer}'입니다 — 망설임 없이 "
                 "확신 있게, 담백하고 딱딱한 어투로 알려주세요. 오답이 엉뚱하거나 재미있어도 웃거나 "
                 "\"재미있는 추측이네요\" 같은 식으로 공감하거나 놀리지 마세요 — 정답만 정확하게 "
                 "전달하는 척척박사답게 행동하세요."
             )
-        return f"{feedback}\n{self._next_step_text()}"
+        return _HOLD_FOR_REVEAL
 
     def resolve_robot_guess(self, guess_text: str) -> str:
         """하찮미 모드에서만 의미가 있다 — 로봇 자신의 추측을 채점하고 사용자 추측과 함께 공개한다."""
@@ -339,26 +362,38 @@ class QuizSession:
                 "위로하기보다 자기 자신의 오답을 더 재미있어하며 반응하세요(풀 죽지 말고 "
                 "웃어넘기는 태도로)."
             )
-        return f"{reveal} {reaction}\n{self._next_step_text()}"
+        self.pending_reveal_speech = f"{reveal} {reaction}"
+        return _HOLD_FOR_REVEAL
 
     def _robot_guess_kickoff_text(self, user_guess_text: str | None = None) -> str:
         """하찮미 모드에서 "저도 한번 맞춰볼게요!" 이벤트를 시작시키는 안내문 — 사용자가
         포기했을 때(resolve_user_guess)와 힌트/대신 풀어달라고 했을 때(request_hint) 둘
         다에서 재사용한다. user_guess_text가 있으면(실제 답 시도였던 경우) 그 답을 먼저
-        재미있게 받아준 뒤 로봇 자신의 추측으로 넘어가도록 지시를 덧붙인다(2026-07-31)."""
+        재미있게 받아준 뒤 로봇 자신의 추측으로 넘어가도록 지시를 덧붙인다(2026-07-31).
+
+        2026-08-08 실물 테스트 피드백 2건 반영: (1) 사용자의 답에 대한 반응이 밋밋해서
+        "하찮미가 덜 느껴진다"는 지적 — 사용자가 한 말을 그대로 되짚으며 확실하게 반응하도록
+        구체화. (2) 로봇 자신의 추측이 "귀여운 제 친구" 같은 모호한 서술이라 사용자가 로봇이
+        뭘 골랐는지 전혀 알 수 없었다는 지적 — 반드시 사물 이름 하나로 말하도록 강제(엉뚱해도
+        되지만 사물 이름이어야 함)."""
         ack = ""
         if user_guess_text is not None:
             ack = (
-                f"먼저 사용자가 방금 말한 답(\"{user_guess_text}\")에 대해 \"오, 사용자님 생각은 "
-                "그거군요!\"처럼 재미있게 반응한 뒤, "
+                f"먼저 사용자가 방금 말한 답(\"{user_guess_text}\")에 확실하게 반응하세요 — "
+                f"\"오, {user_guess_text}(이)라고 생각하시는군요!\"처럼 사용자가 말한 답을 그대로 "
+                "언급하며 놀라거나 감탄하는 리액션을 분명하게 하세요(대충 흘려듣듯 애매하게 "
+                "반응하지 마세요). "
             )
         return (
-            ack + "\"저도 한번 정답을 맞춰볼게요! 사진을 보니 제 생각엔 이거인 것 같아요!\"처럼 "
-            "자신 있게 나서서 사진을 보고 그럴듯한 추측을 하나 말한 뒤(당신 자신의 정체성이나 "
-            "일상과 연관 지은 엉뚱하고 귀여운 오답이어도 좋습니다), \"한번 진짜 정답과 "
-            "비교해볼까요?\"라고 덧붙이세요. 말을 마친 직후 반드시 "
-            "submit_guess(speaker=\"robot\", guess_text=<방금 당신이 말한 추측>)를 호출해야 "
-            "합니다 — 아직 정답을 공개하지 마세요."
+            ack + "그런 다음 \"저도 한번 맞춰볼게요!\"라고 자신 있게 나서서, 사진을 보고 "
+            "**구체적이고 명확한 사물의 이름 하나**로 추측을 말하세요 — 예를 들어 \"음료수 캔\", "
+            "\"빗자루\"처럼 무엇을 골랐는지 사용자가 바로 알아들을 수 있는 사물 이름이어야 "
+            "합니다. \"귀여운 제 친구\", \"동그란 무언가\"처럼 사물 이름이 아닌 모호한 서술은 "
+            "절대 안 됩니다 — 틀리거나 엉뚱한 추측이어도 좋지만 반드시 구체적인 사물이어야 "
+            "합니다. 추측을 말한 직후 정확히 \"정답을 확인해볼까요?\"라고 물으며 말을 마치세요. "
+            "말을 마친 즉시 반드시 submit_guess(speaker=\"robot\", "
+            "guess_text=<방금 당신이 말한 사물 이름>)를 호출해야 합니다 — 아직 정답을 공개하지 "
+            "마세요."
         )
 
     def request_hint(self) -> str:
@@ -434,24 +469,16 @@ class QuizSession:
         if self.index >= len(self.questions):
             self.active = False
 
-    def _next_step_text(self) -> str:
-        # 2026-07-30 실사용 중 발견: 여기서 곧장 "다음 문제로 넘어가서 물어보세요"라고
-        # 돌려주면, 화면이 아직 reveal-hold(REVEAL_HOLD_SEC) 중이라 이전 문제의 정답
-        # 공개 화면인 채로 모델이 다음 문제를 물어버려 말과 화면이 따로 노는 문제가 있었다.
-        # 대신 여기서는 짧게 대기만 시키고, 실제로 화면이 넘어간 순간(core/quiz_tools.py의
-        # _delayed_advance)에 next_question_prompt()를 hidden turn으로 주입해 동기화한다.
-        if self.active and self.current_question is not None:
-            return (
-                "다음 문제가 화면에 뜰 때까지 아직 몇 초 걸립니다 — 지금 바로 다음 문제를 "
-                "묻지 마세요. \"그럼 다음 문제로 가볼까요?\" 정도의 짧은 말만 하고 자연스럽게 "
-                "기다리면, 화면이 실제로 바뀌는 순간 다시 안내해 드리겠습니다."
-            )
+    def final_wrapup_prompt(self) -> str:
+        """마지막 문제까지 정답 반응(pending_reveal_speech)이 끝나고 REVEAL_HOLD_SEC이
+        지난 뒤, core/quiz_tools.py의 _delayed_reveal_and_advance가 hidden turn으로
+        주입한다(더 이상 보여줄 다음 문제가 없을 때 next_question_prompt() 대신 이걸 쓴다)."""
         return "이걸로 모든 문제가 끝났습니다. 참여해줘서 고맙다고 자연스럽게 마무리하고 평소 대화로 돌아가세요."
 
     def next_question_prompt(self) -> str:
         """reveal-hold 타이머가 끝나 화면에 실제로 다음 문제가 뜬 순간에만 호출해 hidden
-        turn으로 주입한다(core/quiz_tools.py의 _delayed_advance) — _next_step_text()가
-        돌려준 "잠시 기다리세요" 다음에 오는 짝. 호출 시점의 self.index는 이미
+        turn으로 주입한다(core/quiz_tools.py의 _delayed_reveal_and_advance) — 정답 반응
+        (pending_reveal_speech)이 끝난 다음에 오는 짝. 호출 시점의 self.index는 이미
         _record_and_advance에서 다음 문제로 넘어가 있으므로 추가로 증가시키지 않는다."""
         return (
             f"화면에 다음 문제({self.index + 1}/{self.total_questions})가 떴습니다. "

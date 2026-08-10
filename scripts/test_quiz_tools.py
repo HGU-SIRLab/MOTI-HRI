@@ -50,6 +50,18 @@ def check(label, condition):
     return condition
 
 
+async def _tick_turn_seq(turn_seq: list, interval=0.02):
+    """실제로는 launcher.py의 recv_loop가 로봇의 턴이 끝날 때마다(turn_complete 또는
+    interrupted) turn_seq[0]을 올린다(2026-08-08 도입 — core/quiz_tools.py의
+    _wait_for_turn_after 참고, 정답 공개가 로봇이 말하기도 전에 뜨던 사고의 재발 방지용
+    구조 변경). 이 테스트는 실제 모델 응답을 시뮬레이션하지 않으므로, 대신 일정 간격으로
+    계속 올려서 "턴은 결국 끝난다"는 흐름만 흉내낸다 — 정확한 턴 경계 타이밍이 아니라
+    _wait_for_turn_after()가 실제로 기다렸다가 진행하는지가 이 테스트의 관심사다."""
+    while True:
+        await asyncio.sleep(interval)
+        turn_seq[0] += 1
+
+
 async def main():
     ok = True
     tmpdir = tempfile.mkdtemp()
@@ -67,14 +79,13 @@ async def main():
         injected.append(text)
 
     loop = asyncio.get_event_loop()
-    # 실제로는 launcher.py의 recv_loop가 갱신하는 이벤트 — 로봇이 지금 말하는 중이
-    # 아닐 때만 set된다. 테스트는 오디오 재생 자체를 시뮬레이션하지 않으므로 항상
-    # set된 채로 둔다(정답 공개가 speaking_done을 기다리는 로직 자체는 여전히 실행되고,
-    # POST_SPEECH_DRAIN_SEC을 짧게 패치해둔 덕에 대기 시간도 작다).
-    speaking_done = asyncio.Event()
-    speaking_done.set()
+    # 실제로는 launcher.py의 recv_loop가 관리하는 1칸짜리 리스트 — 턴이 끝날 때마다
+    # 올라간다. 이 ticker가 계속 돌면서 "턴은 결국 끝난다"를 흉내낸다(POST_SPEECH_DRAIN_SEC을
+    # 짧게 패치해둔 덕에 대기 시간도 작다).
+    turn_seq = [0]
+    ticker_task = asyncio.create_task(_tick_turn_seq(turn_seq))
     start_quiz, select_quiz_mode, submit_guess, request_hint, end_quiz_early, session = qt.make_quiz_tools(
-        quiz_ui_q, busy, motion_ctx, fake_inject_turn, loop, speaking_done, emotion_queue=emotion_queue, num_questions=2,
+        quiz_ui_q, busy, motion_ctx, fake_inject_turn, loop, turn_seq, emotion_queue=emotion_queue, num_questions=2,
     )
 
     start_quiz()
@@ -92,8 +103,8 @@ async def main():
     submit_guess("user", "모르겠어요")  # 포기 신호 -> "저도 맞춰볼게요" 이벤트로 감
     submit_guess("robot", "정답0")  # 로봇이 우연히 맞춤
     ok &= check("robot-correct triggers EXCITED emotion", emotion_calls == ["EXCITED"])
-    # asyncio.sleep이어야 한다 — reveal push는 이제 speaking_done을 기다리는 태스크 안에서
-    # 일어나므로(2026-07-31), 이벤트 루프에 제어권을 넘기지 않는 time.sleep으론 그 태스크가
+    # asyncio.sleep이어야 한다 — reveal push는 turn_seq를 기다리는 태스크 안에서
+    # 일어나므로, 이벤트 루프에 제어권을 넘기지 않는 time.sleep으론 그 태스크가
     # 진행되지 않는다.
     await asyncio.sleep(0.1)
     ok &= check("robot-correct triggers proud arm motions", ("express", "right_arm") in calls and ("express", "left_arm") in calls)
@@ -101,6 +112,8 @@ async def main():
     ok &= check("reveals original photo + answer before advancing",
                 msg["type"] == "reveal" and "정답0" in msg["text"]
                 and msg["image_path"].replace("\\", "/").endswith("q0.jpg"))
+    ok &= check("deferred reveal speech (robot correct on give-up path) was injected as a hidden turn",
+                any("뿌듯" in t for t in injected))
     await asyncio.sleep(0.15)
     msg = quiz_ui_q.get()
     ok &= check("advances to second question after reveal hold",
@@ -120,7 +133,7 @@ async def main():
     # 추측해서 나란히 비교하는 이벤트로 넘어간다 — 즉시 정오를 알려주면 로봇이 이미
     # 정답을 아는 것처럼 보여 조작 점검 문항과 모순된다는 실물 테스트 피드백.
     start1b, select1b, submit1b, hint1b, end1b, sess1b = qt.make_quiz_tools(
-        quiz_ui_q, busy, motion_ctx, fake_inject_turn, loop, speaking_done, emotion_queue=emotion_queue, num_questions=2,
+        quiz_ui_q, busy, motion_ctx, fake_inject_turn, loop, turn_seq, emotion_queue=emotion_queue, num_questions=2,
     )
     start1b()
     quiz_ui_q.get()
@@ -135,7 +148,7 @@ async def main():
 
     r = submit1b("robot", "정답0")  # 로봇도 우연히 맞춤 -> 둘 다 맞음, 이제야 전진
     ok &= check("paired guess advances the session", sess1b.index == 1)
-    await asyncio.sleep(0.1)  # reveal push가 speaking_done 대기 태스크를 통해 일어날 시간을 준다
+    await asyncio.sleep(0.1)  # reveal 이미지 push + 반응 히든 턴 주입이 turn_seq ticker를 통해 일어날 시간을 준다
     msg = quiz_ui_q.get()
     ok &= check("imperfect paired guess pushes reveal", msg["type"] == "reveal" and "정답0" in msg["text"])
     await asyncio.sleep(0.15)
@@ -147,7 +160,7 @@ async def main():
     # 정답 공개/전진은 없다("거절해놓고 몇 초 뒤 정답을 알려주면 사실 알고 있었던 것"으로
     # 보인다는 지적으로 "거절 후 자동 공개" 설계를 되돌림).
     start2, select2, submit2, hint2, end2, sess2 = qt.make_quiz_tools(
-        quiz_ui_q, busy, motion_ctx, fake_inject_turn, loop, speaking_done, emotion_queue=emotion_queue, num_questions=1,
+        quiz_ui_q, busy, motion_ctx, fake_inject_turn, loop, turn_seq, emotion_queue=emotion_queue, num_questions=1,
     )
     start2()
     quiz_ui_q.get()
@@ -166,7 +179,7 @@ async def main():
     # 힌트를 짧은 간격으로 두 번 요청해도 지연 주입은 한 번만 걸려야 한다(중복 발화 방지).
     injected.clear()
     start3, select3, submit3, hint3, end3, sess3 = qt.make_quiz_tools(
-        quiz_ui_q, busy, motion_ctx, fake_inject_turn, loop, speaking_done, emotion_queue=emotion_queue, num_questions=1,
+        quiz_ui_q, busy, motion_ctx, fake_inject_turn, loop, turn_seq, emotion_queue=emotion_queue, num_questions=1,
     )
     start3()
     quiz_ui_q.get()
@@ -185,7 +198,7 @@ async def main():
     calls.clear()
     emotion_calls.clear()
     startA, selectA, submitA, hintA, endA, sessA = qt.make_quiz_tools(
-        quiz_ui_q, busy, motion_ctx, fake_inject_turn, loop, speaking_done, emotion_queue=emotion_queue, num_questions=2,
+        quiz_ui_q, busy, motion_ctx, fake_inject_turn, loop, turn_seq, emotion_queue=emotion_queue, num_questions=2,
     )
     startA()
     quiz_ui_q.get()
@@ -220,9 +233,10 @@ async def main():
     # 답답해서 명시적으로 포기/스킵을 요청하면 그 자리에서 곧장(뜸들임 없이) 정답 공개 + 전진.
     injected.clear()
     r = submitA("user", "그냥 다음 문제로 넘어가줘")
-    ok &= check("an explicit give-up request immediately reveals, no stalling",
-                "정답0" in r and "화면에 적힌" in r)
-    # 포기로 정답을 공개할 때도 THINKING이 남지 않고 무표정으로 돌아온다.
+    ok &= check("an explicit give-up request keeps the immediate response silent (no answer leak)",
+                "정답0" not in r and "화면에 적힌" not in r)
+    # 포기로 정답을 공개할 때도 THINKING이 남지 않고 무표정으로 돌아온다 — 이건
+    # submit_guess() 래퍼가 판정 직후 동기적으로 처리하므로 sleep 없이도 바로 확인된다.
     ok &= check("the face returns to NEUTRAL on give-up reveal too",
                 emotion_calls[-1] == "NEUTRAL")
     ok &= check("give-up advances the session right away", sessA.index == 1 and len(sessA.results) == 1)
@@ -237,9 +251,13 @@ async def main():
         "the logged result captures delivered refusal count and elapsed time",
         sessA.results[0].annoying_refusals == 2 and sessA.results[0].elapsed_sec is not None,
     )
-    await asyncio.sleep(0.1)  # reveal push가 speaking_done 대기 태스크를 통해 일어날 시간을 준다
+    await asyncio.sleep(0.1)  # reveal 이미지 push + 반응 히든 턴 주입이 turn_seq ticker를 통해 일어날 시간을 준다
     msg = quiz_ui_q.get()
     ok &= check("give-up reveal pushes the original photo + answer", msg["type"] == "reveal" and "정답0" in msg["text"])
+    ok &= check(
+        "deferred reveal speech frames it as reading the screen, not the robot's own knowledge",
+        any("정답0" in t and "화면에 적힌" in t for t in injected),
+    )
     await asyncio.sleep(0.15)
     msg = quiz_ui_q.get()
     ok &= check("give-up reveal advances UI to the next question",
@@ -252,7 +270,7 @@ async def main():
     # 넘어갔는데 뒤늦게 이전 문제의 거절 대사가 튀어나오는 사고가 난다.
     injected.clear()
     startB, selectB, submitB, hintB, endB, sessB = qt.make_quiz_tools(
-        quiz_ui_q, busy, motion_ctx, fake_inject_turn, loop, speaking_done, emotion_queue=emotion_queue, num_questions=1,
+        quiz_ui_q, busy, motion_ctx, fake_inject_turn, loop, turn_seq, emotion_queue=emotion_queue, num_questions=1,
     )
     startB()
     quiz_ui_q.get()
@@ -267,7 +285,7 @@ async def main():
     # 예약만 되고 취소된 스톨은 참가자가 실제로 겪은 거절이 아니다 — 0으로 남아야 한다.
     ok &= check("a cancelled (never-delivered) refusal is not counted",
                 sessB.results[0].annoying_refusals == 0)
-    await asyncio.sleep(0.1)  # reveal push가 speaking_done 대기 태스크를 통해 일어날 시간을 준다
+    await asyncio.sleep(0.1)  # reveal 이미지 push + 반응 히든 턴 주입이 turn_seq ticker를 통해 일어날 시간을 준다
     quiz_ui_q.get()  # reveal
     await asyncio.sleep(0.15)  # REVEAL_HOLD_SEC 경과 + 취소된 스톨이 원래 발화했을 시간까지 대기
     msg = quiz_ui_q.get()
@@ -279,7 +297,7 @@ async def main():
     # 즉시 정답이 공개돼야 한다.
     injected.clear()
     start4, select4, submit4, hint4, end4, sess4 = qt.make_quiz_tools(
-        quiz_ui_q, busy, motion_ctx, fake_inject_turn, loop, speaking_done, emotion_queue=emotion_queue, num_questions=2,
+        quiz_ui_q, busy, motion_ctx, fake_inject_turn, loop, turn_seq, emotion_queue=emotion_queue, num_questions=2,
     )
     start4()
     quiz_ui_q.get()
@@ -289,7 +307,7 @@ async def main():
     submit4("user", "정답 알려줘")  # 곧바로 포기 요청 -> 스톨 취소, 즉시 정답 공개
     ok &= check("give-up right after a hint request resolves immediately",
                 sess4.index == 1 and len(sess4.results) == 1)
-    await asyncio.sleep(0.1)  # reveal push가 speaking_done 대기 태스크를 통해 일어날 시간을 준다
+    await asyncio.sleep(0.1)  # reveal 이미지 push + 반응 히든 턴 주입이 turn_seq ticker를 통해 일어날 시간을 준다
     quiz_ui_q.get()  # reveal
     await asyncio.sleep(0.15)  # REVEAL_HOLD_SEC 경과 + 취소된 힌트 스톨이 원래 발화했을 시간까지 대기
     msg = quiz_ui_q.get()
@@ -301,7 +319,7 @@ async def main():
     # 모드가 이미 선택된 뒤 재선택을 시도하면 거부돼야 한다 — 안 그러면 index가 0으로
     # 리셋돼 같은 문제가 연구 결과 로그에 중복 기록될 위험이 있다.
     start5, select5, submit5, hint5, end5, sess5 = qt.make_quiz_tools(
-        quiz_ui_q, busy, motion_ctx, fake_inject_turn, loop, speaking_done, emotion_queue=emotion_queue, num_questions=2,
+        quiz_ui_q, busy, motion_ctx, fake_inject_turn, loop, turn_seq, emotion_queue=emotion_queue, num_questions=2,
     )
     start5()
     quiz_ui_q.get()
@@ -315,7 +333,7 @@ async def main():
     # 기록/전진하지 않았을 때, 그런데도 reveal이 뜨면 아직 안 풀린 문제의 "정답 공개"
     # 화면이 잘못 뜨는 사고가 난다 — 실제로 전진했을 때만 reveal이 떠야 한다.
     start6, select6, submit6, hint6, end6, sess6 = qt.make_quiz_tools(
-        quiz_ui_q, busy, motion_ctx, fake_inject_turn, loop, speaking_done, emotion_queue=emotion_queue, num_questions=2,
+        quiz_ui_q, busy, motion_ctx, fake_inject_turn, loop, turn_seq, emotion_queue=emotion_queue, num_questions=2,
     )
     start6()
     quiz_ui_q.get()
@@ -327,14 +345,14 @@ async def main():
 
     # 퀴즈가 이미 자연 종료된 뒤에 다시 답을 제출해도(비정상) reveal이 뜨면 안 된다.
     start7, select7, submit7, hint7, end7, sess7 = qt.make_quiz_tools(
-        quiz_ui_q, busy, motion_ctx, fake_inject_turn, loop, speaking_done, emotion_queue=emotion_queue, num_questions=1,
+        quiz_ui_q, busy, motion_ctx, fake_inject_turn, loop, turn_seq, emotion_queue=emotion_queue, num_questions=1,
     )
     start7()
     quiz_ui_q.get()
     select7("all_knowing")
     quiz_ui_q.get()
     submit7("user", "정답0")  # 유일한 문제를 답변 -> 퀴즈 자연 종료(active=False)
-    await asyncio.sleep(0.1)  # reveal push가 speaking_done 대기 태스크를 통해 일어날 시간을 준다
+    await asyncio.sleep(0.1)  # reveal 이미지 push + 반응 히든 턴 주입이 turn_seq ticker를 통해 일어날 시간을 준다
     quiz_ui_q.get()  # reveal
     await asyncio.sleep(0.15)
     quiz_ui_q.get()  # REVEAL_HOLD_SEC 경과 후 hide
@@ -342,12 +360,15 @@ async def main():
     submit7("user", "아무말")  # 퀴즈가 이미 끝난 뒤 비정상적으로 재제출
     ok &= check("submitting after the quiz already ended pushes nothing", quiz_ui_q.empty())
 
-    # 회귀 방지(2026-07-31): 로봇이 아직 말하는 중(speaking_done이 clear)이면 정답 공개
-    # 화면이 그동안 미뤄져야 한다 — 이게 없으면 로봇이 자기 추측/비교 멘트를 채 말하기도
-    # 전에 정답 화면이 떠버리는 사고가 재현된다(실사용 피드백으로 발견).
-    speaking_done_busy = asyncio.Event()  # 기본이 clear 상태 -> "로봇이 아직 말하는 중"
+    # 회귀 방지(2026-07-31, 2026-08-08 turn_seq로 재작성): 판정 툴 호출을 포함한 턴이 아직
+    # 안 끝났으면(로봇이 여전히 뭔가 말하는 중이면) 정답 공개 화면이 그동안 미뤄져야 한다 —
+    # 이게 없으면 로봇이 자기 추측/비교 멘트를 채 말하기도 전에 정답 화면이 떠버리는 사고가
+    # 재현된다(실사용 피드백으로 발견). turn_seq_stalled는 일부러 ticker를 안 붙여서
+    # "턴이 하나도 안 끝난" 상태를 고정 — _wait_for_turn_after()가 실제로 대기하는지
+    # 직접 검증한다.
+    turn_seq_stalled = [0]
     start8, select8, submit8, hint8, end8, sess8 = qt.make_quiz_tools(
-        quiz_ui_q, busy, motion_ctx, fake_inject_turn, loop, speaking_done_busy,
+        quiz_ui_q, busy, motion_ctx, fake_inject_turn, loop, turn_seq_stalled,
         emotion_queue=emotion_queue, num_questions=1,
     )
     start8()
@@ -356,12 +377,20 @@ async def main():
     quiz_ui_q.get()
     submit8("user", "정답0")
     await asyncio.sleep(0.1)  # POST_SPEECH_DRAIN_SEC + REVEAL_HOLD_SEC 합보다 넉넉히 대기
-    ok &= check("reveal is withheld while speaking_done stays clear", quiz_ui_q.empty())
-    speaking_done_busy.set()  # 로봇이 이제 막 발화를 마쳤다
+    ok &= check("reveal is withheld while the judging turn hasn't completed yet", quiz_ui_q.empty())
+    turn_seq_stalled[0] += 1  # 침묵 지시를 받은 판정 턴이 이제 막 끝났다고 흉내낸다
     await asyncio.sleep(0.1)
     msg = quiz_ui_q.get()
-    ok &= check("reveal appears once speaking_done is set",
+    ok &= check("reveal appears once the judging turn completes",
                 msg["type"] == "reveal" and "정답0" in msg["text"])
+    ok &= check("deferred reveal speech (all_knowing correct) was injected as a hidden turn",
+                any("맞혔습니다" in t for t in injected))
+    # _delayed_reveal_and_advance는 reveal 이미지를 띄운 뒤 반응 텍스트를 또 다른 히든
+    # 턴으로 주입하고, REVEAL_HOLD_SEC을 세기 전에 "그 턴도" 끝나길 기다린다 — 이것도
+    # 마저 흉내내지 않으면 백그라운드 태스크가 영원히 멈춰있게 된다.
+    turn_seq_stalled[0] += 1
+
+    ticker_task.cancel()
 
     print()
     if ok:

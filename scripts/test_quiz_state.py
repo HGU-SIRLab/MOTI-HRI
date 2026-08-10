@@ -31,7 +31,11 @@ def check(label, condition):
 def main():
     ok = True
 
-    # 1. 척척박사 — 정답을 처음부터 알고, 오답이면 바로 공개
+    # 1. 척척박사 — 정답을 처음부터 알고, 오답이면 바로 공개.
+    # 2026-08-08부터 판정 툴의 즉시 응답은 침묵 지시(_HOLD_FOR_REVEAL)뿐이고, 실제 정답/
+    # 반응 텍스트는 core/quiz_tools.py가 정답 이미지를 띄운 뒤 별도 히든 턴으로 주입할 수
+    # 있도록 session.pending_reveal_speech에 담긴다(구조 변경 이유는 core/quiz_state.py
+    # 상단 _HOLD_FOR_REVEAL 주석 참고 — 정답 공개가 로봇이 말하기도 전에 뜨던 사고 대응).
     s = QuizSession(make_questions(3), num_questions=3)
     s.start()
     ok &= check("invalid mode rejected", s.choose_mode("invalid") is None)
@@ -39,18 +43,27 @@ def main():
     ok &= check("all_knowing reveals answer at mode-select", "정답0" in txt)
     s.mark_question_shown()  # 실제로는 core/quiz_tools.py가 문제를 UI에 push할 때 호출
     txt = s.resolve_user_guess("땡땡땡")
-    ok &= check("wrong guess reveals answer + advances", "정답0" in txt and s.index == 1)
+    ok &= check("wrong guess withholds the answer from the immediate response",
+                "정답0" not in txt and s.index == 1)
+    ok &= check("wrong guess defers the answer to pending_reveal_speech",
+                s.pending_reveal_speech is not None and "정답0" in s.pending_reveal_speech)
     ok &= check("elapsed time is recorded when the question was marked as shown",
                 s.results[0].elapsed_sec is not None and s.results[0].elapsed_sec >= 0)
     ok &= check("annoying refusal count stays None outside annoying mode",
                 s.results[0].annoying_refusals is None)
     txt = s.resolve_user_guess("정답1")
-    ok &= check("correct guess praised", "맞혔습니다" in txt and s.index == 2)
+    ok &= check("correct guess withholds praise from the immediate response",
+                "맞혔습니다" not in txt and s.index == 2)
+    ok &= check("correct guess defers praise to pending_reveal_speech",
+                s.pending_reveal_speech is not None and "맞혔습니다" in s.pending_reveal_speech)
     ok &= check("elapsed time stays None when the question was never marked as shown",
                 s.results[1].elapsed_sec is None)
     txt = s.resolve_user_guess("오답")
-    ok &= check("last question ends session", "모든 문제가 끝났습니다" in txt and not s.active)
+    ok &= check("last question ends session, immediate response stays silent",
+                "모든 문제가 끝났습니다" not in txt and not s.active)
     ok &= check("all_knowing logged 3 results", len(s.results) == 3)
+    ok &= check("final_wrapup_prompt announces the quiz is over",
+                "모든 문제가 끝났습니다" in s.final_wrapup_prompt())
 
     # 2. 하찮미 — 2026-07-31부터 포기/위임 신호든 실제 답 시도든 전부 "로봇도 같이
     # 추측해서 나란히 비교" 이벤트로 통일됐다. 즉시 정오를 알려주면(19~20단계 방식) 로봇이
@@ -71,10 +84,12 @@ def main():
     )
     txt = s2.resolve_robot_guess("정답0")
     ok &= check(
-        "both user and robot correct -> teamwork reaction",
-        "팀워크" in txt and s2.index == 1 and len(s2.results) == 1
+        "both user and robot correct -> teamwork reaction deferred, immediate response stays silent",
+        "팀워크" not in txt and s2.index == 1 and len(s2.results) == 1
         and s2.results[0].user_correct is True and s2.results[0].robot_correct is True,
     )
+    ok &= check("teamwork reaction lands in pending_reveal_speech",
+                s2.pending_reveal_speech is not None and "팀워크" in s2.pending_reveal_speech)
 
     # 2a'. 사용자는 맞혔지만 로봇은 틀림 -> 로봇이 살짝 시무룩하되 사용자를 인정.
     txt = s2.resolve_user_guess("정답1")
@@ -82,17 +97,21 @@ def main():
                 "submit_guess" in txt and s2.pending_user_guess == "정답1")
     txt = s2.resolve_robot_guess("로봇오답")
     ok &= check(
-        "user correct + robot wrong -> robot is sheepishly embarrassed but congratulates",
-        "어이쿠" in txt and s2.results[1].user_correct is True and s2.results[1].robot_correct is False,
+        "user correct + robot wrong -> immediate response stays silent",
+        "어이쿠" not in txt and s2.results[1].user_correct is True and s2.results[1].robot_correct is False,
     )
+    ok &= check("sheepishly-embarrassed reaction lands in pending_reveal_speech",
+                "어이쿠" in s2.pending_reveal_speech)
 
     # 2a''. 둘 다 틀림 -> 로봇이 자기 오답을 더 재미있어하며 웃어넘김(하찮미다움 강화, 2026-07-31).
     s2.resolve_user_guess("땡땡")
     txt = s2.resolve_robot_guess("로봇도땡")
     ok &= check(
-        "both wrong -> robot plays its own wrong guess for laughs instead of flat disappointment",
-        "낙제" in txt and s2.results[2].user_correct is False and s2.results[2].robot_correct is False,
+        "both wrong -> immediate response stays silent",
+        "낙제" not in txt and s2.results[2].user_correct is False and s2.results[2].robot_correct is False,
     )
+    ok &= check("both-wrong-for-laughs reaction lands in pending_reveal_speech",
+                "낙제" in s2.pending_reveal_speech)
     ok &= check("round ends after all 3 questions", not s2.active)
 
     # 2b. "모르겠어요" — 포기 신호는 실제 답이 없으므로 "둘 다"라는 비교 틀이 안 맞아,
@@ -103,8 +122,10 @@ def main():
     txt = s2b.resolve_user_guess("모르겠어요")
     ok &= check("give-up phrase triggers kickoff event", "submit_guess" in txt and s2b.pending_user_guess == "모르겠어요")
     txt = s2b.resolve_robot_guess("정답0")
-    ok &= check("robot guess correct -> proud (give-up path uses the 2-way reaction)",
-                "뿌듯" in txt and s2b.pending_user_guess is None and s2b.index == 1)
+    ok &= check("robot guess correct -> immediate response stays silent (give-up path)",
+                "뿌듯" not in txt and s2b.pending_user_guess is None and s2b.index == 1)
+    ok &= check("proud reaction (give-up path) lands in pending_reveal_speech",
+                "뿌듯" in s2b.pending_reveal_speech)
     r0 = s2b.results[0]
     ok &= check("paired result recorded (robot correct)", r0.user_guess_text == "모르겠어요" and r0.robot_correct is True)
 
@@ -112,7 +133,10 @@ def main():
     txt = s2b.resolve_user_guess("정답 알려줘")
     ok &= check("hand-it-to-me phrase also triggers kickoff event", "submit_guess" in txt and s2b.pending_user_guess == "정답 알려줘")
     txt = s2b.resolve_robot_guess("로봇오답")
-    ok &= check("robot guess wrong -> flustered but cute (give-up path)", "헤헤" in txt and not s2b.active)
+    ok &= check("robot guess wrong -> immediate response stays silent (give-up path)",
+                "헤헤" not in txt and not s2b.active)
+    ok &= check("flustered-but-cute reaction (give-up path) lands in pending_reveal_speech",
+                "헤헤" in s2b.pending_reveal_speech)
     ok &= check("second result recorded (robot wrong)", s2b.results[1].robot_correct is False)
 
     # 2d. request_hint()도 같은 "저도 맞춰볼게요" 이벤트로 통일됨.
@@ -125,7 +149,10 @@ def main():
         "submit_guess" in txt and s2c.pending_user_guess is not None,
     )
     txt = s2c.resolve_robot_guess("정답0")
-    ok &= check("hint-triggered robot guess resolves and advances", "뿌듯" in txt and not s2c.active)
+    ok &= check("hint-triggered robot guess resolves and advances, immediate response stays silent",
+                "뿌듯" not in txt and not s2c.active)
+    ok &= check("hint-triggered reaction lands in pending_reveal_speech",
+                "뿌듯" in s2c.pending_reveal_speech)
 
     # 3. 방어 가드 — imperfect 아닐 때 resolve_robot_guess는 무시
     s3 = QuizSession(make_questions(1), num_questions=1)
@@ -170,8 +197,8 @@ def main():
     # 직전 실제 시도(정답0, 맞았음)의 정오는 로그에 보존된다.
     txt = s4b.resolve_user_guess("그냥 다음 문제로 넘어가줘")
     ok &= check(
-        "an explicit give-up/skip request immediately reveals and advances (no stalling)",
-        "정답0" in txt and s4b.index == 1 and len(s4b.results) == 1
+        "an explicit give-up/skip request advances immediately, immediate response stays silent",
+        "정답0" not in txt and s4b.index == 1 and len(s4b.results) == 1
         and s4b.pending_user_guess is None,
     )
     r0 = s4b.results[0]
@@ -181,8 +208,9 @@ def main():
         and r0.user_guess_text == "그냥 다음 문제로 넘어가줘",
     )
     ok &= check(
-        "reveal wording frames it as reading the screen, not the robot's own knowledge",
-        "화면에 적힌" in txt,
+        "reveal wording (deferred) frames it as reading the screen, not the robot's own knowledge",
+        s4b.pending_reveal_speech is not None and "정답0" in s4b.pending_reveal_speech
+        and "화면에 적힌" in s4b.pending_reveal_speech,
     )
     ok &= check("delivered refusal count is recorded on the give-up result",
                 r0.annoying_refusals == 2)
@@ -190,11 +218,13 @@ def main():
     # 두 번째(마지막) 문제 — 이번엔 실제 시도 없이 곧장 포기하면 correctness가 False로 남는다.
     txt = s4b.resolve_user_guess("정답 알려줘")
     ok &= check(
-        "giving up with no prior real attempt records user_correct=False",
-        "정답1" in txt and s4b.index == 2 and len(s4b.results) == 2
+        "giving up with no prior real attempt records user_correct=False, immediate response silent",
+        "정답1" not in txt and s4b.index == 2 and len(s4b.results) == 2
         and s4b.results[1].user_correct is False and s4b.results[1].user_dont_know is True
         and not s4b.active,
     )
+    ok &= check("second give-up's reveal speech (deferred) contains the answer",
+                s4b.pending_reveal_speech is not None and "정답1" in s4b.pending_reveal_speech)
     ok &= check("refusal counter resets per question",
                 s4b.results[1].annoying_refusals == 0)
 
