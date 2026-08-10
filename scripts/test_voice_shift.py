@@ -107,6 +107,72 @@ def main():
                 max_jump < 4000)
     print(f"    (1초 오디오 변조에 {elapsed:.2f}초 소요 — 실시간 배수 {elapsed:.2f}x)")
 
+    # ---- 4) 유휴 방출(2026-08-10, 41단계) ----
+    # 자투리를 flush()까지 붙잡고 있으면, turn_complete가 늦게 오는 동안 스피커가 말라
+    # 문장 끝이 끊긴다("이 물건은 무엇일까요?"의 '무엇'과 '일까요?' 사이). 이제는 입력이
+    # 잠깐 끊기면 flush 없이도 내보내야 한다.
+    vs.shift_pcm = lambda pcm, sr, **kw: pcm
+    out: list[bytes] = []
+    shifter = vs.VoiceShifter(out.append, sample_rate=SR, buffer_ms=500, overlap_ms=120,
+                               idle_flush_ms=80)
+    shifter.start()
+    try:
+        # 한 블록을 채우고도 남는 분량(700ms)을 넣고, flush 없이 유휴 상태로 둔다.
+        shifter.feed(np.full(int(SR * 0.7), 1234, dtype=np.int16).tobytes())
+        time.sleep(0.6)
+        emitted_before_flush = sum(len(b) for b in out) / 2 / SR * 1000
+        ok &= check(f"idle flush: tail goes out without waiting for turn_complete "
+                    f"({emitted_before_flush:.0f}ms emitted, expected ~580ms)",
+                    emitted_before_flush > 500)
+        shifter.flush()
+        time.sleep(0.4)
+        ok &= check("idle flush: nothing is lost overall",
+                    abs(sum(len(b) for b in out) / 2 / SR * 1000 - 700) < 1)
+    finally:
+        shifter.close()
+
+    # ---- 5) 오버랩보다 짧은 자투리가 워커를 죽이지 않는다 ----
+    # 유휴 방출을 넣으면서 실제로 났던 크래시: 붙잡아둔 출력 꼬리가 overlap 길이에 못 미쳐
+    # 다음 크로스페이드가 shape 불일치로 터지고, 변조 스레드가 죽어 그 세션 내내 로봇이
+    # 한 마디도 못 하게 됐다.
+    out = []
+    shifter = vs.VoiceShifter(out.append, sample_rate=SR, buffer_ms=500, overlap_ms=120,
+                               idle_flush_ms=80)
+    shifter.start()
+    try:
+        shifter.feed(np.full(int(SR * 0.05), 999, dtype=np.int16).tobytes())  # 50ms < 오버랩
+        time.sleep(0.3)
+        shifter.feed(np.full(int(SR * 0.5), 999, dtype=np.int16).tobytes())
+        time.sleep(0.5)
+        shifter.flush()
+        time.sleep(0.4)
+        total_ms = sum(len(b) for b in out) / 2 / SR * 1000
+        ok &= check("sub-overlap tail: worker survives and loses no audio",
+                    shifter._thread.is_alive() and abs(total_ms - 550) < 1)
+    finally:
+        shifter.close()
+
+    # ---- 6) 세션이 끊겨 flush가 영영 안 와도 잔량이 남지 않게 reset으로 풀 수 있다 ----
+    # 2026-08-10 실제 사고: GoAway로 세션이 발화 도중 끊기면 turn_complete가 안 와서
+    # flush()도 안 불리고, 크로스페이드 꼬리(오버랩 길이)가 pending으로 영구히 남았다.
+    # launcher.py는 그 pending을 "아직 말하는 중"으로 읽어 퀴즈 중 마이크를 계속 막았고,
+    # 사용자가 아예 대화를 못 하게 됐다. 재연결 시 reset()으로 반드시 0이 되어야 한다.
+    out = []
+    shifter = vs.VoiceShifter(out.append, sample_rate=SR, buffer_ms=500, overlap_ms=120)
+    shifter.start()
+    try:
+        shifter.feed(np.full(int(SR * 1.0), 777, dtype=np.int16).tobytes())
+        time.sleep(0.6)  # 블록 방출 + 유휴 방출까지 끝나고, 오버랩 꼬리만 남은 상태
+        stuck = shifter.pending_sec
+        ok &= check(f"flush 없이는 오버랩 꼬리가 잔량으로 남는다 ({stuck*1000:.0f}ms)",
+                    stuck > 0.05)
+        shifter.reset()
+        ok &= check("reset()이 그 잔량을 즉시 0으로 만든다 (마이크 게이트가 풀리는 근거)",
+                    shifter.pending_sec == 0.0)
+    finally:
+        shifter.close()
+    vs.shift_pcm = original_shift_pcm
+
     print()
     if ok:
         print("✅ 전부 통과")

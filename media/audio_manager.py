@@ -7,7 +7,6 @@ AEC 연결 시점 — docs/integration-points.md에 "AEC 연결할 때 media/로
 """
 import asyncio
 import os
-import queue
 import threading
 import time
 
@@ -22,6 +21,21 @@ ENABLE_AEC = os.getenv("ENABLE_AEC", "true").lower() not in ("0", "false", "no")
 # 스피커→마이크 왕복 지연 추정치(ms). 실측 안 된 값 — 에코가 잘 안 잡히면 이 값부터
 # 조정해볼 것(오디오 버퍼 크기가 크면 지연도 커진다: 지금 블록사이즈 기준 대략 100ms대).
 AEC_STREAM_DELAY_MS = int(os.getenv("AEC_STREAM_DELAY_MS", "100"))
+
+# 플레이아웃 지터 버퍼(2026-08-10, 40단계) — 재생을 시작하기 전에 최소한 이만큼을 쌓아둔다.
+#
+# 왜 필요한가: VoiceShifter는 buffer_ms만큼 오디오가 "다 모인 뒤에" 한꺼번에 변조해서
+# 한 블록을 통째로 밀어넣고, 스피커는 그걸 실시간으로 빼간다. 그래서 서버가 오디오를
+# 실시간 속도로 보내주는 구간에서는 블록 N의 변조가 끝나는 시각과 스피커가 블록 N-1을
+# 다 재생하는 시각이 **정확히 같다** — 여유가 0이라, 네트워크나 스케줄링이 조금만
+# 흔들려도 그 자리에서 무음이 끼어든다("말하다 중간에 먹히는" 증상의 실제 원인).
+# 중요한 건 이 여유가 buffer_ms와 **무관하게** 항상 0이라는 점이다 — 그래서 예전에
+# 500 -> 700 -> 1200ms로 버퍼를 키웠는데도 증상이 그대로였다(오히려 발화 시작 지연만
+# 늘었다). 진짜 해법은 버퍼 크기가 아니라, 재생 시작 자체를 늦춰서 쿠션을 만드는 것.
+PLAYOUT_PRIME_MS = int(os.getenv("PLAYOUT_PRIME_MS", "600"))
+# 아주 짧은 대답("네!")은 PLAYOUT_PRIME_MS를 영영 못 채울 수 있으니, 첫 오디오가 들어온
+# 뒤 이 시간이 지나면 덜 찼어도 그냥 재생을 시작한다.
+PLAYOUT_PRIME_TIMEOUT_SEC = float(os.getenv("PLAYOUT_PRIME_TIMEOUT_SEC", "0.5"))
 
 
 class EchoCanceller:
@@ -95,56 +109,103 @@ class MicStreamer:
 
 
 class Speaker:
+    """재생 대기 오디오를 하나의 bytearray로 들고 있다가 출력 콜백에 실어 보낸다.
+
+    플레이아웃 지터 버퍼(2026-08-10): 버퍼가 빈 상태에서 새 발화가 시작되면 곧장
+    재생하지 않고 PLAYOUT_PRIME_MS만큼(또는 PLAYOUT_PRIME_TIMEOUT_SEC까지) 먼저
+    쌓아둔 다음 재생을 시작한다 — 위 PLAYOUT_PRIME_MS 주석 참고. 재생 도중 버퍼가
+    마르면 다시 이 대기 상태로 돌아가, 같은 자리에서 잘게 반복해서 끊기지 않게 한다.
+    """
+
     def __init__(self, echo_canceller: "EchoCanceller | None" = None):
         self._aec = echo_canceller
-        self._q: "queue.Queue[bytes]" = queue.Queue()
-        self._leftover = b""
-        # 큐가 말라서 무음으로 메꾼 횟수/총 길이 — 실시간 콜백 안에서는 print 같은 블로킹
-        # I/O를 하면 안 되므로(그 자체가 다음 콜백을 더 지연시켜 언더런을 악화시킬 수 있음)
+        # 콜백(오디오 스레드)과 play()/stop_immediately()(recv_loop 스레드)가 같이
+        # 건드리므로 락으로 보호한다. 콜백이 잡는 구간은 슬라이스 하나뿐이라 짧다.
+        self._lock = threading.Lock()
+        self._buf = bytearray()
+        self._prime_bytes = int(OUTPUT_RATE * PLAYOUT_PRIME_MS / 1000) * 2
+        self._priming = True
+        self._prime_since: float | None = None
+        # 발화 도중 재생이 끊겼던 횟수/총 길이 — 실시간 콜백 안에서는 print 같은 블로킹
+        # I/O를 하면 안 되므로(그 자체가 다음 콜백을 더 지연시켜 상황을 악화시킬 수 있음)
         # 그냥 카운터만 늘리고, 세션이 끝난 뒤 launcher.py가 요약해서 한 번만 출력한다.
         #
-        # 콜백 자체는 스트림이 열려있는 내내 계속 돈다 — 모티가 말을 안 하고 사용자가
-        # 말하는 중이거나 대화 사이 공백일 때도 큐는 당연히 비어있다. 그걸 전부 "언더런"으로
-        # 세면 숫자가 크게 부풀려진다(실측: 실제 대화에서 1764회/175초로 찍혔는데 체감
-        # 문제는 거의 없었음 — 대부분 그냥 "말 안 하는 시간"이었던 것). 그래서 마지막
-        # play() 호출 후 SILENCE_GAP_SEC 이내에 큐가 마른 경우만 진짜 언더런으로 센다
-        # (한창 재생 중인데 다음 조각이 안 와서 비는 경우) — 그보다 오래 조용했으면
-        # "원래 할 말이 없는 시간"으로 보고 세지 않는다.
+        # 세는 방식(2026-08-10에 재작성): "버퍼가 빈 순간부터 재생이 실제로 재개되기까지"를
+        # 하나의 끊김으로 보고 그 길이를 통째로 잰다. 예전에는 콜백 한 번의 모자란 바이트만
+        # 셌는데, 버퍼가 마르면 쿠션을 다시 채우느라 그 뒤로도 계속 무음이 나가고 그 구간은
+        # priming이라 세지 않아서 **실제 무음의 1/5밖에 보고하지 않았다**(실측: 진짜 520ms
+        # 무음을 "2회/100ms"로 보고). 실물 로그의 "16회/638ms"도 그래서 실제보다 한참 작은
+        # 숫자였다. 이제는 끊긴 구간 전체를 잰다.
+        #
+        # 발화 사이의 정상적인 침묵(모티가 할 말이 없는 시간, 사용자가 말하는 시간)까지
+        # 세면 숫자가 무의미해지므로(예전에 1764회/175초로 부풀려진 적 있음), 재생이 다시
+        # 시작될 때까지의 공백이 MAX_MIDSPEECH_GAP_SEC 이하일 때만 "발화 도중 끊김"으로
+        # 본다 — 그보다 길면 원래 조용한 구간이었다고 보고 세지 않는다.
         self.underrun_count = 0
         self.underrun_ms_total = 0.0
-        self._last_play_time = 0.0
-        self.SILENCE_GAP_SEC = 2.0
+        self._dry_since: float | None = None
+        self.MAX_MIDSPEECH_GAP_SEC = 1.5
         self._stream = sd.OutputStream(
             samplerate=OUTPUT_RATE, channels=1, dtype="int16",
             blocksize=2400, callback=self._callback,
         )
 
+    @property
+    def pending_sec(self) -> float:
+        """아직 재생되지 않고 남아있는 오디오 길이(초). launcher.py가 "로봇이 실제로
+        말을 다 끝냈는지"를 고정 상수로 어림잡지 않고 물어보는 데 쓴다."""
+        with self._lock:
+            return len(self._buf) / 2 / OUTPUT_RATE
+
     def _callback(self, outdata, frames, time_info, status):
         need = frames * 2
-        buf = self._leftover
-        while len(buf) < need:
-            try:
-                buf += self._q.get_nowait()
-            except queue.Empty:
-                break
-        chunk, self._leftover = buf[:need], buf[need:]
-        shortfall = need - len(chunk)
-        if shortfall > 0 and (time.monotonic() - self._last_play_time) < self.SILENCE_GAP_SEC:
+        now = time.monotonic()
+        resumed_after = None
+        with self._lock:
+            if self._priming and self._buf:
+                filled = len(self._buf) >= self._prime_bytes
+                timed_out = (self._prime_since is not None
+                             and now - self._prime_since >= PLAYOUT_PRIME_TIMEOUT_SEC)
+                if filled or timed_out:
+                    self._priming = False
+            if self._priming:
+                chunk = b""
+            else:
+                chunk = bytes(self._buf[:need])
+                del self._buf[:need]
+                if chunk and self._dry_since is not None:
+                    # 재생이 실제로 재개된 순간에야 "얼마나 비어 있었는지"가 확정된다.
+                    resumed_after = now - self._dry_since
+                    self._dry_since = None
+                if not self._buf:
+                    # 다 비었다 — 다음 발화는 쿠션을 다시 채우고 시작해야 같은 자리에서
+                    # 또 끊기지 않는다(정상적인 발화 종료도 여기로 온다. 그 경우엔 다음
+                    # 재생까지의 간격이 길어서 아래 판정에서 끊김으로 안 세어진다).
+                    self._priming = True
+                    self._prime_since = None
+                    if self._dry_since is None:
+                        self._dry_since = now
+        if resumed_after is not None and resumed_after <= self.MAX_MIDSPEECH_GAP_SEC:
             self.underrun_count += 1
-            self.underrun_ms_total += (shortfall / 2) / OUTPUT_RATE * 1000
-        chunk = chunk + b"\x00" * shortfall
+            self.underrun_ms_total += resumed_after * 1000
+        chunk = chunk + b"\x00" * (need - len(chunk))
         if self._aec is not None:
             self._aec.push_far(chunk)
         outdata[:] = np.frombuffer(chunk, dtype="int16").reshape(-1, 1)
 
     def play(self, pcm_bytes: bytes):
-        self._last_play_time = time.monotonic()
-        self._q.put(pcm_bytes)
+        with self._lock:
+            self._buf += pcm_bytes
+            if self._priming and self._prime_since is None:
+                self._prime_since = time.monotonic()
 
     def stop_immediately(self):
-        with self._q.mutex:
-            self._q.queue.clear()
-        self._leftover = b""
+        with self._lock:
+            self._buf.clear()
+            self._priming = True
+            self._prime_since = None
+            # barge-in으로 일부러 끊은 것이라 "발화 도중 끊김"이 아니다.
+            self._dry_since = None
 
     def __enter__(self):
         self._stream.start()

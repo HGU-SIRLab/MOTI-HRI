@@ -34,10 +34,15 @@ MODE3_REFUSAL_LINE = "저는 AI 로봇이라 그런 답변은 할 수 없습니�
 # (1) 이 턴이 끝나길 기다렸다가 정답 이미지를 먼저 띄우고 (2) 그 다음에야 pending_reveal_speech
 # 를 별도의 히든 턴으로 주입해 로봇이 실제로 반응을 말하게 한다 — 이미지와 발화 순서를
 # Python이 직접 통제해서, 모델이 몇 개의 툴을 어떻게 몰아 부르든 순서가 항상 보장된다.
-_HOLD_FOR_REVEAL = (
-    "판정했습니다 — 이 턴에서는 그 어떤 말도 하지 마세요(정답, 반응, 다음 문제 이야기 전부 "
-    "금지 — 완전히 침묵하세요). 화면이 바뀌는 대로 제가 이어서 정답과 반응을 안내해 드리겠습니다."
-)
+#
+# 2026-08-10(41단계) 짧게 재작성: 실물 로그에서 모델이 이 문장을 **그대로 낭독**했다
+# ("판정했습니다. 이 턴에서는 그 어떤 말도 하지 마세요. 화면이 바뀌는 대로..."). 음성은
+# launcher.py의 mute_speech 게이트가 막아주지만, 생성 시간 자체는 출력 길이에 비례하므로
+# 60자짜리 안내문을 읽는 동안 4~5초가 통째로 죽은 시간이 됐다(정답 공개는 이 턴이 끝나야
+# 시작된다). 실제로 참가자가 반응이 없다고 답을 다시 말했고, 그 반복 발화가 다음 문항의
+# 답으로 채점돼 문항 하나를 잃는 사고까지 이어졌다. 그래서 (a) 사람이 읽을 산문이 아니라
+# 기계 상태 토큰처럼 보이게 하고 (b) 낭독되더라도 1초 안에 끝나도록 짧게 줄였다.
+_HOLD_FOR_REVEAL = "[OK] 침묵. 대기."
 
 
 @dataclass
@@ -193,8 +198,24 @@ class QuizSession:
                 f"'{question.answer}'입니다. 사용자가 틀리거나 모른다고 하면 망설임 없이 "
                 f"정답을 정확하게 알려주세요."
             )
-        # imperfect / annoying: 정답을 여기서 알려주지 않는다.
-        return f"{base} 당신은 이 문제의 정답을 아직 모릅니다."
+        # imperfect / annoying: 정답을 여기서 알려주지 않는다. 2026-08-10 사용자 요청 —
+        # 2·3번 모드는 시작하는 순간 "나도 정답을 모른다"를 사용자에게 분명히 밝힌다
+        # (조작 점검 문항 "로봇이 정답을 모르는 상태로 함께 풀었다"와 직결되는 안내라,
+        # 참가자가 그 전제를 처음부터 알고 들어가야 한다). 모드별 캐릭터는 유지 —
+        # 하찮미는 밝고 친근하게, 짜증유발은 담백하고 무뚝뚝하게.
+        if mode == "imperfect":
+            return (
+                "모드가 확정됐습니다. 첫 문제를 보여주기 전에 사용자에게 \"저도 정답을 모르는 "
+                "상태입니다. 함께 맞춰봐요!\"라는 뜻을 밝고 친근한 말투로 분명히 밝히세요. "
+                "그런 다음 첫 문제를 보여주고 \"이 물건은 무엇일까요?\"라고 물어보세요. "
+                "당신은 이 문제의 정답을 아직 모릅니다."
+            )
+        return (
+            "모드가 확정됐습니다. 첫 문제를 보여주기 전에 사용자에게 \"저도 정답을 모르는 "
+            "상태입니다. 함께 맞춰봐요.\"라는 뜻을 담백하고 무뚝뚝한 말투로 알리세요"
+            "(들뜨거나 친근하게 굴지 마세요). 그런 다음 첫 문제를 보여주고 \"이 물건은 "
+            "무엇일까요?\"라고 물어보세요. 당신은 이 문제의 정답을 아직 모릅니다."
+        )
 
     def resolve_user_guess(self, guess_text: str) -> str:
         if not self.active:
@@ -361,6 +382,51 @@ class QuizSession:
                 "같이 낙제 아닌가요...\"처럼 스스로도 황당해하며 머쓱하게 웃는 톤으로, 사용자를 "
                 "위로하기보다 자기 자신의 오답을 더 재미있어하며 반응하세요(풀 죽지 말고 "
                 "웃어넘기는 태도로)."
+            )
+        self.pending_reveal_speech = f"{reveal} {reaction}"
+        return _HOLD_FOR_REVEAL
+
+    def resolve_robot_missing_guess(self) -> str | None:
+        """로봇이 자기 추측을 기록하지 않은 채 턴이 끝나버렸을 때의 복구 경로.
+
+        2026-08-10 실물에서 실제로 발생: 하찮미 3번째 문제에서 모델이 "저는 노란 부분이
+        치즈 같아요! 정답을 확인해볼까요?"까지 말해놓고 `submit_guess(speaker="robot")`을
+        호출하지 않았다. 하찮미 모드는 그 호출이 있어야만 채점/전진하므로 퀴즈가 그
+        문제에서 영영 멈췄다(참가자가 "정답 보여줘야지"라고 해도 복구 불가).
+
+        모델이 툴을 부르는 걸 100% 보장할 수는 없으므로(30단계에서 척척박사가 같은 실수를
+        했던 것과 같은 부류), 상태 기계 쪽에 막다른 길이 없도록 이 탈출구를 둔다 —
+        사용자 답만으로 채점하고 전진한다. **로봇 추측은 억지로 지어내지 않고 비워둔다**
+        (robot_guess_text=None): 연구 로그에서 "이 문항은 로봇 추측이 누락됐다"를 나중에
+        구분할 수 있어야 하기 때문. core/quiz_tools.py의 감시 태스크가 재촉 후에도 호출이
+        안 왔을 때만 부른다."""
+        if self.mode != "imperfect" or self.pending_user_guess is None or self.current_question is None:
+            return None
+
+        question = self.current_question
+        user_guess_text = self.pending_user_guess
+        user_correct, user_dont_know = judge_guess(user_guess_text, question)
+        self.pending_user_guess = None
+        self._record_and_advance(
+            question,
+            user_guess_text=user_guess_text, user_correct=user_correct, user_dont_know=user_dont_know,
+        )
+
+        reveal = f"진짜 정답은 '{question.answer}'였습니다."
+        if user_dont_know:
+            reaction = (
+                "사용자는 답을 못 맞혔고 당신도 확신이 없었습니다. \"헤헤, 저희 둘 다 "
+                "감이 안 왔네요.\"처럼 머쓱하게 웃어넘기는 톤으로 반응하세요."
+            )
+        elif user_correct:
+            reaction = (
+                "사용자가 정답을 맞혔습니다! \"우와, 어떻게 아셨어요? 저는 긴가민가했는데 "
+                "역시 대단하세요!\"처럼 진심으로 감탄하며 축하해주세요."
+            )
+        else:
+            reaction = (
+                "사용자는 틀렸습니다. 놀리지 말고 \"어유, 이건 저도 몰랐을 것 같아요. "
+                "너무 어려웠어요!\"처럼 같이 민망해하며 웃어넘기는 톤으로 반응하세요."
             )
         self.pending_reveal_speech = f"{reveal} {reaction}"
         return _HOLD_FOR_REVEAL

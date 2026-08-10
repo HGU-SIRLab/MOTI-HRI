@@ -32,14 +32,25 @@ VOICE_FORMANT_RATIO = float(os.getenv("VOICE_FORMANT_RATIO", "1.12"))
 MIN_SHIFT_SAMPLES = 2400  # 24kHz 기준 100ms
 
 # 로봇 실사용(얼굴추적/모터/표정 UI가 전부 같이 도는 상황)에서 "지직거림"·"대화가 먹힘"
-# 제보 발생(2026-07-28) — 개발 PC 단독 벤치마크(500ms 청크 평균 156ms)로는 여유 있었지만,
-# 실제 로봇은 다른 스레드들과 CPU를 나눠 써서 harvest 처리가 버퍼 크기를 넘기면 Speaker의
-# 재생 큐가 말라 무음으로 메꿔지는 언더런이 생길 수 있다(Speaker.underrun_count 참고).
-# 500ms → 700ms로 한 번 올렸는데도 실측(Speaker.underrun_count의 "말하는 중" 오탐 버그를
-# 고친 뒤 재측정)으로 80회/7.8초(실제 발화 시간의 25~35%)가 나와 여전히 부족함을 확인 →
-# 700 → 1200으로 재상향. 그만큼 발화 시작 지연도 늘어남(트레이드오프) — 안 좋아지면
-# 700으로 롤백.
-VOICE_SHIFT_BUFFER_MS = int(os.getenv("VOICE_SHIFT_BUFFER_MS", "1200"))
+# 제보가 반복됐고, 그때마다 이 값을 키워서 대응했다(500 → 700 → 1200ms). **전부 헛다리였다**
+# — 2026-08-10에 실측·분석으로 원인을 확정: 이 버퍼를 키우는 것은 언더런에 대한 여유를
+# 조금도 늘려주지 못한다.
+#
+# 이유: 워커는 buffer_ms만큼 오디오가 다 모여야 변조를 시작하고, 끝나면 한 블록을 통째로
+# 스피커에 넣는다. 서버가 오디오를 실시간 속도로 보내주는 구간에서는
+#   블록 N의 변조 완료 시각 = N*B + P,  블록 N의 재생 시작 필요 시각 = N*B + P
+# 로 **정확히 같다**(B=버퍼, P=변조 시간). 즉 여유가 항상 0이고, 이 결론은 B에도 P에도
+# 의존하지 않는다 — B를 키우면 발화 시작 지연만 그만큼 늘 뿐이다.
+# 실측(scripts/test_playout_margin.py): 이 PC에서 P/B ≈ 0.24로 CPU는 전혀 부족하지
+# 않았고(pyworld는 GIL도 정상적으로 놓는다), 그런데도 한가한 개발 PC에서조차 6초 발화마다
+# 무음이 끼었다 — 문제는 CPU가 아니라 순전히 이 구조였다.
+# 진짜 해법은 재생 시작 자체를 늦춰 쿠션을 만드는 것 —
+# media/audio_manager.py의 PLAYOUT_PRIME_MS(플레이아웃 지터 버퍼)가 그 역할을 한다.
+#
+# 그래서 여기서는 오히려 원래 값(500ms)으로 되돌린다: 블록이 작을수록 발화 시작이 빠르고,
+# 한 블록이 늦어졌을 때 손해도 작다(스피커 큐가 더 촘촘히 채워짐). 경계 아티팩트는
+# VOICE_SHIFT_OVERLAP_MS 크로스페이드가 따로 책임진다.
+VOICE_SHIFT_BUFFER_MS = int(os.getenv("VOICE_SHIFT_BUFFER_MS", "500"))
 
 # 청크를 서로 독립적으로 pyworld 처리하면 경계에서 F0/스펙트럼 추정이 어긋나 톤이 뚝
 # 끊기는 불연속이 생긴다 — "편하게 말씀해주세요"가 "말...씀"처럼 들리던 실사용 제보
@@ -50,10 +61,27 @@ VOICE_SHIFT_BUFFER_MS = int(os.getenv("VOICE_SHIFT_BUFFER_MS", "1200"))
 # pyworld 처리량도 ~10% 늘어나는 트레이드오프.
 VOICE_SHIFT_OVERLAP_MS = int(os.getenv("VOICE_SHIFT_OVERLAP_MS", "120"))
 
-# turn_complete 이후에도 이 버퍼만큼 오디오가 아직 재생 중일 수 있어, 그 뒤에야 다음 턴을
-# 안전하게 보내거나(launcher.py의 inject_turn) 정답 공개 화면을 띄울 수 있는(core/quiz_tools.py)
-# 곳이 여러 군데라 여기서 한 번만 계산해 공유한다(2배 여유 — 오버랩 홀드백 120ms까지
-# 포함하고도 남는 마진).
+# 입력이 이 시간만큼 끊기면, 버퍼가 buffer_ms를 못 채웠어도 지금까지 모인 자투리를 바로
+# 내보낸다(2026-08-10, 41단계 — "문장 끝에서 먹히는" 증상의 진짜 원인).
+#
+# 예전엔 자투리를 오직 flush()가 올 때만 내보냈는데, flush()는 launcher.py가 서버의
+# turn_complete를 받아야 부른다. 그런데 Live API의 turn_complete는 마지막 오디오 청크보다
+# 늦게 온다(서버가 출력 전사 등을 마무리한 뒤 보냄) — 그 지연 동안 스피커는 계속 재생하니,
+# 재생 쿠션이 바닥나면 **정확히 마지막 블록 경계**에서 무음이 들어간다. 발화가 짧을수록
+# 그 경계가 문장 한복판에 놓여서, "이 물건은 무엇일까요?"는 매번 '무엇'과 '일까요?' 사이가
+# 끊겼다(실물 제보와 정확히 일치, scripts/test_voice_shift.py의 지연 재현 테스트 참고).
+#
+# 유휴 방출은 is_flush=False로 처리하므로 오버랩/크로스페이드 상태가 그대로 유지된다 —
+# 뒤이어 오디오가 더 와도 연속성이 깨지지 않는다(그래서 turn_complete를 기다릴 이유가 없다).
+VOICE_SHIFT_IDLE_FLUSH_MS = int(os.getenv("VOICE_SHIFT_IDLE_FLUSH_MS", "150"))
+
+# turn_complete 이후에도 아직 재생 중인 오디오가 남아있을 수 있어, 그게 다 흘러나간 뒤에야
+# 다음 턴을 안전하게 보내거나(launcher.py의 inject_turn) 정답 공개 화면을 띄울 수 있다
+# (core/quiz_tools.py). **이 상수는 이제 폴백일 뿐이다** — 실제 launcher.py는 남은 재생
+# 길이를 Speaker/VoiceShifter에 직접 물어보는 drain_playback()을 쓴다(2026-08-10, 40단계).
+# 플레이아웃 지터 버퍼가 생기면서 "남은 재생 시간"이 더 이상 버퍼 크기만으로 표현되지
+# 않게 됐고, 고정 상수로 어림잡으면 매 턴 뒤에 불필요한 무음(예전엔 2.4초)이 붙었다.
+# 여전히 남겨두는 이유: launcher.py 없이 도는 오프라인 테스트/스크립트의 기본값.
 POST_SPEECH_DRAIN_SEC = (VOICE_SHIFT_BUFFER_MS * 2) / 1000
 
 
@@ -100,6 +128,10 @@ class VoiceShifter:
     원본 톤으로 재생되던 문제(원본/변환본 톤 차이)를 함께 해결한다. 항상 출력 꼬리
     `overlap_ms`만큼을 다음 청크와 섞기 위해 들고 있으므로 재생이 그만큼 더 지연된다.
 
+    자투리 방출(2026-08-10): 버퍼가 다 안 찼어도 입력이 idle_flush_ms만큼 끊기면 곧장
+    내보낸다 — turn_complete를 기다리다 문장 끝이 무음으로 끊기던 문제 대응
+    (위 VOICE_SHIFT_IDLE_FLUSH_MS 주석에 원인과 재현 근거).
+
     barge-in 처리(2026-08-07): reset()이 세대 번호를 올리고, feed()가 넣은 데이터엔
     그 시점 세대가 태깅된다. 워커는 (1) 큐에서 꺼낼 때 (2) 오래 걸리는 pyworld 처리를
     마치고 재생 직전, 두 번 세대를 검사한다 — 이전엔 reset 마커가 큐 뒤에 줄을 서는
@@ -108,11 +140,13 @@ class VoiceShifter:
     """
 
     def __init__(self, on_shifted, sample_rate: int, buffer_ms: int = VOICE_SHIFT_BUFFER_MS,
-                 overlap_ms: int = VOICE_SHIFT_OVERLAP_MS):
+                 overlap_ms: int = VOICE_SHIFT_OVERLAP_MS,
+                 idle_flush_ms: int = VOICE_SHIFT_IDLE_FLUSH_MS):
         self._on_shifted = on_shifted
         self._sr = sample_rate
         self._buffer_bytes = int(sample_rate * buffer_ms / 1000) * 2  # int16 = 2 bytes/sample
         self._overlap_bytes = int(sample_rate * overlap_ms / 1000) * 2
+        self._idle_flush_sec = idle_flush_ms / 1000
         self._buf = bytearray()
         self._in_q: "queue.Queue[tuple[str, bytes | None, int]]" = queue.Queue()
         self._stop = threading.Event()
@@ -124,8 +158,24 @@ class VoiceShifter:
         # reset() 세대 번호. feed/reset은 같은 스레드(recv_loop)에서만 불리고 워커는
         # 읽기만 하므로 락 없이 int 갱신으로 충분하다(GIL).
         self._gen = 0
+        # 아직 스피커로 안 나간 오디오 바이트 수(먹인 양 - 내보낸 양). feed()는 recv_loop
+        # 스레드, 차감은 워커 스레드라 락으로 보호한다 — launcher.py의 drain_playback()이
+        # "로봇이 정말 말을 다 끝냈는지"를 판단하는 데 쓴다.
+        self._pending_lock = threading.Lock()
+        self._pending_bytes = 0
+
+    @property
+    def pending_sec(self) -> float:
+        """변조 대기/처리 중이라 아직 스피커로 넘어가지 않은 오디오 길이(초)."""
+        with self._pending_lock:
+            return self._pending_bytes / 2 / self._sr
+
+    def _account(self, delta: int):
+        with self._pending_lock:
+            self._pending_bytes = max(0, self._pending_bytes + delta)
 
     def feed(self, pcm_bytes: bytes):
+        self._account(len(pcm_bytes))
         self._in_q.put(("data", pcm_bytes, self._gen))
 
     def flush(self):
@@ -136,13 +186,27 @@ class VoiceShifter:
         """barge-in 등으로 재생을 즉시 끊을 때 — 큐에 쌓였거나 처리 중이던 미재생 오디오를
         전부 폐기한다(Speaker.stop_immediately()와 함께 호출할 것)."""
         self._gen += 1
+        with self._pending_lock:
+            self._pending_bytes = 0
         self._in_q.put(("reset", None, self._gen))
 
     def _run(self):
         while not self._stop.is_set():
             try:
-                kind, payload, gen = self._in_q.get(timeout=0.2)
+                kind, payload, gen = self._in_q.get(timeout=self._idle_flush_sec)
             except queue.Empty:
+                # 입력이 끊긴 채 유휴 — 붙잡고 있던 자투리를 turn_complete까지 기다리지
+                # 말고 지금 내보낸다(위 VOICE_SHIFT_IDLE_FLUSH_MS 주석). is_flush=False라
+                # 오버랩 꼬리는 계속 들고 있으므로 뒤에 오디오가 더 와도 이어붙는다.
+                #
+                # 단, 내보낼 분량이 오버랩보다 짧으면 안 된다 — 그러면 붙잡아둘 출력 꼬리가
+                # overlap 길이에 못 미쳐서 다음 크로스페이드가 길이 불일치로 터지고, 변조
+                # 스레드가 죽어 그 세션 내내 로봇이 벙어리가 된다(실제로 재현됨).
+                # 남은 게 오버랩보다 짧다면 어차피 120ms 미만이라 재생 쿠션 안에 묻힌다.
+                if len(self._prev_in_tail) + len(self._buf) > self._overlap_bytes:
+                    chunk = bytes(self._buf)
+                    self._buf.clear()
+                    self._emit_block(chunk, self._gen, is_flush=False)
                 continue
 
             if kind == "reset":
@@ -154,16 +218,25 @@ class VoiceShifter:
                 # reset() 이전에 feed()된 스테일 오디오 — 처리도 재생도 하지 않는다.
                 continue
 
-            if kind == "data":
-                self._buf.extend(payload)
-                while len(self._buf) >= self._buffer_bytes:
-                    chunk = bytes(self._buf[:self._buffer_bytes])
-                    del self._buf[:self._buffer_bytes]
-                    self._emit_block(chunk, gen, is_flush=False)
-            elif kind == "flush":
-                chunk = bytes(self._buf)
-                self._buf.clear()
-                self._emit_block(chunk, gen, is_flush=True)
+            try:
+                if kind == "data":
+                    self._buf.extend(payload)
+                    while len(self._buf) >= self._buffer_bytes:
+                        chunk = bytes(self._buf[:self._buffer_bytes])
+                        del self._buf[:self._buffer_bytes]
+                        self._emit_block(chunk, gen, is_flush=False)
+                elif kind == "flush":
+                    chunk = bytes(self._buf)
+                    self._buf.clear()
+                    self._emit_block(chunk, gen, is_flush=True)
+            except Exception as e:
+                # 이 스레드가 죽으면 그 세션 내내 로봇이 한 마디도 못 한다 — 실험 도중
+                # 그렇게 되는 게 최악이라, 어떤 예외든 여기서 삼키고 오버랩 상태만 초기화한
+                # 뒤 계속 돈다(그 한 블록은 잃지만 다음 발화부터 정상 복귀). 2026-08-10에
+                # 실제로 유휴 방출이 길이 불일치로 이 스레드를 죽이는 버그가 있었다.
+                print(f"⚠️ 음성 변조 블록 처리 실패({e!r}) — 이 조각만 건너뛰고 계속합니다.")
+                self._prev_in_tail = b""
+                self._prev_out_tail = b""
 
     def _shift_same_length(self, pcm_bytes: bytes):
         """shift_pcm을 돌리되 결과를 입력과 정확히 같은 샘플 수로 맞춰 돌려준다(int16 배열).
@@ -202,6 +275,7 @@ class VoiceShifter:
                 self._prev_in_tail = b""
                 self._prev_out_tail = b""
                 if gen == self._gen:
+                    self._account(-len(tail))
                     self._on_shifted(tail)
             return
 
@@ -227,7 +301,9 @@ class VoiceShifter:
             self._prev_in_tail = b""
             self._prev_out_tail = b""
             return
-        self._on_shifted(emit.tobytes())
+        out_bytes = emit.tobytes()
+        self._account(-len(out_bytes))
+        self._on_shifted(out_bytes)
 
     def start(self):
         self._thread.start()

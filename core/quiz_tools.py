@@ -24,10 +24,39 @@ STALL_MAX_SEC = 12.0
 # 다 마친 순간부터 시작한다(아래 _delayed_reveal_and_advance 참고) — 툴 호출 시점부터
 # 세면 아직 안 끝난 발화 도중에 화면이 넘어가버린다.
 REVEAL_HOLD_SEC = 4.0
+# 하찮미 모드에서 로봇이 자기 추측을 말한 턴이 끝난 뒤, submit_guess(speaker="robot")가
+# 도착하길 이만큼 더 기다려본다(모델이 다음 턴에 뒤늦게 부르는 경우가 있어 여유를 둔다).
+ROBOT_GUESS_GRACE_SEC = 2.0
+
+# 정답/반응을 말하라고 주입하는 히든 턴 뒤에 항상 붙이는 제약(2026-08-10, 40단계).
+# 실물 로그에서 모델이 반응을 말한 김에 "다음 문제입니다. 이 물건은 무엇일까요?"까지
+# 이어서 말해버렸다 — 그런데 그 시점엔 화면이 아직 정답 공개 사진이고, 다음 문제 사진은
+# REVEAL_HOLD_SEC 뒤에야 뜬다. 그래서 참가자는 아직 보지도 못한 문제를 질문받고,
+# 잠시 뒤 화면이 바뀌면서 next_question_prompt()가 같은 질문을 또 하게 된다
+# ("이 물건은 무엇일까요?"가 두 번 나오는 실물 제보의 원인).
+_REVEAL_SPEECH_SUFFIX = (
+    " 그리고 이 턴에서는 위 반응까지만 말하고 곧바로 멈추세요 — 다음 문제를 소개하거나 "
+    "\"이 물건은 무엇일까요?\"라고 미리 묻지 마세요(다음 사진은 아직 화면에 뜨지 않았습니다). "
+    "다음 문제가 실제로 화면에 뜨면 그때 제가 따로 알려드립니다."
+)
+
+# 사용자가 아직 아무 말도 안 했는데 모델이 submit_guess를 부를 때 돌려주는 가드.
+# 실물 로그(2026-08-10 척척박사)에서 모델이 guess_text="사용자의 말을 기다리는 중",
+# "사용자의 대답을 기다리는 중"으로 두 번 호출했고, 그때마다 그 문항이 오답으로 채점되고
+# 소모됐다 — 5문항 중 2문항이 참가자가 보지도 못한 채 오답으로 기록된 셈이라 연구 데이터
+# 무결성 문제다. 잘못 막았더라도 사용자가 실제로 답했다면 다음 턴에 다시 호출되므로
+# 손해는 턴 하나뿐이고, 반대로 안 막으면 문항이 조용히 사라진다.
+_NO_USER_SPEECH_GUARD = (
+    "사용자는 아직 이 문제에 대해 아무 말도 하지 않았습니다 — 방금 넘긴 것은 사용자의 답이 "
+    "아닙니다. 이 툴을 부르지 말고, 아무 말도 하지 말고 사용자가 실제로 답할 때까지 조용히 "
+    "기다리세요."
+)
 
 
 def make_quiz_tools(quiz_ui_q, busy: threading.Event, motion_ctx, inject_turn, loop,
-                     turn_seq: list, emotion_queue=None, num_questions: int = 5):
+                     turn_seq: list, emotion_queue=None, num_questions: int = 5,
+                     drain_playback=None, mute_speech: list | None = None,
+                     user_spoke: list | None = None):
     """motion_ctx = (port, pkt, lock, shared_state, home_pan, home_tilt) — launcher.py가
     core.motion_tools.make_motion_tools에 넘기는 것과 같은 튜플. busy도 그쪽과 같은
     threading.Event를 공유해야 퀴즈 리액션 모션과 LLM이 부르는 제스처가 같은 모터를
@@ -41,6 +70,15 @@ def make_quiz_tools(quiz_ui_q, busy: threading.Event, motion_ctx, inject_turn, l
     Event보다 정확하게 표현한다(아래 _wait_for_turn_after 참고 — Event는 "이미 끝난
     상태"와 "아직 시작 전이라 우연히 끝난 것처럼 보이는 상태"를 구분 못 해 정답 공개가
     로봇이 말하기도 전에 뜨는 경합이 있었다, 2026-08-08).
+
+    drain_playback/mute_speech/user_spoke도 launcher.py가 넘기는 오디오·발화 상태 훅이다
+    (전부 선택 — 안 넘기면 오프라인 테스트에서 기존 동작 그대로 돈다):
+      - drain_playback(): 아직 재생이 안 끝난 오디오가 다 빠질 때까지 기다리는 코루틴.
+        안 주면 예전처럼 POST_SPEECH_DRAIN_SEC만큼 그냥 잔다.
+      - mute_speech: 1칸짜리 리스트. True인 동안 launcher.py가 모델 오디오를 재생하지
+        않고 버린다 — 침묵 지시를 어긴 발화를 파이썬이 강제로 막는 용도.
+      - user_spoke: 1칸짜리 리스트. 사용자가 실제로 말하면 launcher.py가 True로 올리고,
+        submit_guess가 판정에 쓰면서 다시 False로 소비한다(_NO_USER_SPEECH_GUARD 참고).
     """
     port, pkt, lock, shared_state, home_pan, home_tilt = motion_ctx
     # 크래시 복구용(docs/experiment_design.md §1-1): 세션이 도중에 죽어 launcher를
@@ -60,6 +98,104 @@ def make_quiz_tools(quiz_ui_q, busy: threading.Event, motion_ctx, inject_turn, l
     # _pending_stall과 같은 이유로(가비지 컬렉션 방지) 붙잡아둔다 — 정답 공개 화면을
     # REVEAL_HOLD_SEC 뒤 다음 문제로 넘기는 지연 태스크.
     _pending_reveal_transition = {"task": None}
+    # 침묵 지시를 내린 턴이 끝나면 음소거를 자동으로 푸는 태스크(위 두 개와 같은
+    # 가비지 컬렉션 방지용 참조 보관).
+    _pending_unmute = {"task": None}
+    # 하찮미 모드에서 로봇 자신의 추측 판정(submit_guess(speaker="robot"))이 오는지
+    # 지켜보는 감시 태스크 — 안 오면 퀴즈가 그 문제에서 영영 멈춘다(아래 참고).
+    _pending_robot_guess_watch = {"task": None}
+
+    async def _drain_audio():
+        if drain_playback is not None:
+            await drain_playback()
+        else:
+            # 모듈 전역을 호출 시점에 읽는다 — 오프라인 테스트가 이 값을 짧게 패치한다.
+            await asyncio.sleep(POST_SPEECH_DRAIN_SEC)
+
+    def _set_mute(on: bool):
+        if mute_speech is not None:
+            mute_speech[0] = on
+
+    async def _unmute_after_turn(baseline: int, timeout: float = 20.0):
+        try:
+            # 턴 종료 신호가 영영 안 오는 상황(세션 사망 등)에서도 로봇이 그 뒤로 계속
+            # 벙어리로 남지 않도록 상한을 둔다 — 음소거는 어디까지나 한 턴짜리 안전장치다.
+            await asyncio.wait_for(_wait_for_turn_after(baseline), timeout)
+        except asyncio.TimeoutError:
+            print("⚠️ 침묵 지시 턴이 제시간에 끝나지 않아 음소거를 강제로 해제합니다.")
+        finally:
+            # 취소되든 정상 종료되든 반드시 음소거를 푼다 — 여기서 새면 로봇이 그 뒤로
+            # 계속 벙어리가 되는 최악의 실패 모드라, 실패 경로를 반드시 덮는다.
+            _set_mute(False)
+            _pending_unmute["task"] = None
+
+    def _mute_until_turn_ends():
+        """"이 턴에서는 침묵하세요"라는 지시를 내린 직후에 호출한다 — 그 지시를 어기고
+        나오는 오디오를 재생하지 않도록 launcher.py의 게이트를 닫고, 그 턴이 실제로
+        끝나면 다시 연다. 같은 턴에서 두 번 호출되면(하찮미의 user->robot 연속 판정)
+        이미 걸어둔 태스크를 그대로 둔다."""
+        if mute_speech is None:
+            return
+        _set_mute(True)
+        task = _pending_unmute["task"]
+        if task is not None and not task.done():
+            return
+        _pending_unmute["task"] = loop.create_task(_unmute_after_turn(turn_seq[0]))
+
+    def _cancel_robot_guess_watch():
+        task = _pending_robot_guess_watch["task"]
+        if task is not None and not task.done():
+            task.cancel()
+        _pending_robot_guess_watch["task"] = None
+
+    async def _watch_for_robot_guess():
+        """하찮미 모드는 로봇이 자기 추측을 말한 뒤 submit_guess(speaker="robot")를
+        불러줘야만 채점/전진한다 — 모델이 그 호출을 빼먹으면 그 문제에서 영영 멈춘다
+        (2026-08-10 실물: "치즈!"라고 말해놓고 툴을 안 불러 퀴즈가 정지, 참가자가
+        "정답 보여줘야지"라고 해도 복구 불가). 모델이 툴을 부르는 걸 100% 보장할 수는
+        없으니, 한 번 재촉하고 그래도 안 오면 사용자 답만으로 채점해 전진시킨다."""
+        try:
+            for attempt in range(2):
+                baseline = turn_seq[0]
+                await _wait_for_turn_after(baseline)
+                await asyncio.sleep(ROBOT_GUESS_GRACE_SEC)
+                if session.pending_user_guess is None:
+                    return  # 정상적으로 호출됨
+                if attempt == 0:
+                    print("⚠️ 하찮미: 로봇 추측 판정 호출이 오지 않아 한 번 재촉합니다.")
+                    await inject_turn(
+                        "당신이 방금 말한 추측이 아직 기록되지 않았습니다 — 지금 즉시 "
+                        "submit_guess(speaker=\"robot\", guess_text=<방금 말한 사물 이름>)을 "
+                        "호출하세요. 이 턴에서는 아무 말도 하지 마세요."
+                    )
+                    _mute_until_turn_ends()
+            if session.pending_user_guess is None:
+                return
+            print("⚠️ 하찮미: 재촉에도 로봇 추측이 오지 않아 사용자 답만으로 채점하고 넘어갑니다.")
+            question_before = session.current_question
+            count_before = len(session.results)
+            session.resolve_robot_missing_guess()
+            if len(session.results) > count_before:
+                reveal_speech = session.pending_reveal_speech
+                session.pending_reveal_speech = None
+                _schedule_reveal(question_before, reveal_speech)
+        finally:
+            _pending_robot_guess_watch["task"] = None
+
+    def _watch_robot_guess_if_staged():
+        """resolve_user_guess/request_hint가 하찮미 이벤트로 분기해 로봇 추측을 기다리는
+        상태(pending_user_guess가 채워진 상태)가 됐으면 감시를 건다."""
+        if session.mode != "imperfect" or session.pending_user_guess is None:
+            return
+        _cancel_robot_guess_watch()
+        _pending_robot_guess_watch["task"] = loop.create_task(_watch_for_robot_guess())
+
+    def _force_unmute():
+        task = _pending_unmute["task"]
+        if task is not None and not task.done():
+            task.cancel()
+        _pending_unmute["task"] = None
+        _set_mute(False)
 
     def _push_question_or_hide():
         q = session.current_question
@@ -71,6 +207,13 @@ def make_quiz_tools(quiz_ui_q, busy: threading.Event, motion_ctx, inject_turn, l
             # "문제당 소요시간" 지표(docs/experiment_design.md §5)의 시작점 — 화면에
             # 사진이 실제로 나가는 이 지점이 유일한 push 경로라 여기서 한 번만 찍는다.
             session.mark_question_shown()
+            # 새 사진이 뜨기 **전에** 한 말은 이 문제의 답이 될 수 없다 — 신호를 여기서
+            # 버린다. 2026-08-10 실물 로그에서 참가자가 로봇이 조용하니 이전 문제의 답을
+            # 다시 말했는데, 그게 다음 문항의 답으로 채점돼 그 문항을 통째로 잃었다
+            # (참가자는 그 사진을 보지도 못했다). user_spoke가 없으면(오프라인 테스트)
+            # 아무 일도 안 한다.
+            if user_spoke is not None:
+                user_spoke[0] = False
         else:
             quiz_ui_q.put({"type": "hide"})
 
@@ -113,11 +256,13 @@ def make_quiz_tools(quiz_ui_q, busy: threading.Event, motion_ctx, inject_turn, l
         # 툴 호출을 어떻게 몰아서 처리하든, 이미지->반응 순서는 항상 Python이 보장한다.
         baseline = turn_seq[0]
         await _wait_for_turn_after(baseline)  # 침묵 지시를 받은 턴이 끝나길 기다림
-        await asyncio.sleep(POST_SPEECH_DRAIN_SEC)
+        await _drain_audio()
         _push_reveal(question)
         if reveal_speech:
             reveal_baseline = turn_seq[0]
-            await inject_turn(reveal_speech)
+            # _REVEAL_SPEECH_SUFFIX: 반응만 말하고 다음 문제를 미리 묻지 말라는 제약을
+            # 항상 함께 보낸다(위 상수 주석 — "이 물건은 무엇일까요?" 중복 질문의 원인).
+            await inject_turn(reveal_speech + _REVEAL_SPEECH_SUFFIX)
             # 반응 발화가 실제로 끝날 때까지 기다린 뒤에야 REVEAL_HOLD_SEC(사진을 유지하는
             # 시간)을 세기 시작한다 — 안 그러면 로봇이 아직 반응을 말하는 도중에 사진이
             # 넘어가버린다.
@@ -206,9 +351,15 @@ def make_quiz_tools(quiz_ui_q, busy: threading.Event, motion_ctx, inject_turn, l
         (e.g. "심심해", "퀴즈 풀자", "재밌는 거 하자"). Takes no arguments.
         """
         if session.active:
-            return "이미 퀴즈가 진행 중입니다 — 다시 시작하지 마세요."
+            # 거절만 하면 모델이 빠져나갈 방법을 몰라 막다른 길이 된다 — 무엇을 해야
+            # 하는지 같이 알려준다(2026-08-10, select_quiz_mode의 자동 복구와 같은 취지).
+            print("⚠️ 라운드 진행 중 start_quiz 재호출 — 거절했습니다.")
+            return ("이미 퀴즈가 진행 중입니다 — 다시 시작하지 마세요. 사용자가 정말 새로 "
+                    "시작하길 원하면 먼저 end_quiz_early()를 호출해 이번 라운드를 끝내세요.")
         _cancel_pending_stall()
         _cancel_pending_reveal_transition()
+        _cancel_robot_guess_watch()
+        _force_unmute()
         text = session.start()
         quiz_ui_q.put({"type": "rules", "text": "부분 확대 사진 퀴즈를 시작합니다!"})
         return text
@@ -226,12 +377,28 @@ def make_quiz_tools(quiz_ui_q, busy: threading.Event, motion_ctx, inject_turn, l
         if mode not in VALID_MODES:
             return f"'{mode}'는 알 수 없는 모드입니다 — all_knowing/imperfect/annoying 중 하나로 다시 호출하세요."
         if session.mode is not None:
-            # 모델이 실수로 두 번 호출하면 index가 0으로 리셋돼 같은 문제가 결과 로그에
-            # 중복 기록될 위험이 있다(연구 데이터 무결성 문제) — start_quiz()의 재시작
-            # 가드와 같은 이유로 재선택을 막는다.
-            return "이미 모드가 선택되어 있습니다 — 다시 선택하지 마세요."
+            if not session.active:
+                # 앞 라운드가 끝난 뒤(active=False인데 mode는 그 라운드 값이 남아있다)
+                # 모델이 start_quiz()를 건너뛰고 곧장 다음 모드를 고른 경우 — 2026-08-10
+                # 실물에서 "1번 끝내고 2번 하자"에 퀴즈 화면이 아예 안 뜨는 사고로 나타났다.
+                # 예전엔 여기서 거절만 해서 복구 경로가 없는 막다른 길이었다(모델은 왜 화면이
+                # 안 뜨는지 알 수 없고, 거절 문구도 무엇을 해야 하는지 알려주지 않았다).
+                # 사용자가 모드 번호를 말했다는 것 자체가 새 라운드 의도이므로 자동으로 시작한다.
+                print("ℹ️ 이전 라운드가 끝난 상태에서 모드가 선택됨 — 새 라운드를 자동으로 시작합니다.")
+                session.start()
+                quiz_ui_q.put({"type": "rules", "text": "부분 확대 사진 퀴즈를 시작합니다!"})
+            else:
+                # 라운드가 실제로 진행 중인데 또 고른 경우 — 모델이 실수로 두 번 호출하면
+                # index가 0으로 리셋돼 같은 문제가 결과 로그에 중복 기록될 위험이 있다
+                # (연구 데이터 무결성 문제)라 막는다. 다만 빠져나갈 길은 알려준다.
+                print("⚠️ 라운드 진행 중 모드 재선택 시도 — 거절했습니다.")
+                return ("이미 이번 라운드의 모드가 정해져 진행 중입니다 — 다시 선택하지 마세요. "
+                        "사용자가 정말 다른 모드로 새로 시작하길 원하면 먼저 end_quiz_early()를 "
+                        "호출해 이번 라운드를 끝낸 뒤 start_quiz()부터 다시 하세요.")
         _cancel_pending_stall()
         _cancel_pending_reveal_transition()
+        _cancel_robot_guess_watch()
+        _force_unmute()
         text = session.choose_mode(mode)
         # 이미 진행한 모드 재선택이면 choose_mode가 상태를 바꾸지 않고 재확인 요청만
         # 돌려준다(2026-08-07) — 그때 화면을 건드리면 규칙 안내가 hide로 지워지므로,
@@ -252,6 +419,15 @@ def make_quiz_tools(quiz_ui_q, busy: threading.Event, motion_ctx, inject_turn, l
         """
         if speaker not in ("user", "robot"):
             return "speaker는 'user' 또는 'robot'이어야 합니다."
+
+        if speaker == "user" and user_spoke is not None:
+            # 사용자가 실제로 말한 적이 없으면 판정 자체를 하지 않는다 — 안 그러면 그
+            # 문항이 유령 오답으로 소모된다(위 _NO_USER_SPEECH_GUARD 주석).
+            if not user_spoke[0]:
+                return _NO_USER_SPEECH_GUARD
+            # 이번 발화는 여기서 소비한다 — 같은 발화로 두 번 판정되지 않게(read-once,
+            # session.pending_user_guess와 같은 패턴).
+            user_spoke[0] = False
 
         # 2026-07-30까지는 "사용자 차례 + 하찮미 모드"면 무조건 채점을 미루는(staging)
         # 호출이라고 미리 가정하고 여기서 판단했었다. 이제 하찮미 모드의 실제 답 시도는
@@ -296,9 +472,21 @@ def make_quiz_tools(quiz_ui_q, busy: threading.Event, motion_ctx, inject_turn, l
                         emotion_queue.put("THINKING")
                     _run_guarded(play_thinking_stall, port, pkt, lock, shared_state, emotion_queue)
                     _schedule_stall_refusal()
+                    # 뜸들이는 동안은 완전히 침묵해야 한다("음...", "어디 보자" 같은
+                    # 추임새도 금지 — core/quiz_state.py의 반환문 참고). 지시만 믿지 않고
+                    # 이 턴의 오디오를 실제로 막는다.
+                    _mute_until_turn_ends()
+            else:
+                # 하찮미: 로봇이 자기 추측을 말하고 submit_guess(speaker="robot")를
+                # 불러줘야 전진한다 — 그 호출이 실제로 오는지 지켜본다(위 감시 함수 주석).
+                _watch_robot_guess_if_staged()
 
         advanced = len(session.results) > results_count_before
         if advanced:
+            # 판정이 끝났다 — 이 턴에서 모델이 뭘 말하든(정답을 먼저 말해버리든, 다음
+            # 문제를 미리 묻든) 재생하지 않는다. 정답 반응은 정답 사진이 화면에 뜬 뒤
+            # _delayed_reveal_and_advance가 히든 턴으로 따로 시킨다.
+            _mute_until_turn_ends()
             # 실제로 채점/전진했을 때만 — 이전 문제에서 걸어둔 지연된 거절 대사/정답 공개
             # 전환이 남아있으면 지금 취소하고, 방금 답한 문제의 정답 공개 화면을 띄운다.
             # resolve_*_guess가 상황이 안 맞으면(퀴즈 비활성, pending_user_guess 없음, 하찮미
@@ -328,6 +516,14 @@ def make_quiz_tools(quiz_ui_q, busy: threading.Event, motion_ctx, inject_turn, l
                 emotion_queue.put("THINKING")
             _run_guarded(play_thinking_stall, port, pkt, lock, shared_state, emotion_queue)
             _schedule_stall_refusal()
+            # submit_guess의 실제 답 시도 분기와 같은 이유 — 뜸들이는 동안의 침묵을
+            # 지시만으로 믿지 않고 실제로 막는다.
+            _mute_until_turn_ends()
+        else:
+            # 하찮미에서 힌트/대신 풀어달라는 요청도 "저도 맞춰볼게요" 이벤트로 가므로
+            # submit_guess 쪽과 똑같이 로봇 추측 호출을 지켜봐야 한다(안 그러면 그 경로로
+            # 들어간 문제에서만 여전히 멈춘다 — 실물 로그의 1번 문제가 이 경로였다).
+            _watch_robot_guess_if_staged()
         return text
 
     def end_quiz_early() -> str:
@@ -337,6 +533,8 @@ def make_quiz_tools(quiz_ui_q, busy: threading.Event, motion_ctx, inject_turn, l
         """
         _cancel_pending_stall()
         _cancel_pending_reveal_transition()
+        _cancel_robot_guess_watch()
+        _force_unmute()
         text = session.end_early()
         quiz_ui_q.put({"type": "hide"})
         return text

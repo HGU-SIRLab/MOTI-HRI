@@ -117,25 +117,50 @@ def quiz_window_process(quiz_q: "multiprocessing.Queue"):
                 _current_photo["img"] = None
             progress_label.configure(text="")
 
+        def _apply(msg) -> bool:
+            """메시지 하나를 반영한다. 창을 닫아야 하면 True."""
+            if msg == "__QUIT__":
+                root.destroy()
+                return True
+            msg_type = msg.get("type")
+            if msg_type == "rules":
+                _clear()
+                prompt_label.configure(text=msg.get("text", ""))
+            elif msg_type == "question":
+                _show_question(msg)
+            elif msg_type == "reveal":
+                _show_reveal(msg)
+            elif msg_type == "hide":
+                _clear()
+            else:
+                print(f"⚠️ 퀴즈 창: 알 수 없는 메시지 종류({msg_type!r}) — 무시합니다.")
+            return False
+
         def check_queue():
+            # 이 콜백에서 예외가 새어나가면 마지막 줄의 root.after()가 실행되지 않아
+            # **폴링이 영구히 멈춘다** — 창은 살아있지만 그 뒤로 어떤 메시지도 반영되지
+            # 않아 화면이 마지막 상태(퀴즈 종료 직후라면 빈 화면)에 그대로 굳는다.
+            # launcher.py는 이 프로세스가 살아있는지만 알 수 있어 감지도 안 된다.
+            # 그래서 무슨 일이 있어도 재예약은 finally에서 보장한다(2026-08-10).
+            closed = False
             try:
-                msg = quiz_q.get_nowait()
-                if msg == "__QUIT__":
-                    root.destroy()
-                    return
-                msg_type = msg.get("type")
-                if msg_type == "rules":
-                    _clear()
-                    prompt_label.configure(text=msg.get("text", ""))
-                elif msg_type == "question":
-                    _show_question(msg)
-                elif msg_type == "reveal":
-                    _show_reveal(msg)
-                elif msg_type == "hide":
-                    _clear()
-            except Empty:
-                pass
-            root.after(150, check_queue)
+                # 한 틱에 하나만 처리하면 메시지가 몰릴 때(규칙 안내 -> 첫 문제처럼 연달아
+                # 오는 경우) 화면이 150ms씩 밀린다 — 쌓인 건 한 번에 다 비운다.
+                while True:
+                    try:
+                        msg = quiz_q.get_nowait()
+                    except Empty:
+                        break
+                    if _apply(msg):
+                        closed = True
+                        break
+            except Exception as e:
+                print(f"❌ 퀴즈 창 메시지 처리 오류: {e} — 폴링은 계속합니다.")
+            if not closed:
+                try:
+                    root.after(150, check_queue)
+                except tk.TclError:
+                    pass  # 창이 이미 파괴됨
 
         print("🖼️ 퀴즈 창 프로세스 시작됨.")
         check_queue()

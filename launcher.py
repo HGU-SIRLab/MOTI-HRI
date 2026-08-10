@@ -44,6 +44,7 @@ from core import report_manager
 from core.emotion_tools import make_set_emotion_tool
 from core.idle_watcher import IDLE_SLEEP_SEC, decide_idle_action
 from core.memory_tools import make_forget_me_tool, make_remember_fact_tool
+from core.mic_gate import MAX_MIC_WITHHOLD_SEC, decide_withhold_mic
 from core.motion_tools import make_motion_tools
 from core.quiz_export import save_quiz_results
 from core.quiz_tools import make_quiz_tools
@@ -52,7 +53,15 @@ from display.main import RobotFaceApp
 from display.quiz_window import quiz_window_process
 from hardware import config as C
 from hardware import init as I
-from media.audio_manager import ENABLE_AEC, INPUT_RATE, OUTPUT_RATE, EchoCanceller, MicStreamer, Speaker
+from media.audio_manager import (
+    ENABLE_AEC,
+    INPUT_RATE,
+    OUTPUT_RATE,
+    PLAYOUT_PRIME_MS,
+    EchoCanceller,
+    MicStreamer,
+    Speaker,
+)
 from media.voice_shift import (
     ENABLE_VOICE_SHIFT,
     POST_SPEECH_DRAIN_SEC,
@@ -82,6 +91,9 @@ LIVE_MODEL = os.getenv("LIVE_MODEL_NAME", "models/gemini-3.1-flash-live-preview"
 # 교체함(2026-07-28, docs/progress.md 참고).
 LIVE_VOICE_NAME = os.getenv("LIVE_VOICE_NAME", "Zephyr")
 IDENTIFY_TIMEOUT_SEC = 8.0
+# 퀴즈 진행 중에는 barge-in(끼어들기)을 끈다 — 아래 should_withhold_mic() 주석 참고.
+# 일반 대화의 barge-in은 이 값과 무관하게 항상 켜져 있다.
+QUIZ_DISABLE_BARGE_IN = os.getenv("QUIZ_DISABLE_BARGE_IN", "true").lower() not in ("0", "false", "no")
 # 기본 대화 상태(퀴즈 제외)에서 IDLE_SLEEP_SEC(core/idle_watcher.py)만큼 사용자가 조용하면
 # SLEEPY로 전환하고 팬/틸트 추적도 멈춘다 — 사용자 요청(2026-07-29). display/emotions/
 # sleepy.py·wake.py는 v1(capston_mk1/motirobotics)에서 재이식.
@@ -191,19 +203,55 @@ async def run_conversation(name_state: dict, facts_summary: str | None, emotion_
     # 시작 전이라 우연히 끝난 것처럼 보이는 상태"를 구분 못 해, 정답 공개 이미지가 로봇이
     # 말하기도 전에 뜨는 경합이 있었다 — 2026-08-08, core/quiz_tools.py 참고).
     turn_seq = [0]
+    # 퀴즈 판정 직후 "이 턴에서는 완전히 침묵하세요"라는 지시(core/quiz_state.py의
+    # _HOLD_FOR_REVEAL)를 받고도 모델이 그냥 말해버리는 일이 실물에서 실제로 발생했다
+    # (2026-08-10 척척박사 실물 로그: 사용자가 답하자마자 로봇이 "이 물건은 무엇일까요?"를
+    # 한 번 더 말함). 지시를 지켜주길 기대하는 대신, 그 턴 동안 도착하는 오디오를 아예
+    # 재생하지 않는 것으로 파이썬이 강제한다 — core/quiz_tools.py가 이 플래그를 켜고,
+    # 해당 턴이 끝나면 자동으로 끈다. 텍스트(output_transcription)는 그대로 로그에 남으므로
+    # 모델이 무슨 말을 하려 했는지는 나중에 확인할 수 있다.
+    mute_speech = [False]
+    # 지금 문제에 대해 사용자가 실제로 뭔가 말한 적이 있는지 — 모델이 사용자가 아무 말도
+    # 안 했는데 submit_guess를 부르는 사고(같은 로그에서 2회 발생, 문항 2개가 오답으로
+    # 소모됨) 방지용. core/quiz_tools.py가 판정에 성공하면 다시 False로 소비한다.
+    user_spoke = [False]
+    # media/audio_manager.py의 Speaker와 media/voice_shift.py의 VoiceShifter는 아래
+    # `with` 블록 안에서야 만들어지는데, inject_turn과 퀴즈 툴은 그보다 먼저 필요하다 —
+    # session_holder와 같은 우회(가변 딕셔너리에 나중에 채워넣기).
+    drain_holder = {"fn": None}
+
+    async def drain_playback():
+        """아직 재생되지 않은 오디오가 실제로 다 흘러나갈 때까지 기다린다.
+        폴백(아직 오디오 장치가 안 열렸거나 테스트)은 예전의 고정 상수."""
+        fn = drain_holder["fn"]
+        if fn is None:
+            await asyncio.sleep(POST_SPEECH_DRAIN_SEC)
+        else:
+            await fn()
 
     async def inject_turn(text: str):
-        s = session_holder["session"]
-        if s is None:
+        if session_holder["session"] is None:
             return
         # 로봇이 아직 이전 턴을 말하는 도중이면 곧장 보내지 않고 기다린다 — 안 그러면 새
         # 응답 생성이 이전 발화 위에 겹쳐서 음성이 끊기거나 뭉개지는 사고가 난다(2026-07-30).
         await speaking_done.wait()
-        await asyncio.sleep(POST_SPEECH_DRAIN_SEC)
-        await s.send_client_content(
-            turns=types.Content(role="user", parts=[types.Part(text=text)]),
-            turn_complete=True,
-        )
+        await drain_playback()
+        # 위에서 기다리는 동안 세션이 끊기고 재연결됐을 수 있다 — 여기서 다시 읽는다.
+        # 예전엔 함수 진입 시점의 세션 객체를 붙잡고 있다가 이미 죽은 세션으로 보내서
+        # 예외가 났고, 그 예외가 태스크를 통째로 죽여 지연된 거절 대사/정답 공개가
+        # 조용히 사라졌다(2026-08-10, 짜증유발 스톨 중 GoAway가 오면 정확히 이 경로).
+        s = session_holder["session"]
+        if s is None:
+            return
+        try:
+            await s.send_client_content(
+                turns=types.Content(role="user", parts=[types.Part(text=text)]),
+                turn_complete=True,
+            )
+        except Exception as e:
+            # 여기서 예외가 새어나가면 호출한 태스크(정답 공개 전환 등)가 통째로 죽어
+            # 퀴즈가 그 문제에서 멈춘다 — 한 번의 주입 실패로 그렇게 되면 안 된다.
+            print(f"⚠️ 히든 턴 주입 실패({e!r}) — 이 주입은 건너뜁니다.")
 
     tools = []
     tool_fns = {}
@@ -230,6 +278,7 @@ async def run_conversation(name_state: dict, facts_summary: str | None, emotion_
          quiz_session) = make_quiz_tools(
             quiz_ui_q, quiz_busy or threading.Event(), quiz_motion_ctx, inject_turn, loop,
             turn_seq, emotion_queue=emotion_queue, num_questions=quiz_num_questions,
+            drain_playback=drain_playback, mute_speech=mute_speech, user_spoke=user_spoke,
         )
         for quiz_tool_fn in (start_quiz, select_quiz_mode, submit_guess, request_hint, end_quiz_early):
             tools.append(quiz_tool_fn)
@@ -270,6 +319,60 @@ async def run_conversation(name_state: dict, facts_summary: str | None, emotion_
         if shifter:
             shifter.start()
 
+        async def wait_for_playback_drain(timeout: float = 8.0):
+            """변조 대기분 + 스피커에 남은 재생분이 실제로 다 빠질 때까지 기다린다.
+            예전에는 POST_SPEECH_DRAIN_SEC(버퍼의 2배 = 2.4초)이라는 고정 상수로
+            어림잡았는데, (a) 플레이아웃 지터 버퍼가 생겨 남은 재생 시간이 버퍼 크기만으로
+            표현되지 않게 됐고 (b) 짧은 발화 뒤에도 매번 2.4초씩 죽은 시간이 붙었다.
+            timeout은 안전장치일 뿐 — 정상 흐름에서는 잔량이 0이 되면 곧장 반환한다."""
+            deadline = time.monotonic() + timeout
+            while time.monotonic() < deadline:
+                pending = speaker.pending_sec
+                if shifter is not None:
+                    pending += shifter.pending_sec
+                if pending <= 0.05:
+                    return
+                await asyncio.sleep(0.05)
+
+        drain_holder["fn"] = wait_for_playback_drain
+
+        def reset_after_lost_session():
+            """세션이 발화 도중 끊겼을 때, 다시는 오지 않을 신호를 기다리는 상태를 전부 푼다.
+
+            turn_complete가 영영 안 오므로 (a) speaking_done이 clear된 채 남고 (b) turn_seq가
+            안 올라가 core/quiz_tools.py의 대기가 안 풀리며 (c) **VoiceShifter가 크로스페이드
+            꼬리를 flush 때까지 붙잡고 있어 pending_sec이 0.12초로 고정된다**. (c)는 2026-08-10
+            실물에서 실제 사고를 냈다: pending이 안 내려가니 robot_is_speaking()이 영원히
+            True가 되고, 퀴즈 중 barge-in 차단이 마이크를 계속 막아 사용자가 아예 대화를 못
+            하게 됐다(재연결 이후 입력 전사가 한 줄도 안 남음). reset()은 pending을 즉시
+            0으로 만들고 잘려나간 턴의 잔여 오디오도 버린다 — 어차피 그 발화는 중간에 끊겼다.
+            """
+            speaking_done.set()
+            turn_seq[0] += 1
+            if shifter is not None:
+                shifter.reset()
+
+        def robot_is_speaking() -> bool:
+            """생성 중이거나, 생성은 끝났어도 아직 스피커로 흘러나오는 중이면 True."""
+            if not speaking_done.is_set():
+                return True
+            pending = speaker.pending_sec
+            if shifter is not None:
+                pending += shifter.pending_sec
+            return pending > 0.05
+
+        def should_withhold_mic() -> bool:
+            """퀴즈 중 barge-in 차단 — 판단 자체는 core/mic_gate.py의 순수 함수가 하고
+            (실패 시 대가와 시간 상한의 근거도 그쪽 주석에 있다), 여기서는 현재 상태만
+            모아서 넘긴다."""
+            return decide_withhold_mic(
+                quiz_active=quiz_session is not None and quiz_session.active,
+                robot_speaking=robot_is_speaking(),
+                sec_since_last_audio=time.monotonic() - last_audio_time[0],
+                enabled=QUIZ_DISABLE_BARGE_IN,
+                max_withhold_sec=MAX_MIC_WITHHOLD_SEC,
+            )
+
         # SLEEPY 배경음 — API를 다시 부르지 않고 캐시된 클립만 읽는다(_load_snore_clip
         # 참고). 파일이 없으면 (None, None)이라 snore_player()가 그냥 아무것도 안 함.
         snore_pcm, snore_duration_sec = _load_snore_clip()
@@ -283,6 +386,10 @@ async def run_conversation(name_state: dict, facts_summary: str | None, emotion_
         # 하고 있는 동안은 사용자가 IDLE_SLEEP_SEC만큼 조용해도 잠들면 안 된다는 요구사항.
         last_activity_time = [time.monotonic()]
         is_sleeping = [False]
+        # 로봇의 오디오 청크가 마지막으로 도착한 시각 — barge-in 차단 게이트가 영영 안
+        # 풀리는 사고를 막는 시간 상한에만 쓴다(should_withhold_mic 참고). 0.0으로 시작하면
+        # "아주 오래전"이라 게이트가 열린 상태에서 출발한다.
+        last_audio_time = [0.0]
 
         async def connection_manager():
             """Live 세션을 열고 send/recv 루프를 돌린다. 세션 시간 제한이 다가오면
@@ -345,6 +452,10 @@ async def run_conversation(name_state: dict, facts_summary: str | None, emotion_
                                     chunk = await asyncio.wait_for(mic.queue.get(), timeout=0.5)
                                 except asyncio.TimeoutError:
                                     continue
+                                if should_withhold_mic():
+                                    # 퀴즈 중 로봇이 말하는 동안은 서버로 안 보낸다 —
+                                    # barge-in 차단(위 should_withhold_mic 주석).
+                                    continue
                                 await session.send_realtime_input(
                                     audio=types.Blob(data=chunk, mime_type=f"audio/pcm;rate={INPUT_RATE}")
                                 )
@@ -379,18 +490,27 @@ async def run_conversation(name_state: dict, facts_summary: str | None, emotion_
                                         turn_seq[0] += 1
 
                                     if message.data:
-                                        if shifter:
-                                            shifter.feed(message.data)
-                                        else:
-                                            speaker.play(message.data)
+                                        # mute_speech는 퀴즈 판정 직후의 "침묵" 턴에서만 켜진다 —
+                                        # 지시를 어기고 나온 오디오를 버려서, 정답 공개 전에 로봇이
+                                        # 먼저 말해버리는 것을 파이썬이 강제로 막는다(위 주석 참고).
+                                        if not mute_speech[0]:
+                                            if shifter:
+                                                shifter.feed(message.data)
+                                            else:
+                                                speaker.play(message.data)
                                         # 로봇이 말하는 중 — 사용자가 조용히 듣고만 있어도 idle-sleep이
                                         # 끼어들면 안 되고, inject_turn()도 이 턴이 끝날 때까지 기다려야
-                                        # 겹쳐 말하지 않는다(2026-07-30).
+                                        # 겹쳐 말하지 않는다(2026-07-30). 재생을 버린 경우에도 모델은
+                                        # 실제로 생성 중이므로 두 신호 모두 그대로 갱신한다.
                                         last_activity_time[0] = time.monotonic()
+                                        last_audio_time[0] = last_activity_time[0]
                                         speaking_done.clear()
 
                                     if sc and sc.input_transcription and sc.input_transcription.text:
                                         turn_user.append(sc.input_transcription.text)
+                                        # 사용자가 실제로 말했다는 유일한 신호 — 퀴즈의 유령
+                                        # submit_guess 가드가 이 값을 본다(위 user_spoke 주석).
+                                        user_spoke[0] = True
                                         last_activity_time[0] = time.monotonic()
                                     if sc and sc.output_transcription and sc.output_transcription.text:
                                         turn_moti.append(sc.output_transcription.text)
@@ -463,14 +583,12 @@ async def run_conversation(name_state: dict, facts_summary: str | None, emotion_
                     # turn_seq도 같은 이유로 올려서, core/quiz_tools.py의
                     # _wait_for_turn_after()가 다시는 안 올 turn_complete를 무한정
                     # 기다리지 않게 한다.
-                    speaking_done.set()
-                    turn_seq[0] += 1
+                    reset_after_lost_session()
                     continue
                 except ConnectionClosed as e:
                     if stop_event.is_set():
                         break
-                    speaking_done.set()
-                    turn_seq[0] += 1
+                    reset_after_lost_session()
                     handle_note = "재개 핸들로" if resumption_handle["value"] else "핸들 없이 새 세션으로"
                     print(f"⚠️ 세션 연결이 예기치 않게 끊겼습니다({e!r}) — {handle_note} 재연결 시도...")
                     continue
@@ -542,8 +660,13 @@ async def run_conversation(name_state: dict, facts_summary: str | None, emotion_
         if shifter:
             shifter.close()
         if speaker.underrun_count:
+            # 예전엔 여기서 VOICE_SHIFT_BUFFER_MS를 늘리라고 안내했는데 그건 틀린 처방이다 —
+            # 그 버퍼는 언더런 여유를 조금도 만들어주지 못한다(media/voice_shift.py의
+            # VOICE_SHIFT_BUFFER_MS 주석 참고, 2026-08-10에 실측으로 확정). 재생 쿠션을
+            # 키우는 쪽이 실제로 듣는 지터를 흡수한다.
             print(f"⚠️ 스피커 언더런 {speaker.underrun_count}회, 총 {speaker.underrun_ms_total:.0f}ms 무음 재생됨 "
-                  f"— VoiceShifter 처리가 실시간을 못 따라간 신호. VOICE_SHIFT_BUFFER_MS를 늘려볼 것.")
+                  f"— 재생 쿠션이 부족했다는 신호. .env의 PLAYOUT_PRIME_MS를 늘려볼 것"
+                  f"(지금 {PLAYOUT_PRIME_MS}ms, 그만큼 발화 시작이 늦어지는 트레이드오프).")
 
     return session_history
 
@@ -613,6 +736,22 @@ def main():
     quiz_ui_q: "multiprocessing.Queue" = multiprocessing.Queue()
     quiz_proc = multiprocessing.Process(target=quiz_window_process, args=(quiz_ui_q,), daemon=True)
     quiz_proc.start()
+
+    # 이 프로세스는 daemon이라 죽어도 launcher.py가 자동으로 알 수 없다 — 그러면 퀴즈
+    # 사진이 안 뜨는데 원인을 몰라 한참 헤매게 된다(실제로 "화면이 안 불러와진다"로
+    # 여러 번 겪음). 죽으면 콘솔에 한 번 크게 알려서 즉시 알아채게 한다.
+    def watch_quiz_window():
+        while not display_stop.is_set():
+            if not quiz_proc.is_alive():
+                print("\n" + "=" * 60)
+                print("❌ 퀴즈 사진 창 프로세스가 죽었습니다 — 이제 퀴즈 사진이 안 뜹니다.")
+                print("   실험 중이라면 이 참가자 세션을 중단하고 launcher를 재시작하세요")
+                print("   (.env의 QUIZ_ROUND_OFFSET으로 이미 마친 라운드를 건너뛸 수 있습니다).")
+                print("=" * 60 + "\n")
+                return
+            time.sleep(2.0)
+
+    threading.Thread(target=watch_quiz_window, name="quiz-window-watch", daemon=True).start()
 
     # 둘 다 run_conversation이 "시작 시점에" 채우는 가변 컨테이너 — 세션이 [대화종료]가
     # 아니라 Ctrl+C로 끝나도 아래 finally에서 그때까지의 대화록/퀴즈 결과를 저장할 수 있다.

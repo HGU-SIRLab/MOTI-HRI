@@ -326,7 +326,8 @@ async def main():
     select5("imperfect")
     quiz_ui_q.get()
     r = select5("annoying")
-    ok &= check("re-selecting mode after it's already chosen is rejected", "이미 모드가 선택" in r)
+    ok &= check("re-selecting mode mid-round is rejected",
+                "다시 선택하지 마세요" in r and "end_quiz_early" in r)
     ok &= check("mode stays unchanged after rejected re-selection", sess5.mode == "imperfect")
 
     # resolve_robot_guess가 무효 상황(사용자 차례 없이 로봇 추측부터 제출)이라 아무것도
@@ -389,6 +390,139 @@ async def main():
     # 턴으로 주입하고, REVEAL_HOLD_SEC을 세기 전에 "그 턴도" 끝나길 기다린다 — 이것도
     # 마저 흉내내지 않으면 백그라운드 태스크가 영원히 멈춰있게 된다.
     turn_seq_stalled[0] += 1
+
+    # --- 40단계(2026-08-10) 실물 로그에서 나온 세 가지 회귀 방지 ---
+
+    # (1) 유령 submit_guess: 사용자가 아무 말도 안 했는데 모델이 guess_text="사용자의 말을
+    # 기다리는 중" 같은 걸로 판정을 요청해, 참가자가 보지도 못한 문항이 오답으로 소모되던
+    # 사고(실물 로그에서 5문항 중 2문항 손실). user_spoke 신호가 없으면 판정 자체를 거부한다.
+    user_spoke = [False]
+    mute_speech = [False]
+    start9, select9, submit9, hint9, end9, sess9 = qt.make_quiz_tools(
+        quiz_ui_q, busy, motion_ctx, fake_inject_turn, loop, turn_seq,
+        emotion_queue=emotion_queue, num_questions=2,
+        mute_speech=mute_speech, user_spoke=user_spoke,
+    )
+    start9()
+    quiz_ui_q.get()
+    # 새 사진이 뜨기 전에 한 말은 그 문제의 답이 될 수 없다 — 사진을 push하는 경로
+    # (_push_question_or_hide)가 신호를 버려야 한다. 실물에서 참가자가 로봇이 조용하니
+    # 이전 문제의 답을 다시 말했고, 그게 다음 문항의 답으로 채점돼 문항을 잃었다.
+    user_spoke[0] = True
+    select9("all_knowing")
+    quiz_ui_q.get()
+    ok &= check("showing a new question discards speech from before it appeared",
+                user_spoke[0] is False)
+
+    before = len(sess9.results)
+    r = submit9("user", "사용자의 말을 기다리는 중")
+    ok &= check("phantom submit_guess (user never spoke) is refused",
+                "아직" in r and len(sess9.results) == before)
+    ok &= check("phantom submit_guess consumes no question", sess9.current_question is not None)
+    ok &= check("phantom submit_guess leaves speech unmuted", mute_speech[0] is False)
+
+    # 사용자가 실제로 말하면(launcher.py가 input_transcription에서 올려줌) 정상 판정된다.
+    user_spoke[0] = True
+    r = submit9("user", "정답0")
+    ok &= check("real guess is judged once the user actually spoke", len(sess9.results) == before + 1)
+    # (2) 판정 턴 음소거: 침묵 지시를 어기고 나오는 오디오를 파이썬이 실제로 막는다.
+    ok &= check("judging turn mutes playback until the turn ends", mute_speech[0] is True)
+    ok &= check("user_spoke is consumed after a successful judgement", user_spoke[0] is False)
+
+    r = submit9("user", "정답1")
+    ok &= check("the same utterance cannot be judged twice", "아직" in r)
+
+    await asyncio.sleep(0.15)  # ticker가 turn_seq를 올려 판정 턴이 끝났다고 흉내낸다
+    ok &= check("playback unmutes automatically once the judging turn ends", mute_speech[0] is False)
+
+    # (3) 정답 반응 히든 턴에는 "다음 문제를 미리 묻지 말라"는 제약이 항상 함께 간다 —
+    # 이게 없으면 모델이 반응에 이어 "이 물건은 무엇일까요?"까지 말해버려, 아직 뜨지도 않은
+    # 문제를 질문하고 잠시 뒤 같은 질문이 한 번 더 나온다(실물 제보의 원인).
+    ok &= check("reveal speech carries the do-not-ask-next-question constraint",
+                any("미리 묻지 마세요" in t for t in injected))
+
+    # (4) 41단계 후속(2026-08-10 하찮미 실물): 로봇이 자기 추측을 말해놓고
+    # submit_guess(speaker="robot")를 호출하지 않으면 그 문제에서 퀴즈가 영영 멈췄다.
+    # 이제 한 번 재촉하고, 그래도 안 오면 사용자 답만으로 채점하고 전진해야 한다.
+    qt.ROBOT_GUESS_GRACE_SEC = 0.05
+    # 앞 블록의 정답 공개 전환 태스크가 아직 백그라운드에서 돌며 같은 큐에 push하므로,
+    # 그게 끝나길 기다린 뒤 큐를 비우고 시작한다(안 그러면 여기서 앞 블록 메시지를 읽는다).
+    await asyncio.sleep(0.5)
+    while not quiz_ui_q.empty():
+        quiz_ui_q.get()
+    startA2, selectA2, submitA2, hintA2, endA2, sessA2 = qt.make_quiz_tools(
+        quiz_ui_q, busy, motion_ctx, fake_inject_turn, loop, turn_seq,
+        emotion_queue=emotion_queue, num_questions=2,
+    )
+    startA2()
+    quiz_ui_q.get()
+    selectA2("imperfect")
+    quiz_ui_q.get()
+    injected.clear()
+    submitA2("user", "빵")  # 하찮미: 로봇 추측을 기다리는 상태로 staging됨
+    ok &= check("imperfect stages a pending robot guess", sessA2.pending_user_guess is not None)
+    await asyncio.sleep(0.25)
+    ok &= check("a missing robot guess gets nudged once",
+                any("submit_guess" in t and "robot" in t for t in injected))
+    await asyncio.sleep(0.45)
+    ok &= check("a never-arriving robot guess no longer freezes the quiz",
+                len(sessA2.results) == 1 and sessA2.pending_user_guess is None)
+    ok &= check("the recovered result keeps the user's answer but records no robot guess",
+                sessA2.results[0].user_guess_text == "빵"
+                and sessA2.results[0].robot_guess_text is None)
+    await asyncio.sleep(0.2)   # 복구 경로도 평소처럼 reveal 태스크를 거쳐 화면을 띄운다
+    msg = quiz_ui_q.get()
+    ok &= check("the recovered question still reveals its answer on screen", msg["type"] == "reveal")
+
+    # 정상 경로(로봇이 제때 호출)는 감시가 조용히 물러나야 한다 — 억지 채점이 끼어들면 안 됨.
+    startA3, selectA3, submitA3, hintA3, endA3, sessA3 = qt.make_quiz_tools(
+        quiz_ui_q, busy, motion_ctx, fake_inject_turn, loop, turn_seq,
+        emotion_queue=emotion_queue, num_questions=2,
+    )
+    startA3()
+    quiz_ui_q.get()
+    selectA3("imperfect")
+    quiz_ui_q.get()
+    submitA3("user", "빵")
+    submitA3("robot", "정답0")
+    await asyncio.sleep(0.5)
+    ok &= check("a timely robot guess is recorded normally (watchdog stays out of the way)",
+                len(sessA3.results) == 1 and sessA3.results[0].robot_guess_text == "정답0")
+
+    # (5) 43단계 후속(2026-08-10 실물): 1번 라운드를 끝낸 뒤 모델이 start_quiz()를
+    # 건너뛰고 곧장 다음 모드를 고르면, 예전엔 "이미 모드가 선택되어 있습니다"로 거절되고
+    # 사진 push가 아예 안 일어나 **퀴즈 화면이 안 뜨는 막다른 길**이 됐다. 이제는 새
+    # 라운드를 자동으로 시작해야 한다.
+    await asyncio.sleep(0.5)
+    while not quiz_ui_q.empty():
+        quiz_ui_q.get()
+    startB2, selectB2, submitB2, hintB2, endB2, sessB2 = qt.make_quiz_tools(
+        quiz_ui_q, busy, motion_ctx, fake_inject_turn, loop, turn_seq,
+        emotion_queue=emotion_queue, num_questions=1,
+    )
+    startB2(); quiz_ui_q.get()
+    selectB2("all_knowing"); quiz_ui_q.get()
+    submitB2("user", "정답0")          # 1문항짜리 라운드를 소진해 라운드 종료
+    ok &= check("round ends (active=False) but the mode is still set",
+                sessB2.active is False and sessB2.mode == "all_knowing")
+    await asyncio.sleep(0.5)
+    while not quiz_ui_q.empty():
+        quiz_ui_q.get()
+
+    r = selectB2("imperfect")          # start_quiz() 없이 곧장 다음 모드
+    ok &= check("selecting the next mode after a finished round is not refused",
+                "다시 선택하지 마세요" not in r)
+    ok &= check("it auto-starts a fresh round", sessB2.active is True and sessB2.mode == "imperfect")
+    msgs = []
+    while not quiz_ui_q.empty():
+        msgs.append(quiz_ui_q.get()["type"])
+    ok &= check(f"and the quiz screen actually gets a question pushed ({msgs})",
+                "question" in msgs)
+
+    # 반대로 라운드가 실제로 진행 중일 때는 여전히 막되, 빠져나갈 길을 알려줘야 한다.
+    r = selectB2("annoying")
+    ok &= check("re-selecting mid-round is still refused, but tells the model how to escape",
+                "end_quiz_early" in r)
 
     ticker_task.cancel()
 
