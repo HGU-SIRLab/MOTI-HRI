@@ -16,6 +16,7 @@
 - **idle-sleep** — 40초간 아무 활동이 없으면 SLEEPY 표정 + 코골이 배경음 + 추적 정지, 사용자가 말하면 즉시 깨어남.
 - **목소리 후처리** — Zephyr 프리셋 + pyworld 피치/포먼트 시프트(+3.5반음/×1.12)로 더 앳된 톤. 청크 경계는 오버랩-크로스페이드로 이어붙여 끊김 없음.
 - **에코캔슬레이션(AEC)** — WebRTC AEC3로 스피커→마이크 되먹임 제거. 이어폰 없이 로봇 스피커로 대화해도 barge-in 오탐이 없다.
+- **프라이버시 고지(신뢰도 측정용)** — 이름을 알게 된 직후와 작별 인사에서 고정된 문장으로 "이 대화는 유출되지 않고 모티만 기억한다"고 안내한다. 실제 발화를 launcher가 확인하고 빠지면 다시 시키며, 전달 여부를 `session_meta.json`에 기록한다(`core/trust_notice.py`).
 - **세션 산출물** — 종료 시 전체 대화록 + (퀴즈를 했다면) 모드별 연구 데이터 JSON을 `user_result/{참가자ID}/{날짜_시각}/`에 함께 저장. 둘 다 파일 쓰기뿐이라 API를 쓰지 않는다(LLM이 쓰던 "마음 처방전" 결과지는 2026-08-10에 토큰 절감을 위해 제거).
 - **퀴즈 실험 모드** — 부분 확대 사진 퀴즈, 3가지 로봇 성격(척척박사/하찮미/짜증유발)을 한 세션 안에서 라운드별로 진행. 아래 [퀴즈 실험 모드](#퀴즈-실험-모드-하찮미-실험) 참고.
 
@@ -182,6 +183,8 @@ assets/        퀴즈 사진(questions.json + 크롭/원본), 코골이 클립, 
 | `test_quiz_tools.py` | 퀴즈 툴 — 지연 거절, 정답 공개 타이밍, 거절 카운트 |
 | `test_voice_shift.py` | 목소리 변조 — 오버랩 정렬(항등 검증), reset 세대, pyworld 경계 연속성 |
 | `test_idle_watcher.py` / `test_emotion_tools.py` / `test_snore_clip.py` | idle-sleep 판단 / 표정 클램프 / 코골이 클립 로더 |
+| `test_trust_notice.py` | 프라이버시 고지 — 문장/발화 판정, 시작·마무리 안내 주입과 상한 |
+| `test_report.py` / `test_mic_gate.py` / `test_playout_margin.py` | 세션 산출물 저장 / 마이크 게이트 / 재생 지터 여유 |
 | `test_quiz_live.py` | 실제 Gemini Live API로 퀴즈 시나리오 검증 (**API 키 필요**) |
 | `test_persona.py` / `test_live_poc.py` / `test_live_audio.py` | 페르소나/Live 연결/실오디오 barge-in (**API 키, 뒤 2개는 마이크·스피커 필요**) |
 | `test_motions.py` | 모터 매크로 메뉴 테스트 (**로봇 필요**) |

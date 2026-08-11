@@ -54,7 +54,9 @@ from core.quiz_state import mode_label, parse_mode_order
 from core.result_paths import (make_session_dir, parse_participant_id,
                                write_session_meta)
 from core.quiz_tools import make_quiz_tools
-from core.utils import build_persona_system_instruction, extract_exit_tag
+from core import trust_notice
+from core.utils import (build_persona_system_instruction, extract_exit_tag,
+                        short_name)
 from display.main import RobotFaceApp
 from display.quiz_window import quiz_window_process
 from hardware import config as C
@@ -97,6 +99,9 @@ LIVE_MODEL = os.getenv("LIVE_MODEL_NAME", "models/gemini-3.1-flash-live-preview"
 # 교체함(2026-07-28, docs/progress.md 참고).
 LIVE_VOICE_NAME = os.getenv("LIVE_VOICE_NAME", "Zephyr")
 IDENTIFY_TIMEOUT_SEC = 8.0
+# 작별 인사에 프라이버시 안내(core/trust_notice.py)가 빠져 한 번 더 시켰는데도 응답이
+# 안 올 때, 이만큼 지나면 그냥 세션을 닫는다 — 참가자를 붙잡아두지 않기 위한 상한.
+TRUST_CLOSING_TIMEOUT_SEC = 25.0
 # 퀴즈 진행 중에는 barge-in(끼어들기)을 끈다 — 아래 should_withhold_mic() 주석 참고.
 # 일반 대화의 barge-in은 이 값과 무관하게 항상 켜져 있다.
 QUIZ_DISABLE_BARGE_IN = os.getenv("QUIZ_DISABLE_BARGE_IN", "true").lower() not in ("0", "false", "no")
@@ -179,7 +184,7 @@ async def run_conversation(name_state: dict, facts_summary: str | None, emotion_
                             quiz_ui_q=None, quiz_busy: threading.Event | None = None,
                             port=None, pkt=None, lock=None, home_pan: int | None = None, home_tilt: int | None = None,
                             quiz_num_questions: int = 5, quiz_session_out: dict | None = None,
-                            history_out: list | None = None):
+                            history_out: list | None = None, trust_out: dict | None = None):
     """Live 세션을 열고 대화가 끝날 때까지 실행한다. 종료 시 세션 로그를 반환.
 
     name_state: {"name": <세션 시작 시점 확정된 이름 또는 None>}. 처음 보는 사람이면
@@ -194,7 +199,11 @@ async def run_conversation(name_state: dict, facts_summary: str | None, emotion_
     세션이 정상 종료([대화종료])가 아니라 Ctrl+C/크래시로 끝나도 호출자가 그때까지 쌓인
     퀴즈 결과(export_log)와 대화록을 잃지 않는다. 이전엔 정상 반환 경로에서만 결과를
     복사해줘서, 참가자가 작별 인사 없이 끝나 실험자가 Ctrl+C로 세션을 끊으면 그 참가자의
-    퀴즈 데이터·대화록·결과지가 통째로 사라졌다(2026-08-07 전체 코드 검사로 발견)."""
+    퀴즈 데이터·대화록·결과지가 통째로 사라졌다(2026-08-07 전체 코드 검사로 발견).
+
+    trust_out도 같은 패턴 — 프라이버시 안내 멘트(core/trust_notice.py)가 실제로 발화됐는지를
+    담아 돌려준다. 설문의 신뢰도 문항이 이 멘트를 겨냥하므로, 참가자가 그 말을 실제로
+    들었는지를 산출물(session_meta.json)에 남겨 응답과 대조할 수 있어야 한다."""
     api_key = os.getenv("GOOGLE_API_KEY")
     if not api_key:
         print("⏭️  GOOGLE_API_KEY가 없어 대화를 시작할 수 없습니다.")
@@ -234,6 +243,20 @@ async def run_conversation(name_state: dict, facts_summary: str | None, emotion_
     # 안 했는데 submit_guess를 부르는 사고(같은 로그에서 2회 발생, 문항 2개가 오답으로
     # 소모됨) 방지용. core/quiz_tools.py가 판정에 성공하면 다시 False로 소비한다.
     user_spoke = [False]
+    # 프라이버시 안내 멘트(core/trust_notice.py)의 진행 상태. 설문의 신뢰도 문항이 겨냥하는
+    # 자극이라 "말했다고 가정"하면 안 되고 실제 발화를 확인해야 한다 — 매 턴 끝에
+    # was_delivered()로 검사하고, 안 했으면 히든 턴으로 한 번 더 시킨다.
+    # trust_out이 주어지면 그 딕셔너리를 그대로 쓴다 — history_out/quiz_session_out과 같은
+    # 이유로, Ctrl+C로 끊긴 세션에서도 호출자가 그때까지의 전달 여부를 읽을 수 있어야 한다.
+    trust_state = trust_out if trust_out is not None else {}
+    trust_state.update({
+        "opening_delivered": False,   # 이름을 알게 된 직후 안내가 실제로 발화됐는가
+        "closing_delivered": False,   # 작별 인사의 안내가 실제로 발화됐는가
+        "opening_attempts": 0,        # 히든 턴 주입 횟수(무한 재시도 방지)
+        "closing_attempts": 0,
+    })
+    trust_tasks: list = []  # 주입 태스크 참조 보관 — 안 잡아두면 GC로 사라진다(45단계 교훈)
+
     # media/audio_manager.py의 Speaker와 media/voice_shift.py의 VoiceShifter는 아래
     # `with` 블록 안에서야 만들어지는데, inject_turn과 퀴즈 툴은 그보다 먼저 필요하다 —
     # session_holder와 같은 우회(가변 딕셔너리에 나중에 채워넣기).
@@ -315,6 +338,71 @@ async def run_conversation(name_state: dict, facts_summary: str | None, emotion_
     # 호출자가 그때까지의 턴 기록을 그대로 들고 있게 하기 위함(위 docstring 참고).
     session_history: list[str] = history_out if history_out is not None else []
     stop_event = asyncio.Event()
+
+    def _notice_name() -> str | None:
+        """안내 멘트에 넣을 호칭 — 로봇이 평소 부르는 방식과 같게 맞춘다("조형민" -> "형민").
+        이름을 모르면 None을 넘겨 호칭 없는 문장을 쓰게 한다(short_name은 "사용자"를
+        돌려주므로 그대로 쓰면 "사용자님과 나눈 대화는"이 되어 어색하다)."""
+        name = name_state["name"]
+        return short_name(name) if name else None
+
+    def _inject_trust(text: str):
+        """안내 멘트 히든 턴을 예약한다. recv_loop 안에서 inject_turn을 직접 await하면
+        재생 드레인을 기다리는 동안 수신 처리가 멈추므로 퀴즈 툴과 같이 태스크로 띄운다."""
+        task = loop.create_task(inject_turn(text))
+        trust_tasks.append(task)
+        task.add_done_callback(lambda t: trust_tasks.remove(t) if t in trust_tasks else None)
+
+    async def _force_end_after(sec: float):
+        """마무리 안내를 시켰는데 응답이 영영 안 올 때를 대비한 상한 — 이 가드가 없으면
+        세션이 안 닫혀 참가자를 붙잡아두게 된다(43단계 교훈: 사용자를 막는 가드에는
+        반드시 시간 상한을 같이 둔다). recv_loop는 다음 메시지가 도착하는 시점에 이
+        플래그를 보므로 즉시 끊기는 아니지만, 영구히 매달리는 것은 막는다."""
+        await asyncio.sleep(sec)
+        if not stop_event.is_set():
+            print("⏱️ 마무리 안내 응답이 없어 그대로 세션을 마칩니다.")
+            stop_event.set()
+
+    def handle_trust_notice(m_clean: str, should_end: bool) -> bool:
+        """한 턴이 끝날 때마다 호출. 안내 멘트의 실제 발화를 확인하고, 빠졌으면 히든 턴으로
+        한 번 더 시킨다. Returns: **지금 세션을 끝내야 하면 True.**
+
+        모델이 지시대로 말해줬으면 주입 없이 그냥 통과한다 — 주입은 대화 흐름을 한 번
+        끊으므로 필요할 때만 쓴다.
+        """
+        delivered = trust_notice.was_delivered(m_clean)
+        # 마무리 안내를 한 번 시켰다면 그 뒤의 턴도 전부 '종료 국면'이다 — 주입한 턴에는
+        # [대화종료] 태그를 다시 붙이지 말라고 했으므로(core/trust_notice.py) should_end가
+        # False로 오는데, 그걸 평상시 턴으로 취급하면 세션이 영영 안 닫힌다.
+        if should_end or trust_state["closing_attempts"] > 0:
+            if delivered:
+                trust_state["closing_delivered"] = True
+                print("🔒 마무리 안내 발화 확인")
+                return True
+            if trust_state["closing_attempts"] >= 1:
+                # 한 번 더 시켰는데도 안 했다 — 더 붙잡지 않고 끝낸다(못 들은 참가자로
+                # session_meta.json에 기록되므로 분석 때 걸러낼 수 있다).
+                print("⚠️ 마무리 안내가 발화되지 않았습니다 — 이 참가자는 안내를 못 들었습니다.")
+                return True
+            trust_state["closing_attempts"] += 1
+            print("↩️  작별 인사에 마무리 안내가 빠져 한 번 더 요청합니다.")
+            _inject_trust(trust_notice.closing_prompt(_notice_name()))
+            trust_tasks.append(loop.create_task(_force_end_after(TRUST_CLOSING_TIMEOUT_SEC)))
+            return False
+
+        if delivered and not trust_state["opening_delivered"]:
+            trust_state["opening_delivered"] = True
+            print("🔒 프라이버시 안내 발화 확인")
+            return False
+        # 이름을 알게 됐는데 아직 안내를 안 했으면 시킨다. 퀴즈 진행 중에는 끼어들지
+        # 않는다 — 문제/정답 시퀀스를 Python이 통제하고 있는 구간이라(39·45단계) 그 사이에
+        # 히든 턴을 밀어 넣으면 순서가 뒤엉킨다. 안내는 원래 퀴즈 시작 전에 끝난다.
+        quiz_running = quiz_session is not None and quiz_session.active
+        if (name_state["name"] and not trust_state["opening_delivered"]
+                and trust_state["opening_attempts"] < 2 and not quiz_running):
+            trust_state["opening_attempts"] += 1
+            _inject_trust(trust_notice.opening_prompt(_notice_name()))
+        return False
 
     print(f"모델: {LIVE_MODEL} — 마이크에 대고 말해보세요. Ctrl+C로 언제든 종료.")
 
@@ -581,7 +669,10 @@ async def run_conversation(name_state: dict, facts_summary: str | None, emotion_
                                             print(f"\n[나] {u}\n[모티] {m_clean}")
                                         turn_user.clear()
                                         turn_moti.clear()
-                                        if should_end:
+                                        # 프라이버시 안내 멘트 확인/보정. [대화종료]가 왔어도
+                                        # 마무리 안내가 빠졌으면 곧장 끊지 않고 한 번 더
+                                        # 시킨 뒤(그 턴이 끝나면 다시 여기로 온다) 마친다.
+                                        if handle_trust_notice(m_clean, should_end):
                                             print("\n👋 [대화종료] 감지 — 세션을 마칩니다.")
                                             stop_event.set()
                                             break
@@ -804,6 +895,9 @@ def main():
     # 아니라 Ctrl+C로 끝나도 아래 finally에서 그때까지의 대화록/퀴즈 결과를 저장할 수 있다.
     session_history: list[str] = []
     quiz_holder: dict = {"session": None}
+    # 프라이버시 안내 멘트가 실제로 발화됐는지 — 설문의 신뢰도 문항과 대조해야 하므로
+    # session_meta.json에 남긴다(core/trust_notice.py).
+    trust_holder: dict = {}
     try:
         asyncio.run(
             run_conversation(
@@ -813,6 +907,7 @@ def main():
                 quiz_ui_q=quiz_ui_q, quiz_busy=motion_busy,
                 port=port, pkt=pkt, lock=lock, home_pan=home_pan, home_tilt=home_tilt,
                 quiz_session_out=quiz_holder, history_out=session_history,
+                trust_out=trust_holder,
             )
         )
     except KeyboardInterrupt:
@@ -866,6 +961,10 @@ def main():
             started_at=session_started_at.strftime("%Y-%m-%d %H:%M:%S"),
             ended_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             quiz_question_count=len(quiz_log),
+            # 설문의 신뢰도 문항("로봇이 이렇게 말했을 때 신뢰할 수 있었는가")이 겨냥하는
+            # 안내 멘트를 이 참가자가 실제로 들었는지 — false면 그 응답은 분석에서 걸러야 한다.
+            trust_notice_opening_delivered=trust_holder.get("opening_delivered"),
+            trust_notice_closing_delivered=trust_holder.get("closing_delivered"),
         )
         if meta_path:
             print(f"📁 세션 산출물 저장 완료: {os.path.relpath(session_dir, _REPO_ROOT)}")
