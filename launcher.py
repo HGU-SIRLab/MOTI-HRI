@@ -28,6 +28,7 @@ import sys
 import threading
 import time
 import wave
+from datetime import datetime
 
 import numpy as np
 from dynamixel_sdk import PacketHandler, PortHandler
@@ -50,6 +51,8 @@ from core.mic_gate import (MAX_MIC_WITHHOLD_SEC, SLEEP_MIC_RMS_THRESHOLD,
 from core.motion_tools import make_motion_tools
 from core.quiz_export import save_quiz_results
 from core.quiz_state import mode_label, parse_mode_order
+from core.result_paths import (make_session_dir, parse_participant_id,
+                               write_session_meta)
 from core.quiz_tools import make_quiz_tools
 from core.utils import build_persona_system_instruction, extract_exit_tag
 from display.main import RobotFaceApp
@@ -703,17 +706,26 @@ def main():
     except ImportError:
         pass
 
-    # 퀴즈 모드 순서(.env의 QUIZ_MODE_ORDER)는 **로봇을 만지기 전에** 확인한다 — 진행자가
-    # 오타를 냈다면 모터/카메라/모델을 다 띄운 뒤 대화 도중에 알게 되는 것보다, 여기서
-    # 즉시 죽어서 고치는 편이 훨씬 낫다(카운터밸런싱이 깨진 데이터는 나중에 복구 불가).
+    # 참가자 표식(.env의 PARTICIPANT_ID)과 퀴즈 모드 순서(QUIZ_MODE_ORDER)는 **로봇을
+    # 만지기 전에** 확인한다 — 진행자가 오타를 냈다면 모터/카메라/모델을 다 띄운 뒤 대화
+    # 도중에 알게 되는 것보다, 여기서 즉시 죽어서 고치는 편이 훨씬 낫다(카운터밸런싱이
+    # 깨진 데이터도, 엉뚱한 폴더에 섞인 산출물도 나중에 복구 불가).
     try:
+        participant_id = parse_participant_id(os.getenv("PARTICIPANT_ID"))
         mode_order = parse_mode_order(os.getenv("QUIZ_MODE_ORDER"))
     except ValueError as e:
         print(f"❌ {e}")
         sys.exit(1)
+    print(f"🧑 이번 참가자: {participant_id}  (.env PARTICIPANT_ID)")
     print("🎯 이번 참가자 퀴즈 모드 순서: "
           + " → ".join(mode_label(m) for m in mode_order)
           + f"  (.env QUIZ_MODE_ORDER={os.getenv('QUIZ_MODE_ORDER') or '미지정, 기본값'})")
+
+    # 대화록과 퀴즈 결과가 반드시 같은 폴더에 들어가도록, 세션 폴더를 여기서 한 번만 정해
+    # 두 저장 함수에 똑같이 넘긴다(예전엔 둘이 각자 시각을 찍어 몇 초씩 어긋났다).
+    session_started_at = datetime.now()
+    session_dir = make_session_dir(participant_id, session_started_at)
+    print(f"📁 이번 세션 저장 위치: {os.path.relpath(session_dir, _REPO_ROOT)}")
 
     port, pkt = open_port()
     lock = threading.Lock()
@@ -825,12 +837,12 @@ def main():
             # 빈 리스트를 반환해 조용히 스킵된다.
             profiles.consolidate_facts(final_name)
 
-        if final_name and session_history:
+        if session_history:
             # 2026-08-10: '마음 처방전'(LLM 결과지) 생성은 제거했다 — 대화록 원문만 저장한다
             # (core/report_manager.py 상단 주석 참고). 파일 쓰기뿐이라 API를 쓰지 않는다.
-            report_manager.save_conversation_log(final_name, "\n".join(session_history))
-        elif session_history:
-            print("ℹ️  이름을 몰라 대화록은 저장하지 않습니다 (대화 자체는 정상 진행됨).")
+            # 2026-08-11: 이름을 몰라도 저장한다 — 폴더가 참가자ID로 이미 정해져 있으므로
+            # 어느 참가자 것인지 알 수 있고, 예전처럼 대화록이 통째로 사라지지 않는다.
+            report_manager.save_conversation_log(final_name, "\n".join(session_history), session_dir)
 
         # 연구 데이터 — 문항별 모드/정답여부/힌트요청여부/타임스탬프(core/quiz_state.py
         # export_log() 참고)를 1/2/3번 모드별 파일로 나눠 저장한다(core/quiz_export.py).
@@ -838,7 +850,27 @@ def main():
         # 뽑는다 — Ctrl+C로 끊긴 세션도 그때까지 채점된 문항은 전부 보존된다.
         quiz_session = quiz_holder["session"]
         quiz_log = quiz_session.export_log() if quiz_session is not None else []
-        save_quiz_results(final_name, quiz_log)
+        save_quiz_results(quiz_log, session_dir)
+
+        # 분석할 때 필요한 세션 단위 정보(특히 카운터밸런싱 그룹 = 모드 순서)를 산출물
+        # 옆에 같이 남긴다 — 예전엔 .env에만 있어서 나중에 손으로 맞춰야 했다.
+        meta_path = write_session_meta(
+            session_dir,
+            participant_id=participant_id,
+            robot_known_name=final_name,
+            quiz_mode_order=[mode_label(m) for m in mode_order],
+            # 이 finally는 어떤 경우에도 죽으면 안 된다(여기서 예외가 나면 그 참가자
+            # 산출물 저장이 통째로 날아간다) — 값이 이상하면 원문 그대로 기록만 한다.
+            quiz_round_offset=(os.getenv("QUIZ_ROUND_OFFSET", "0") or "0").strip(),
+            quiz_experiment_mode=(os.getenv("QUIZ_EXPERIMENT_MODE", "").strip().lower() == "true"),
+            started_at=session_started_at.strftime("%Y-%m-%d %H:%M:%S"),
+            ended_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            quiz_question_count=len(quiz_log),
+        )
+        if meta_path:
+            print(f"📁 세션 산출물 저장 완료: {os.path.relpath(session_dir, _REPO_ROOT)}")
+        else:
+            print("ℹ️  남길 산출물이 없어 세션 폴더를 만들지 않았습니다(대화록·퀴즈 결과 모두 없음).")
 
 
 if __name__ == "__main__":

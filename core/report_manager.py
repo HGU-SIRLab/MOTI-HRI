@@ -11,29 +11,29 @@
 
 conversation_log는 "User: {발화} | Moti: {응답}" 형식 줄바꿈 로그를 기대한다(v2와 동일 계약) —
 launcher.py가 매 턴마다 이 형식으로 session_history를 쌓아서 그대로 넘긴다.
+
+**2026-08-11: 저장 위치가 참가자별 세션 폴더로 바뀌었다**(core/result_paths.py). 파일명을
+직접 짓지 않고 launcher.py가 정해준 session_dir 안에 `대화.txt`로 쓴다 — 같은 세션의 퀴즈
+JSON과 반드시 같은 폴더에 들어가게 하기 위함. 동시에 **이름을 몰라도 저장한다**: 예전에는
+user_name이 없으면 그대로 return해서, 참가자가 끝내 이름을 말하지 않으면 그 사람 대화록이
+통째로 사라졌다(N=30 실험에서는 그대로 데이터 손실).
 """
 import os
 from datetime import datetime
 
 
-def save_conversation_log(user_name: str, conversation_log: str) -> None:
-    """user_name이 없거나 "Unknown"이면 아무것도 하지 않는다(v2와 동일한 방어 조건)."""
-    if not user_name or user_name == "Unknown":
-        return
+def save_conversation_log(user_name: str | None, conversation_log: str, session_dir: str) -> None:
+    """session_dir(core/result_paths.make_session_dir()) 안에 대화.txt를 쓴다.
 
+    user_name은 이제 저장 여부를 좌우하지 않고 머리말에만 쓰인다 — 폴더는 진행자가 지정한
+    참가자ID로 이미 정해져 있으므로, 이름을 몰라도 어느 참가자 것인지 알 수 있다.
+    """
     try:
         now = datetime.now()
-        today_str = now.strftime("%Y-%m-%d")
-        # 2026-07-31 코드 리뷰로 발견: 날짜만으로 파일명을 지으면 같은 참가자를 같은 날
-        # 다시 진행해야 하는 경우(기술적 문제로 재실험 등) 이전 시도의 대화록이 조용히
-        # 덮어써진다 — core/quiz_export.py가 22단계에서 이미 겪고 고친 문제와 동일해서,
-        # 여기도 시각(HHMMSS)을 파일명에 포함시켜 같은 방식으로 맞춘다.
-        time_str = now.strftime("%H%M%S")
-        base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        result_dir = os.path.join(base_dir, "user_result")
-        os.makedirs(result_dir, exist_ok=True)
+        display_name = user_name if user_name and user_name != "Unknown" else "이름 미확인"
+        os.makedirs(session_dir, exist_ok=True)
 
-        chat_filename = os.path.join(result_dir, f"{today_str}_{time_str}_{user_name}_대화.txt")
+        chat_filename = os.path.join(session_dir, "대화.txt")
         formatted_log = ""
         for line in conversation_log.split('\n'):
             parts = line.split(" | Moti: ")
@@ -44,7 +44,7 @@ def save_conversation_log(user_name: str, conversation_log: str) -> None:
                 formatted_log += line + "\n"
 
         with open(chat_filename, "w", encoding="utf-8") as f:
-            f.write(f"--- {user_name}님과의 전체 대화 기록 ---\n")
+            f.write(f"--- {display_name}님과의 전체 대화 기록 ---\n")
             f.write(f"일시: {now.strftime('%Y-%m-%d %H:%M:%S')}\n\n")
             f.write(formatted_log)
         print(f"📄 전체 대화문 저장 완료: {chat_filename}")

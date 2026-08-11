@@ -5,10 +5,13 @@ core/report_manager.py가 대화록/결과지를 저장하는 것과 같은 "세
 한 참가자가 세 모드를 로봇을 끄지 않고 한 대화 세션 안에서 연속으로 진행하는 실험 운영
 방식(2026-07-31 확정)을 전제로, 세션 종료 시 한 번만 호출되면 그 세션에서 진행된 모드
 전부가 각자 파일로 나뉘어 저장된다.
+
+**2026-08-11: 저장 위치가 참가자별 세션 폴더로 바뀌었다**(core/result_paths.py). 폴더명을
+여기서 직접 짓지 않고 launcher.py가 정해준 session_dir을 그대로 쓴다 — 같은 세션의
+대화록(core/report_manager.py)과 반드시 같은 폴더에 들어가게 하기 위함.
 """
 import json
 import os
-from datetime import datetime
 
 MODE_LABELS = {
     "all_knowing": "1_척척박사",
@@ -17,25 +20,16 @@ MODE_LABELS = {
 }
 
 
-def save_quiz_results(user_name: str | None, quiz_log: list[dict]) -> None:
-    """quiz_log(QuizSession.export_log()의 결과)를 mode별로 나눠 user_result/ 아래
-    참가자+시각 단위 폴더에 저장한다. 빈 로그면 아무것도 안 한다.
+def save_quiz_results(quiz_log: list[dict], session_dir: str) -> None:
+    """quiz_log(QuizSession.export_log()의 결과)를 mode별로 나눠 session_dir
+    (core/result_paths.make_session_dir())에 저장한다. 빈 로그면 아무것도 안 한다.
 
-    폴더명에 날짜뿐 아니라 시각(HHMMSS)까지 넣는 이유: 같은 참가자를 같은 날 다시
-    진행해야 하는 경우(기술적 문제로 재실험 등) 이전 시도를 덮어쓰지 않기 위함 —
-    예전 launcher.py는 날짜+이름만으로 파일명을 지어서 이런 재실험 시 데이터가
-    조용히 사라질 위험이 있었다.
+    폴더 자체는 여기서 만든다 — 퀴즈를 한 문항도 안 한 세션이 빈 폴더로 남지 않게
+    "쓸 게 있을 때만" 생성하는 방식(core/report_manager.py도 동일).
     """
     if not quiz_log:
         return
 
-    display_name = user_name or "unknown"
-    now = datetime.now()
-    date_str = now.strftime("%Y-%m-%d")
-    time_str = now.strftime("%H%M%S")
-
-    base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    session_dir = os.path.join(base_dir, "user_result", f"{date_str}_{time_str}_{display_name}_quiz")
     os.makedirs(session_dir, exist_ok=True)
 
     by_mode: dict[str, list[dict]] = {}
