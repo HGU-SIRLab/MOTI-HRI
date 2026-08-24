@@ -35,6 +35,11 @@ python launcher.py            # 카메라 인덱스 기본 0
 python launcher.py 1          # 다른 카메라를 쓸 때
 ```
 
+> **Jetson Orin Nano에서 돌리려면** `requirements.txt` 대신 `requirements-jetson.txt`를 쓰고,
+> 실행 전에 `python scripts/jetson_doctor.py`로 사전점검할 것 — 절차 전체는
+> [`docs/jetson.md`](docs/jetson.md). 카메라 백엔드·시리얼 포트·오디오 장치·ONNX 프로바이더가
+> 플랫폼마다 갈리는데, 전부 `.env`로 지정할 수 있게 되어 있다(기본값은 Windows 기존 동작 유지).
+
 **모델 파일**: `models/face_landmarker.task`(mediapipe 공식 배포본)는 용량 문제로 git에 없다 — 없으면 얼굴추적이 비활성화되니 직접 받아 넣을 것. InsightFace `buffalo_l`은 첫 실행 시 `~/.insightface/`에 자동 다운로드된다. SLEEPY 코골이 클립(`assets/audio/snore.wav`)이 없으면 `python scripts/generate_snore_audio.py`로 한 번 생성한다(없어도 경고만 하고 정상 동작).
 
 **종료**: 사용자가 작별 인사를 하면 모델이 `[대화종료]` 태그를 내보내 자연 종료된다. Ctrl+C로 강제 종료해도 그때까지의 대화록/퀴즈 결과는 저장된다(31단계).
@@ -226,6 +231,7 @@ assets/        퀴즈 사진(questions.json + 크롭/원본), 코골이 클립, 
 | [`docs/integration-points.md`](docs/integration-points.md) | 남은 통합 지점/보류 항목 |
 | [`docs/experiment_design.md`](docs/experiment_design.md) | 하찮미 실험 측정 설계(가설-설문 매핑, 카운터밸런싱, 로그 지표, 운영 절차) |
 | [`docs/survey_draft.md`](docs/survey_draft.md) | 설문 문항 전체 |
+| [`docs/jetson.md`](docs/jetson.md) | Jetson Orin Nano 이식 절차 + 플랫폼별로 갈리는 지점 6군데 |
 
 ## 상태 (2026-08-07)
 

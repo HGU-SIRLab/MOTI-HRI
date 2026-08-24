@@ -43,7 +43,9 @@ captured: list = []
 class FakeOutputStream:
     """콜백을 blocksize/samplerate 주기로 계속 부르는 가짜 출력 장치."""
 
-    def __init__(self, samplerate, channels, dtype, blocksize, callback):
+    # **kwargs: 실제 sd.OutputStream이 받는 인자가 늘어나도(2026-08-24의 device= 등)
+    # 이 가짜 장치가 따라 깨지지 않도록 흘려보낸다.
+    def __init__(self, samplerate, channels, dtype, blocksize, callback, **kwargs):
         self._period = blocksize / samplerate
         self._frames = blocksize
         self._callback = callback

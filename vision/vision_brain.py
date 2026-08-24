@@ -70,6 +70,69 @@ class FuzzyART:
         self.num_categories += 1
         return f"Created new memory for {label}"
 
+# ==========================================
+# ONNX Runtime 실행 프로바이더 (2026-08-24, Jetson 이식)
+# ==========================================
+# 예전에는 providers=['CUDAExecutionProvider','CPUExecutionProvider']를 그냥 박아뒀다.
+# 그 목록은 "요청"일 뿐이라, 설치된 onnxruntime이 CPU 전용 휠이면 **아무 말 없이 CPU로**
+# 떨어진다. Windows에서는 그래도 쓸 만했지만 Orin Nano에서 CPU로 떨어지면 얼굴인식이
+# 눈에 띄게 느려지는데 원인을 모른 채 헤매게 된다 — 그래서 (1) 실제 가용한 것만 요청하고
+# (2) 세션이 뭘로 돌아가는지 시작할 때 찍는다.
+#
+# Jetson(JetPack)에서는 TensorrtExecutionProvider가 대개 가장 빠르지만 첫 실행 때
+# 엔진 빌드로 수 분이 걸린다. 그래서 기본 우선순위에는 넣지 않고, 쓰고 싶으면
+# .env의 ORT_PROVIDERS로 명시하게 했다.
+_DEFAULT_PROVIDER_ORDER = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+
+# 얼굴 검출 입력 해상도. 640이 기존 값이고 정확도 기준이다. CPU로만 돌려야 하는
+# 상황이라면 320으로 낮추면 체감 속도가 크게 오른다(멀리 있는 얼굴은 놓치기 쉬워짐).
+DET_SIZE = int(os.getenv("FACE_DET_SIZE", "640"))
+
+
+def resolve_ort_providers() -> list[str]:
+    """요청할 실행 프로바이더 목록을 실제 가용한 것만 남겨서 돌려준다."""
+    requested = [p.strip() for p in os.getenv("ORT_PROVIDERS", "").split(",") if p.strip()]
+    requested = requested or list(_DEFAULT_PROVIDER_ORDER)
+    try:
+        import onnxruntime as ort
+        available = set(ort.get_available_providers())
+    except Exception as e:
+        print(f"⚠️ onnxruntime 프로바이더 목록을 못 읽었습니다({e}) — 요청 목록을 그대로 씁니다.")
+        return requested
+
+    usable = [p for p in requested if p in available]
+    dropped = [p for p in requested if p not in available]
+    if dropped:
+        print(f"ℹ️ 사용할 수 없어 제외된 프로바이더: {', '.join(dropped)}")
+        print(f"   (이 환경에서 가능한 것: {', '.join(sorted(available))})")
+    if not usable:
+        usable = ["CPUExecutionProvider"]
+    return usable
+
+
+def report_actual_providers(app) -> None:
+    """insightface가 만든 세션이 **정말로** 무엇으로 돌고 있는지 출력한다.
+    요청 목록이 아니라 세션에 붙은 실제 값을 읽는다."""
+    names = set()
+    for model in getattr(app, "models", {}).values():
+        session = getattr(model, "session", None)
+        if session is not None:
+            try:
+                names.update(session.get_providers())
+            except Exception:
+                pass
+    if not names:
+        return
+    if names == {"CPUExecutionProvider"}:
+        print("⚠️ 얼굴인식이 **CPU**로 돌고 있습니다 (GPU 가속 없음).")
+        print("   Jetson이라면 JetPack용 onnxruntime-gpu 휠이 설치됐는지 확인하세요"
+              " — `python -c \"import onnxruntime; print(onnxruntime.get_available_providers())\"`"
+              " (docs/jetson.md 참고).")
+    else:
+        print(f"✅ 얼굴인식 실행 프로바이더: {', '.join(sorted(names))}")
+
+
+
 class RobotBrain:
     def __init__(self, db_path=None, similarity_threshold=None):
         # (호환성을 위해 인자 추가, 사용은 안 함)
@@ -77,12 +140,17 @@ class RobotBrain:
         
         # ▼▼▼ [수정 1] 필요한 모듈만 지정하여 로드 (속도 향상) ▼▼▼
         # allowed_modules=['detection', 'recognition'] 만 사용
+        providers = resolve_ort_providers()
         self.app = FaceAnalysis(
-            name='buffalo_l', 
-            allowed_modules=['detection', 'recognition'], 
-            providers=['CUDAExecutionProvider', 'CPUExecutionProvider']
+            name='buffalo_l',
+            allowed_modules=['detection', 'recognition'],
+            providers=providers,
         )
-        self.app.prepare(ctx_id=0, det_size=(640, 640))
+        # ctx_id는 GPU 프로바이더가 실제로 잡혔을 때만 0(=GPU)이어야 한다. CPU만 남았는데
+        # 0을 주면 insightface가 GPU를 쓰는 줄 알고 진행하다 엉뚱한 데서 실패한다.
+        ctx_id = 0 if providers and providers[0] != "CPUExecutionProvider" else -1
+        self.app.prepare(ctx_id=ctx_id, det_size=(DET_SIZE, DET_SIZE))
+        report_actual_providers(self.app)
         # ▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲
 
         # Fuzzy ART (뇌)

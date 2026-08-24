@@ -1,0 +1,174 @@
+# Jetson Orin Nano 이식 (jetson-moti 브랜치)
+
+대상 하드웨어: **Jetson Orin Nano Super Developer Kit 8GB + NVMe SSD 256GB**
+목표: 지금까지 Windows에서 돌던 모티 기능 전부(얼굴추적·인식 → Live API 대화 → 표정 UI →
+제스처 → 퀴즈 3라운드 → 결과지 저장)를 젯슨에서 그대로 재현.
+
+이 문서는 **절차서**다. "이렇게 하면 된다"가 아니라 "이 순서로 하고, 각 단계를
+`scripts/jetson_doctor.py`로 확인하라"는 뜻이다 — 실제 검증은 젯슨 실물에서만 가능하다.
+
+---
+
+## 0. 이 브랜치가 Windows 브랜치와 다른 점
+
+`main`은 Windows에서만 돌아가는 전제로 쓰여 있었다. 갈리는 지점이 여섯 군데 있었고,
+전부 **Windows 동작을 바꾸지 않는 방식**(플랫폼 분기 + `.env` 스위치)으로 고쳤다.
+즉 이 브랜치는 개발 PC에서도 예전과 똑같이 돌아간다.
+
+| # | 문제 | 증상(고치기 전) | 고친 곳 |
+|---|------|----------------|---------|
+| 1 | `cv2.CAP_DSHOW`는 Windows 전용 백엔드 | 젯슨에서 카메라가 안 열림 | `vision/camera.py` 신규, `vision/face.py` |
+| 2 | 시리얼 포트 기본값 `COM3`, 탐색이 Windows 드라이버 문자열 매칭 | U2D2를 못 찾음 | `hardware/config.py` (FTDI **VID**로 판정) |
+| 3 | `multiprocessing` 기본값이 리눅스는 `fork` | 퀴즈 사진 창이 뜨다 멈춤/죽음 | `bootstrap.ensure_spawn_start_method()` |
+| 4 | ONNX 프로바이더를 검증 없이 요청 | 얼굴인식이 **조용히** CPU로 떨어짐 | `vision/vision_brain.py` |
+| 5 | 오디오가 시스템 기본 장치 고정 | ALSA가 HDMI를 잡아 소리가 안 남 | `media/audio_manager.py` (`MIC_DEVICE`/`SPEAKER_DEVICE`) |
+| 6 | `pyworld`/`aec` 를 최상단 import | 그 패키지 빌드가 실패하면 **로봇 자체가 안 뜸** | `media/voice_shift.py`, `media/audio_manager.py` |
+
+6번이 특히 중요하다. 두 패키지는 aarch64 미리 빌드 휠이 없을 수 있는데, 예전 구조에서는
+`ENABLE_VOICE_SHIFT=false`로 꺼둬도 `launcher.py`의 import 단계에서 죽었다. 지금은 없으면
+해당 기능만 끄고 경고를 찍은 뒤 계속 간다.
+
+---
+
+## 1. 하드웨어 연결
+
+| 장치 | 연결 | 젯슨에서 보이는 이름 |
+|------|------|---------------------|
+| 다이나믹셀 (U2D2) | USB | `/dev/ttyUSB0` (FTDI, VID `0403`) |
+| 카메라 | USB 웹캠 | `/dev/video0` |
+| 마이크 / 스피커 | USB 오디오 | `jetson_doctor.py --audio` 로 인덱스 확인 |
+| 표정 화면 | HDMI/DP | 800×480 기준으로 스케일됨 |
+
+카메라를 CSI로 바꿀 거라면 `.env`에 `CAMERA_BACKEND=gstreamer`를 넣는다. 단 그 경로는
+**OpenCV가 GStreamer 지원으로 빌드되어 있어야** 동작한다(아래 3단계).
+
+---
+
+## 2. OS / 시스템 준비
+
+```bash
+# 전원 모드를 최대로 — 기본 저전력 모드면 대화 응답 지연이 눈에 띄게 늘어난다
+sudo nvpmodel -m 0
+sudo jetson_clocks
+
+# 시리얼 포트 권한. 재로그인해야 반영된다
+sudo usermod -aG dialout $USER
+
+# 8GB 모델이라 스왑을 잡아두는 편이 안전하다(SSD에 만들 것)
+sudo fallocate -l 8G /swapfile && sudo chmod 600 /swapfile
+sudo mkswap /swapfile && sudo swapon /swapfile
+echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab
+```
+
+메모리 압박이 실제로 있다: mediapipe FaceLandmarker + insightface(buffalo_l) + pygame +
+Tkinter 창 + Live API 스트림이 동시에 뜬다. 스왑이 없으면 모델 로딩 중 죽을 수 있다.
+
+---
+
+## 3. 파이썬 환경
+
+`requirements-jetson.txt` 의 주석이 단계별 명령을 그대로 담고 있다. 요약하면:
+
+```bash
+sudo apt install -y python3-pip python3-dev python3-tk \
+                    libportaudio2 portaudio19-dev v4l-utils build-essential cmake
+
+python3 -m venv ~/moti-venv --system-site-packages   # apt로 깐 opencv를 쓰려면 이 옵션 필요
+source ~/moti-venv/bin/activate
+pip install -r requirements-jetson.txt
+```
+
+**따로 판단해야 하는 두 가지:**
+
+- **OpenCV** — USB 웹캠만 쓸 거면 `pip install opencv-python`으로 충분하다. CSI 카메라를
+  쓰려면 GStreamer 지원이 필요하고, 그건 `sudo apt install python3-opencv` 쪽이다.
+- **onnxruntime** — `pip install onnxruntime`은 **CPU 전용**이다. GPU 가속을 쓰려면
+  설치된 JetPack 버전에 맞는 `onnxruntime-gpu` 휠을 받아야 한다. 먼저
+  `cat /etc/nv_tegra_release`로 L4T 버전을 확인하고 그에 맞는 휠을 설치할 것.
+  확인:
+  ```bash
+  python -c "import onnxruntime; print(onnxruntime.get_available_providers())"
+  ```
+  `CUDAExecutionProvider`가 보이면 성공. 안 보이면 CPU로 도는 것이고, 그 상태로 버티려면
+  `.env`에 `FACE_DET_SIZE=320`을 넣어 검출 해상도를 낮춘다.
+
+---
+
+## 4. git으로 코드 옮기기 — 안 따라오는 파일들
+
+`.gitignore` 때문에 `git clone`만으로는 **오지 않는** 것들이 있다. 개발 PC에서 직접 복사해야 한다.
+
+| 파일/폴더 | 없으면 | 어떻게 |
+|-----------|--------|--------|
+| `models/face_landmarker.task` | 얼굴**추적**이 아예 안 됨 | 개발 PC `C:\moti\models\`에서 복사 |
+| `.env` | API 키 없어 대화 시작 안 됨 | `cp .env.example .env` 후 채우기 |
+| `art_brain.pkl` | 등록된 얼굴 기억이 빈 상태로 시작 | 기존 기억을 유지하려면 복사 |
+| `user_profiles.json` | 위와 같음 | 위와 같음 |
+| insightface `buffalo_l` | 얼굴**인식**이 안 됨 | 첫 실행 시 자동 다운로드(네트워크 필요) |
+
+`assets/`(퀴즈 사진 30MB)는 git에 들어있으니 clone으로 따라온다.
+
+오프라인 시연 예정이라면 **네트워크가 되는 동안 한 번 실행해서** insightface 캐시
+(`~/.insightface/models/buffalo_l`)를 미리 만들어 둘 것. 단, Live API 대화 자체는
+네트워크가 필수라 완전 오프라인 시연은 불가능하다.
+
+---
+
+## 5. 점검 → 실행
+
+```bash
+python scripts/jetson_doctor.py            # 전체
+python scripts/jetson_doctor.py --audio    # 오디오 장치 인덱스 확인 → .env에 기입
+python scripts/jetson_doctor.py --camera   # 실제로 프레임을 한 장 받아본다
+python scripts/jetson_doctor.py --serial   # 포트 열기까지 (모터는 안 움직임)
+```
+
+❌ 가 없어지면 실행:
+
+```bash
+export DISPLAY=:0        # SSH로 접속했다면 반드시 (안 하면 표정 창이 안 뜬다)
+python launcher.py
+```
+
+---
+
+## 6. 실물에서 처음 켤 때 확인할 순서
+
+한꺼번에 켜서 안 되면 원인을 못 찾는다. 아래 순서로 하나씩 올린다.
+
+1. `python scripts/jetson_doctor.py --camera --serial --audio` → ❌ 0건
+2. `python scripts/test_motions.py` → 모터가 실제로 움직이는가 (관절 홈 위치가 Windows에서
+   보정한 값 그대로인지 눈으로 확인 — `hardware/init.py`의 `MOTOR_HOME_POSITIONS`)
+3. `python scripts/test_display.py` → 표정 창이 HDMI 화면에 뜨는가
+4. `python scripts/test_quiz_window.py` → 퀴즈 사진 창(별도 프로세스)이 뜨는가
+   **← 3번 fork 문제가 있었다면 여기서 걸린다**
+5. `python scripts/test_vision_brain.py` → 얼굴이 인식되는가, 몇 fps인가
+6. `python scripts/test_live_audio.py` → 마이크로 말하면 대답이 들리는가
+7. `python launcher.py` → 전체
+
+---
+
+## 7. 젯슨에서 새로 생길 법한 문제와 대처
+
+| 증상 | 먼저 볼 것 |
+|------|-----------|
+| 카메라 fps가 5~10으로 낮다 | `.env` `CAMERA_FOURCC=MJPG` 확인. 그래도 낮으면 `CAMERA_WIDTH/HEIGHT=640/480` |
+| 얼굴인식이 느리다 | doctor의 "얼굴인식 실행 프로바이더" 줄 — CPU면 onnxruntime-gpu 재설치, 아니면 `FACE_DET_SIZE=320` |
+| 소리가 안 난다 | `--audio`로 인덱스 확인 후 `SPEAKER_DEVICE` 지정. ALSA 기본이 HDMI인 경우가 흔함 |
+| 말이 중간에 끊긴다 | 세션 종료 로그의 "스피커 언더런" 수치를 보고 `PLAYOUT_PRIME_MS`를 올린다(`.env.example` 주석 참고). **`VOICE_SHIFT_BUFFER_MS`는 올리지 말 것** — 2026-08-10에 효과 없음이 실측으로 확정됨 |
+| 퀴즈 사진 창이 안 뜬다 | `python3-tk` 설치 여부, `DISPLAY` 설정, 그리고 콘솔에 "퀴즈 사진 창 프로세스가 죽었습니다" 경고가 떴는지 |
+| 모터를 못 연다 | `dialout` 그룹 + **재로그인**. `ls -l /dev/ttyUSB0`로 권한 확인 |
+| 대화 응답이 전반적으로 굼뜨다 | `sudo nvpmodel -m 0 && sudo jetson_clocks` (재부팅하면 풀린다) |
+
+---
+
+## 8. 아직 안 한 것 / 남은 판단
+
+- **실물 검증 전부.** 이 브랜치의 변경은 Windows에서 회귀가 없다는 것만 확인했다
+  (doctor 실행 결과 ❌ 0건, 카메라·시리얼·오디오 경로 모두 기존 동작 유지).
+- **성능 목표치 미정.** 얼굴추적이 몇 fps 나와야 실사용에 무리가 없는지는 젯슨에서
+  재본 뒤 정해야 한다. Windows에서는 웹캠 30fps 기준으로 맞춰져 있었다.
+- **자동 시작(systemd) 미구성.** 전원만 넣으면 모티가 뜨게 하려면 서비스 유닛이 필요한데,
+  `DISPLAY`가 필요한 GUI 프로세스라 사용자 세션에 붙여야 한다. 실행이 안정된 뒤에 할 일.
+- **CSI 카메라 경로 미검증.** 코드 경로는 만들어 뒀지만(`vision/camera.py`의
+  `csi_pipeline()`) USB 웹캠을 계속 쓸 거면 손댈 필요 없다.

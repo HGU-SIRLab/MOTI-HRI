@@ -14,6 +14,7 @@ import time
 
 from hardware import config as C
 from core import suppress
+from vision.camera import CAMERA_HEIGHT, CAMERA_WIDTH, open_capture
 from hardware import dxl_io as io
 from dynamixel_sdk import PortHandler, PacketHandler
 from mediapipe.tasks import python
@@ -111,16 +112,13 @@ def face_tracker_worker(port: PortHandler, pkt: PacketHandler, lock: threading.L
         io.write4(pkt, port, C.PAN_ID, C.ADDR_PROFILE_ACCELERATION, accel_value)
         io.write4(pkt, port, C.TILT_ID, C.ADDR_PROFILE_ACCELERATION, accel_value)
 
-    print(f"▶ 카메라({camera_index})를 여는 중입니다...")
-    cap = cv2.VideoCapture(camera_index, cv2.CAP_DSHOW)
+    # 백엔드(Windows=DirectShow / 리눅스=V4L2·GStreamer)와 해상도·FOURCC 설정은
+    # vision/camera.py가 플랫폼별로 처리한다(2026-08-24, Jetson 이식).
+    cap = open_capture(camera_index)
 
     if not cap.isOpened():
         print(f"⚠️ 카메라({camera_index}) 열기 실패")
         landmarker.close(); return
-    print(f"✅ 카메라({camera_index})가 성공적으로 열렸습니다.")
-
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
 
     last_mode = shared_state.get('mode', 'tracking')
 
@@ -131,8 +129,8 @@ def face_tracker_worker(port: PortHandler, pkt: PacketHandler, lock: threading.L
 
     prev_time = 0
 
-    smooth_nx = 1280 // 2
-    smooth_ny = 720 // 2
+    smooth_nx = CAMERA_WIDTH // 2
+    smooth_ny = CAMERA_HEIGHT // 2
     SMOOTH_FACTOR = 0.4
 
     last_recog_time = 0

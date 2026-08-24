@@ -20,11 +20,27 @@ import queue
 import threading
 
 import numpy as np
-import pyworld as pw
+
+# pyworld(WORLD 보코더)는 aarch64에 미리 빌드된 휠이 없어 Jetson에서는 소스 빌드가
+# 필요하고, 그게 실패할 수도 있다. 예전에는 여기서 모듈 최상단에 import했는데
+# launcher.py가 이 모듈을 무조건 import하므로, pyworld가 없으면 **ENABLE_VOICE_SHIFT=false로
+# 꺼둬도 로봇 자체가 안 뜨는** 상태였다(2026-08-24 Jetson 이식 중 발견).
+# 지금은 실제로 변조를 할 때만 불러오고, 없으면 원본 음성으로 조용히 넘어간다.
+try:
+    import pyworld as pw
+    HAS_PYWORLD = True
+except ImportError:  # pragma: no cover - 플랫폼 의존
+    pw = None
+    HAS_PYWORLD = False
 
 ENABLE_VOICE_SHIFT = os.getenv("ENABLE_VOICE_SHIFT", "true").lower() not in ("0", "false", "no")
 # +4st/x1.15로 시작했으나 프로덕션(청크) 방식에서 살짝 기계음이 섞여 들린다는 피드백으로
 # 강도를 조금 낮춤 — "귀여움"은 거의 유지하면서 기계음이 줄어드는 지점으로 확정(2026-07-28).
+if ENABLE_VOICE_SHIFT and not HAS_PYWORLD:
+    print("⚠️ pyworld가 없어 목소리 시프트를 끕니다 — Gemini 프리셋 음색(성인 톤) 그대로 재생됩니다.")
+    print("   설치하려면: pip install pyworld  (aarch64에서는 build-essential·cython 필요)")
+    ENABLE_VOICE_SHIFT = False
+
 VOICE_PITCH_SEMITONES = float(os.getenv("VOICE_PITCH_SEMITONES", "3.5"))
 VOICE_FORMANT_RATIO = float(os.getenv("VOICE_FORMANT_RATIO", "1.12"))
 # 이 이하로 버퍼가 쌓이면 harvest 분석이 불안정해질 수 있어(맥락이 너무 짧음) 그냥
@@ -90,6 +106,8 @@ def shift_pcm(pcm_bytes: bytes, sample_rate: int,
               formant_ratio: float = VOICE_FORMANT_RATIO) -> bytes:
     """int16 PCM 바이트를 받아 피치+포먼트를 시프트한 int16 PCM 바이트를 돌려준다.
     너무 짧거나 무음이면(분석 불가) 원본을 그대로 돌려준다."""
+    if not HAS_PYWORLD:
+        return pcm_bytes
     audio = np.frombuffer(pcm_bytes, dtype=np.int16).astype(np.float64) / 32768.0
     if len(audio) < MIN_SHIFT_SAMPLES or not np.any(audio):
         return pcm_bytes

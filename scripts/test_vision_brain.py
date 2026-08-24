@@ -20,6 +20,7 @@ from bootstrap import ensure_utf8_console
 ensure_utf8_console()
 
 from core import suppress
+from vision.camera import open_capture
 from vision.vision_brain import RobotBrain
 
 
@@ -31,7 +32,7 @@ def main():
     print("▶ RobotBrain 초기화 중 (모델 로딩)...")
     brain = RobotBrain()
 
-    cap = cv2.VideoCapture(camera_index, cv2.CAP_DSHOW)
+    cap = open_capture(camera_index)
     if not cap.isOpened():
         print(f"⚠️ 카메라({camera_index}) 열기 실패")
         return

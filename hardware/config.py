@@ -1,6 +1,6 @@
 import os
 
-from bootstrap import ensure_utf8_console
+from bootstrap import IS_LINUX, ensure_utf8_console
 
 ensure_utf8_console()
 
@@ -21,30 +21,63 @@ ADDR_PROFILE_ACCELERATION = 108
 
 
 def find_dxl_port() -> str | None:
-    """U2D2/FTDI 계열 시리얼 포트를 스캔해 자동으로 찾는다."""
+    """U2D2/FTDI 계열 시리얼 포트를 스캔해 자동으로 찾는다.
+
+    2026-08-24(Jetson 이식): 예전에는 `port.description`에 'U2D2'/'USB Serial Port'/'FTDI'가
+    들어있는지만 봤다. 그 문자열들은 **Windows 드라이버가 붙여주는 이름**이라 리눅스에서는
+    같은 U2D2가 'FT232H'·'USB <-> Serial Converter' 같은 다른 설명으로 잡혀 자동 탐색이
+    통째로 실패한다. 그래서 판정 근거를 USB VID(FTDI=0x0403)로 옮기고, 문자열 매칭은
+    VID를 못 읽는 환경을 위한 보조 수단으로만 남긴다.
+    """
     if serial is None:
         return None
 
     print("▶️  사용 가능한 시리얼 포트 검색 중...")
-    ports = serial.tools.list_ports.comports()
-    dxl_port = None
+    ports = list(serial.tools.list_ports.comports())
+    if not ports:
+        print("  (열거된 포트 없음)")
+
+    keywords = ("U2D2", "USB SERIAL PORT", "FTDI", "FT232", "USB <-> SERIAL", "USB2.0-SER")
+    by_vid, by_keyword = [], []
 
     for port in ports:
-        print(f"  - 포트: {port.device}, 설명: {port.description}")
-        if 'U2D2' in port.description or \
-           'USB Serial Port' in port.description or \
-           'FTDI' in port.description:
-            dxl_port = port.device
-            print(f"✅ 다이나믹셀 포트를 찾았습니다: {dxl_port}")
-            break
+        vid_pid = f"{port.vid:04X}:{port.pid:04X}" if port.vid is not None and port.pid is not None else "----:----"
+        print(f"  - 포트: {port.device}, 설명: {port.description}, VID:PID: {vid_pid}")
+        if port.vid == FTDI_VID:
+            by_vid.append(port.device)
+            continue
+        haystack = f"{port.description} {port.manufacturer or ''} {port.product or ''}".upper()
+        if any(k in haystack for k in keywords):
+            by_keyword.append(port.device)
 
-    if dxl_port is None:
-        print("⚠️  자동으로 다이나믹셀 포트를 찾지 못했습니다.")
+    # 같은 근거로 여러 개가 잡히면 /dev/ttyUSB* 를 먼저 본다 — Jetson에서 /dev/ttyTHS*
+    # (SoC 내장 UART)나 /dev/ttyACM* 이 같이 열거되는 경우가 있어서다.
+    def rank(dev: str) -> int:
+        return 0 if "ttyUSB" in dev or dev.upper().startswith("COM") else 1
 
-    return dxl_port
+    for label, found in (("VID(FTDI)", by_vid), ("설명 문자열", by_keyword)):
+        if found:
+            found.sort(key=rank)
+            dxl_port = found[0]
+            print(f"✅ 다이나믹셀 포트를 찾았습니다: {dxl_port}  (근거: {label})")
+            if len(found) > 1:
+                print(f"   ℹ️ 후보가 여럿입니다({', '.join(found)}) — 틀렸다면 .env의 DXL_PORT로 직접 지정하세요.")
+            return dxl_port
+
+    print("⚠️  자동으로 다이나믹셀 포트를 찾지 못했습니다.")
+    if IS_LINUX:
+        print("   리눅스에서는 권한 문제일 수 있습니다: `ls -l /dev/ttyUSB*` 로 포트가 보이는데도"
+              " 못 열면 `sudo usermod -aG dialout $USER` 후 재로그인하세요"
+              " (docs/jetson.md 참고).")
+    return None
 
 
-_DEFAULT_PORT = "COM3"
+# U2D2는 FTDI 칩을 쓴다. FTDI의 USB 벤더 ID는 0x0403으로 고정이고, 제품 ID(PID)는
+# 칩/리비전마다 달라(FT232H·FT232R 등) 여기서 못 박지 않는다 — VID만으로 충분히 좁혀진다.
+FTDI_VID = 0x0403
+
+# 자동 탐색도 .env 지정도 없을 때의 최후 기본값. 플랫폼마다 다른 게 당연하므로 갈라둔다.
+_DEFAULT_PORT = "/dev/ttyUSB0" if IS_LINUX else "COM3"
 
 MANUAL_PORT = os.getenv("DXL_PORT")
 if MANUAL_PORT:

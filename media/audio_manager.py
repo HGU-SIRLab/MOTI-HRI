@@ -18,6 +18,18 @@ INPUT_RATE = 16000
 OUTPUT_RATE = 24000
 
 ENABLE_AEC = os.getenv("ENABLE_AEC", "true").lower() not in ("0", "false", "no")
+# aec-audio-processing(WebRTC AEC3 바인딩)은 aarch64에 미리 빌드된 휠이 없을 수 있다.
+# 예전에는 EchoCanceller() 생성 시점에 ImportError가 터져 로봇이 기동 중에 죽었다 —
+# 에코캔슬은 있으면 좋은 기능이지 없으면 못 도는 기능이 아니므로, 여기서 한 번 확인하고
+# 없으면 끈 채로 계속 간다(2026-08-24 Jetson 이식).
+if ENABLE_AEC:
+    try:
+        import aec_audio_processing as _aec_probe  # noqa: F401
+    except ImportError:
+        print("⚠️ aec-audio-processing이 없어 에코캔슬(AEC)을 끕니다.")
+        print("   스피커 소리가 마이크로 되돌아가 barge-in 오탐이 늘 수 있으니, 가능하면")
+        print("   스피커 볼륨을 낮추거나 마이크를 스피커에서 떨어뜨려 두세요.")
+        ENABLE_AEC = False
 # 스피커→마이크 왕복 지연 추정치(ms). 실측 안 된 값 — 에코가 잘 안 잡히면 이 값부터
 # 조정해볼 것(오디오 버퍼 크기가 크면 지연도 커진다: 지금 블록사이즈 기준 대략 100ms대).
 AEC_STREAM_DELAY_MS = int(os.getenv("AEC_STREAM_DELAY_MS", "100"))
@@ -36,6 +48,53 @@ PLAYOUT_PRIME_MS = int(os.getenv("PLAYOUT_PRIME_MS", "600"))
 # 아주 짧은 대답("네!")은 PLAYOUT_PRIME_MS를 영영 못 채울 수 있으니, 첫 오디오가 들어온
 # 뒤 이 시간이 지나면 덜 찼어도 그냥 재생을 시작한다.
 PLAYOUT_PRIME_TIMEOUT_SEC = float(os.getenv("PLAYOUT_PRIME_TIMEOUT_SEC", "0.5"))
+
+
+# ---------------------------------------------------------------------------
+# 입출력 장치 선택 (2026-08-24, Jetson 이식)
+#
+# 지금까지는 sounddevice의 기본 장치를 그냥 썼다. Windows에서는 그게 대체로 맞았지만
+# 리눅스/Jetson에서는 ALSA 기본 장치가 HDMI 출력이나 엉뚱한 캡처 장치로 잡히는 일이
+# 흔하다("소리는 안 나는데 에러도 안 남"의 전형적 원인). 그래서 .env로 장치를 못 박을 수
+# 있게 한다 — 인덱스(예: 11)로도, 이름 일부(예: "USB Audio")로도 지정할 수 있다.
+# 사용 가능한 장치 목록은 `python scripts/jetson_doctor.py --audio` 로 확인.
+# ---------------------------------------------------------------------------
+MIC_DEVICE = os.getenv("MIC_DEVICE", "").strip()
+SPEAKER_DEVICE = os.getenv("SPEAKER_DEVICE", "").strip()
+
+
+def resolve_device(spec: str, kind: str):
+    """.env 값(인덱스 또는 이름 일부)을 sounddevice 장치 인덱스로 바꾼다.
+    빈 값이면 None(=기본 장치)을 돌려준다. kind는 'input' 또는 'output'."""
+    if not spec:
+        return None
+    if spec.lstrip("-").isdigit():
+        return int(spec)
+
+    want = spec.lower()
+    key = "max_input_channels" if kind == "input" else "max_output_channels"
+    matches = [(i, d) for i, d in enumerate(sd.query_devices())
+               if d[key] > 0 and want in d["name"].lower()]
+    if not matches:
+        raise RuntimeError(
+            f"{kind} 장치 중 이름에 '{spec}'가 들어가는 것을 찾지 못했습니다. "
+            f"`python scripts/jetson_doctor.py --audio`로 목록을 확인하세요."
+        )
+    idx, dev = matches[0]
+    if len(matches) > 1:
+        print(f"ℹ️ '{spec}'에 맞는 {kind} 장치가 여럿입니다 — 첫 번째({dev['name']})를 씁니다.")
+    print(f"🎚️ {kind} 장치: [{idx}] {dev['name']}")
+    return idx
+
+
+def describe_devices() -> str:
+    """현재 잡힌 입출력 장치를 사람이 읽는 한 줄로. 세션 시작 로그용."""
+    try:
+        din = sd.query_devices(resolve_device(MIC_DEVICE, "input"), "input")
+        dout = sd.query_devices(resolve_device(SPEAKER_DEVICE, "output"), "output")
+        return f"🎤 입력: {din['name']}   🔊 출력: {dout['name']}"
+    except Exception as e:
+        return f"⚠️ 오디오 장치 확인 실패: {e}"
 
 
 class EchoCanceller:
@@ -91,6 +150,7 @@ class MicStreamer:
         self._stream = sd.InputStream(
             samplerate=INPUT_RATE, channels=1, dtype="int16",
             blocksize=1600, callback=self._callback,
+            device=resolve_device(MIC_DEVICE, "input"),
         )
 
     def _callback(self, indata, frames, time_info, status):
@@ -148,6 +208,7 @@ class Speaker:
         self._stream = sd.OutputStream(
             samplerate=OUTPUT_RATE, channels=1, dtype="int16",
             blocksize=2400, callback=self._callback,
+            device=resolve_device(SPEAKER_DEVICE, "output"),
         )
 
     @property

@@ -1,0 +1,74 @@
+# Jetson Orin Nano (JetPack / Ubuntu aarch64) 전용 의존성 목록
+# ---------------------------------------------------------------------------
+# requirements.txt를 그대로 쓰지 않는 이유는 세 가지다:
+#   1) opencv / onnxruntime 은 aarch64에서 pip 기본 휠이 정답이 아니다(아래 주석 참고).
+#   2) 일부 패키지는 pip이 아니라 apt로 깔아야 한다(tkinter, PortAudio).
+#   3) 몇 개는 aarch64 휠이 없어 소스 빌드가 필요하고, 실패해도 로봇은 돌아야 한다.
+#
+# ⚠️ 이 파일의 버전·경로는 실물에서 검증하고 채워 넣을 것. 여기 적힌 값은 "이 순서로
+#    설치하고, 설치 후 scripts/jetson_doctor.py 로 확인하라"는 절차이지 검증된 핀 목록이
+#    아니다. 확인이 끝나면 실제로 깔린 버전을 여기에 못 박아 재현 가능하게 만들 것.
+#    (설치 절차 전체는 docs/jetson.md)
+# ---------------------------------------------------------------------------
+
+# === 0단계: apt (pip으로 못 깖) ===
+#   sudo apt update
+#   sudo apt install -y python3-pip python3-dev python3-tk \
+#                       libportaudio2 portaudio19-dev \
+#                       v4l-utils build-essential cmake
+#   - python3-tk        : 퀴즈 사진 창(display/quiz_window.py)이 Tkinter를 쓴다
+#   - libportaudio2     : sounddevice의 실체. 없으면 import 자체가 실패한다
+#   - portaudio19-dev   : sounddevice 빌드가 필요할 때
+#   - v4l-utils         : 카메라 진단(v4l2-ctl --list-devices)
+#   - build-essential   : pyworld 등 소스 빌드용
+
+# === 1단계: 그냥 pip으로 되는 것들 ===
+google-genai
+google-generativeai
+mediapipe
+insightface
+dynamixel-sdk
+pyserial
+sounddevice
+numpy
+scipy
+pygame
+pillow
+python-dotenv
+screeninfo
+pynput
+
+# === 2단계: 별도 취급이 필요한 것들 (위 목록에 일부러 안 넣음) ===
+#
+# opencv
+#   pip의 opencv-python 휠은 GStreamer 지원 없이 빌드되어 있어 CSI 카메라
+#   (nvarguscamerasrc) 경로를 못 쓴다. USB 웹캠만 쓴다면 pip으로 충분하다.
+#     USB 웹캠만:  pip install opencv-python
+#     CSI 카메라도: sudo apt install python3-opencv   (JetPack 제공 빌드, GStreamer 포함)
+#   어느 쪽을 골랐든 확인:  python scripts/jetson_doctor.py   → "GStreamer 지원" 줄
+#
+# onnxruntime
+#   pip install onnxruntime 은 **CPU 전용**이다. 그걸 깔면 얼굴인식이 GPU를 전혀 못 쓴다
+#   (조용히 느려지기만 해서 알아채기 어렵다 — 그래서 vision/vision_brain.py가 실제
+#    프로바이더를 시작할 때 찍도록 고쳐뒀다).
+#   GPU를 쓰려면 **설치된 JetPack 버전에 맞는** onnxruntime-gpu 휠이 필요하다. NVIDIA가
+#   Jetson용 휠을 따로 배포하므로, 보드의 JetPack 버전을 먼저 확인하고
+#   (`cat /etc/nv_tegra_release`) 그 버전에 맞는 휠을 받아 설치할 것.
+#   설치 후 확인:
+#     python -c "import onnxruntime; print(onnxruntime.get_available_providers())"
+#   → CUDAExecutionProvider 가 보여야 성공. 안 보이면 CPU로 도는 것이고,
+#     그 경우 .env에 FACE_DET_SIZE=320 을 넣어 검출 해상도를 낮춰 버틸 수 있다.
+#
+# === 3단계: 있으면 좋지만 없어도 로봇은 도는 것들 ===
+#   둘 다 aarch64 미리 빌드 휠이 없을 수 있다. 설치가 실패하면 그냥 넘어가도 된다 —
+#   코드가 없는 걸 감지해서 해당 기능만 끄고 계속 진행한다(2026-08-24 이식 때 그렇게 고침).
+#
+# pyworld           # 목소리 피치/포먼트 시프트. 없으면 성인 음색 그대로 재생
+#   pip install cython && pip install pyworld
+#   실패하면 .env에 ENABLE_VOICE_SHIFT=false
+#
+# aec-audio-processing   # 에코캔슬(WebRTC AEC3). 없으면 스피커 소리가 마이크로 되돌아감
+#   pip install aec-audio-processing
+#   실패하면 .env에 ENABLE_AEC=false (스피커 볼륨을 낮추고 마이크를 떼어놓아 보완)
+#
+# websockets 는 google-genai 가 의존성으로 끌어온다(Live API가 WebSocket 기반).

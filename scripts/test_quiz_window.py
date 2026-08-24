@@ -21,9 +21,13 @@ import tempfile
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, _REPO_ROOT)
 
-from bootstrap import ensure_utf8_console
+from bootstrap import ensure_spawn_start_method, ensure_utf8_console
 
 ensure_utf8_console()
+# 퀴즈 사진 창을 별도 프로세스로 띄우기 전에 반드시 먼저 호출해야 한다
+# (리눅스 기본값 fork로는 CUDA 세션·pygame·열린 시리얼 포트를 물고 있는 상태에서
+#  자식이 멈춘다 — bootstrap.ensure_spawn_start_method 주석 참고).
+ensure_spawn_start_method()
 
 
 def _load_or_fake_questions():
