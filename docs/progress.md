@@ -2,6 +2,72 @@
 
 `docs/architecture.md`의 로드맵(§10) 대비 실제 구현 상태를 기록한다. 설계 자체가 바뀌면 architecture.md를, 무엇을 언제 어떻게 만들었는지는 이 문서를 갱신한다.
 
+### 49단계 — Jetson Orin Nano 이식 기반 (2026-08-24, 커밋 `a1ed2f4`, `79886af`)
+
+**브랜치**: `quiz-auto-rounds`를 `main`에 fast-forward 머지하고, `main`에서 `jetson-moti`를 팠다.
+머지 전 옛 main 끝점(참가자가 퀴즈 모드를 직접 고르던 방식)은 태그 `main-mode-select`(=`95b299b`)로 보존.
+실험 사용본 태그 `rita2026`은 그대로 두었고, main 푸시가 fast-forward라 태그 대상 커밋(`c859f84`)도
+새 main 히스토리에 그대로 포함된다.
+
+**목표**: Jetson Orin Nano Super 8GB + SSD 256GB, **Ubuntu 22.04 LTS (aarch64)** 위에서 기존 기능 전부 재현.
+
+#### 플랫폼이 갈리던 지점 7군데 (전부 Windows 동작을 바꾸지 않는 방식으로 수정)
+
+| # | 문제 | 고치기 전 증상 | 고친 곳 |
+|---|---|---|---|
+| 1 | `cv2.CAP_DSHOW`는 Windows 전용 백엔드 | 젯슨에서 카메라가 안 열림 | `vision/camera.py` 신규 |
+| 2 | 포트 기본값 `COM3` + Windows 드라이버 문자열 매칭 | U2D2를 못 찾음 | `hardware/config.py` — FTDI **VID(0x0403)** 로 판정 |
+| 3 | `multiprocessing` 리눅스 기본값이 `fork` | 퀴즈 사진 창 프로세스가 멈춤/사망 | `bootstrap.ensure_spawn_start_method()` |
+| 4 | ONNX 프로바이더를 검증 없이 요청 | 얼굴인식이 **조용히** CPU로 떨어짐 | `vision/vision_brain.py` |
+| 5 | 오디오가 시스템 기본 장치 고정 | ALSA가 HDMI를 잡아 소리 안 남 | `media/audio_manager.py` — `MIC_DEVICE`/`SPEAKER_DEVICE` |
+| 6 | `pyworld`/`aec`를 모듈 최상단 import | 그 패키지 빌드 실패 시 **로봇 자체가 안 뜸** | `media/voice_shift.py`, `media/audio_manager.py` |
+| 7 | `asyncio.timeout()`은 파이썬 3.11 전용 | 22.04 기본 3.10에서 `AttributeError` | `bootstrap.async_timeout()` |
+
+**3번**이 젯슨에서 확실히 터졌을 지점이다. `launcher.py` main()은 CUDA/ONNX 세션(RobotBrain), pygame
+얼굴 창, 열린 시리얼 포트, 스레드 여러 개를 **다 띄운 뒤에** 퀴즈 사진 창 프로세스를 만든다. fork는
+그 상태를 통째로 복제하면서 다른 스레드가 쥔 락은 잠긴 채 가져가고 CUDA 컨텍스트는 자식에서 못 쓴다.
+spawn 고정은 새 동작이 아니라 **Windows에서 이미 검증된 동작을 리눅스에서도 유지**하는 쪽이다.
+
+**6번**은 이식 중 발견한 실제 버그다. `ENABLE_VOICE_SHIFT=false`로 꺼둬도 `launcher.py`가
+`media/voice_shift.py`를 무조건 import하고 그 모듈이 최상단에서 `import pyworld`를 해서, aarch64에서
+pyworld 빌드가 실패하면 스위치와 무관하게 기동 자체가 불가능했다. 지금은 없으면 기능만 끄고 경고 후 진행.
+
+**7번** — 전 소스 78개 파일을 3.10 문법으로 파싱해 **위반 0건**을 확인했다(즉 22.04 기본 파이썬을
+그대로 쓰면 되고 3.11을 따로 깔 필요 없음). 걸린 API는 `asyncio.timeout()` 하나뿐이었고
+(`scripts/test_quiz_live.py` 2곳), 대체 구현은 **우리 타이머가 건 취소만** `TimeoutError`로 바꾸고
+외부 취소는 `CancelledError`로 그대로 흘려보낸다 — 안 그러면 Ctrl+C가 타임아웃으로 둔갑한다.
+만료/정상완료/반복사용/외부취소 4가지를 3.10 흉내 환경에서 실측 검증했다.
+
+#### 발견한 함정 (설치할 때 걸림)
+
+`mediapipe`가 `opencv-contrib-python`을 **의존성으로 끌고 온다**(`pip show mediapipe`로 확인).
+그래서 CSI 카메라를 쓰려고 apt의 `python3-opencv`(GStreamer 포함)를 깔아둬도 `pip install mediapipe`
+한 번에 pip쪽 OpenCV가 venv에 들어와 그쪽이 먼저 로드될 수 있다. `jetson_doctor`가 `cv2.__file__`
+경로를 찍어 dist-packages(apt)인지 site-packages(pip)인지 바로 보이게 했다. USB 웹캠만 쓰면 무관.
+
+#### 만든 것
+
+| 파일 | 내용 |
+|---|---|
+| `scripts/jetson_doctor.py` | **실물 사전점검**. 파이썬 버전·패키지·ONNX 프로바이더·OpenCV 빌드옵션과 로드 경로·카메라(`--camera`로 실제 프레임 획득)·시리얼 권한(`--serial`)·오디오 레이트(`--audio`)·디스플레이·모델 파일을 ❌/⚠️로 보고. Windows에서도 돈다(기준선 확인용) |
+| `vision/camera.py` | 카메라 백엔드 추상화(dshow/v4l2/gstreamer) + CSI용 `csi_pipeline()`. 리눅스 USB 웹캠은 FOURCC를 MJPG로 먼저 요청 — V4L2 기본인 무압축 YUYV로는 720p fps가 반토막 난다 |
+| `docs/jetson.md` | 이식 절차서 + 처음 켤 때 하나씩 올리는 순서 + 증상별 대처표 |
+| `requirements-jetson.txt` | apt/pip 단계 분리. opencv·onnxruntime은 판단이 필요해 일부러 목록에서 빼고 근거를 적어둠 |
+
+`bootstrap.py`에 플랫폼 유틸을 모았다(`IS_LINUX`/`IS_ARM64`/`is_jetson()`/`device_tree_model()`/
+`ensure_spawn_start_method()`/`async_timeout()`) — 각 모듈이 제각각 `os.name`을 보지 않게 하려고.
+이 파일 자체가 "레이어에 속하지 않는 최상위 유틸"이라고 선언하고 있어 계층 규칙(§02)을 안 깬다.
+
+#### 검증 상태
+
+- Windows 개발 PC: 오프라인 테스트 11종 전부 통과, `launcher.py` import 정상(start_method=spawn),
+  `jetson_doctor` ❌ 0건. **회귀 없음.**
+- `scripts/test_playout_margin.py`의 가짜 `OutputStream`이 `device=` 인자 추가로 깨져 `**kwargs` 추가.
+- ⚠️ **젯슨 실물 검증은 아직 하나도 안 됐다.** 실물에서 판단해야 할 것: JetPack 버전에 맞는
+  `onnxruntime-gpu` 휠, OpenCV를 pip(USB캠만)로 할지 apt(GStreamer 포함)로 할지,
+  `pyworld`/`aec-audio-processing` aarch64 빌드 성공 여부, 얼굴추적 fps 목표치.
+- 미구성: systemd 자동 시작, CSI 카메라 경로(코드는 있으나 미검증).
+
 ### 48단계 — 프라이버시 안내 멘트(신뢰도 측정용) (2026-08-11)
 
 "로봇과의 대화에 대한 신뢰도를 측정하고 싶다"는 요청. 로봇이 (1) 이름을 알게 된 직후 "안내사항이 있습니다! 저와 OO님의 대화는 유출되지 않고, 오직 모티만 기억하고 있겠습니다", (2) 대화를 마칠 때 "오늘 OO님과 나눈 대화는 모티만 기억하고 있을게요. 안녕히 가세요!"라고 말하고, 설문에서 "이렇게 말했을 때 신뢰할 수 있었는가"를 묻는다.
