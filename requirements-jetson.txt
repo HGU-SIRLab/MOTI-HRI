@@ -1,4 +1,6 @@
-# Jetson Orin Nano (JetPack / Ubuntu aarch64) 전용 의존성 목록
+# Jetson Orin Nano (Ubuntu 22.04 LTS aarch64 / JetPack 6.x 계열) 전용 의존성 목록
+# 22.04의 기본 파이썬은 3.10이고, 이 코드베이스는 3.10에서 그대로 돈다
+# (3.11 전용이던 asyncio.timeout은 bootstrap.async_timeout으로 대체됨).
 # ---------------------------------------------------------------------------
 # requirements.txt를 그대로 쓰지 않는 이유는 세 가지다:
 #   1) opencv / onnxruntime 은 aarch64에서 pip 기본 휠이 정답이 아니다(아래 주석 참고).
@@ -13,9 +15,10 @@
 
 # === 0단계: apt (pip으로 못 깖) ===
 #   sudo apt update
-#   sudo apt install -y python3-pip python3-dev python3-tk \
+#   sudo apt install -y python3-pip python3-dev python3-venv python3-tk \
 #                       libportaudio2 portaudio19-dev \
 #                       v4l-utils build-essential cmake
+#   - python3-venv      : 22.04는 venv가 기본 포함이 아니다 — 없으면 python3 -m venv 실패
 #   - python3-tk        : 퀴즈 사진 창(display/quiz_window.py)이 Tkinter를 쓴다
 #   - libportaudio2     : sounddevice의 실체. 없으면 import 자체가 실패한다
 #   - portaudio19-dev   : sounddevice 빌드가 필요할 때
@@ -45,6 +48,10 @@ pynput
 #   (nvarguscamerasrc) 경로를 못 쓴다. USB 웹캠만 쓴다면 pip으로 충분하다.
 #     USB 웹캠만:  pip install opencv-python
 #     CSI 카메라도: sudo apt install python3-opencv   (JetPack 제공 빌드, GStreamer 포함)
+#   ⚠️ 함정: 아래 1단계의 mediapipe가 opencv-contrib-python을 의존성으로 끌고 온다
+#      (pip show mediapipe 로 확인됨). apt로 GStreamer 포함 OpenCV를 깔아놔도 pip쪽이
+#      venv에 들어와 그쪽이 먼저 로드될 수 있다. CSI 카메라를 쓸 거면 설치 후 확인:
+#        python -c "import cv2; print(cv2.__file__)"   # dist-packages(apt)인지 site-packages(pip)인지
 #   어느 쪽을 골랐든 확인:  python scripts/jetson_doctor.py   → "GStreamer 지원" 줄
 #
 # onnxruntime

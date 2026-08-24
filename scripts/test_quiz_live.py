@@ -19,7 +19,7 @@ from queue import Queue
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, _REPO_ROOT)
 
-from bootstrap import ensure_utf8_console
+from bootstrap import async_timeout, ensure_utf8_console
 
 ensure_utf8_console()
 
@@ -157,7 +157,7 @@ async def run_scenario():
             deadline = time.monotonic() + seconds
             while time.monotonic() < deadline:
                 try:
-                    async with asyncio.timeout(max(0.1, deadline - time.monotonic())):
+                    async with async_timeout(max(0.1, deadline - time.monotonic())):
                         reply = await consume_one_turn()
                 except (asyncio.TimeoutError, TimeoutError):
                     return
@@ -180,7 +180,7 @@ async def run_scenario():
         delayed_reply = ""
         while time.monotonic() < deadline and not found_refusal:
             try:
-                async with asyncio.timeout(max(0.1, deadline - time.monotonic())):
+                async with async_timeout(max(0.1, deadline - time.monotonic())):
                     async for message in session.receive():
                         sc = message.server_content
                         if sc and sc.output_transcription and sc.output_transcription.text:

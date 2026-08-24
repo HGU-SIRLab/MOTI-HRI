@@ -58,6 +58,13 @@ def _section(name: str):
 def check_platform():
     _section("플랫폼")
     print(f"  python  : {sys.version.split()[0]}  ({sys.executable})")
+    # Ubuntu 22.04의 기본 파이썬은 3.10이다. 소스 전체를 3.10 문법으로 파싱해 위반 0건을
+    # 확인했고, 3.11 전용 API(asyncio.timeout)는 bootstrap.async_timeout으로 대체해 뒀다.
+    if sys.version_info < (3, 10):
+        _record("fail", f"파이썬 {sys.version_info.major}.{sys.version_info.minor} — 3.10 이상이 필요합니다",
+                "Ubuntu 22.04 기본 파이썬이 3.10이므로 그대로 쓰면 됩니다.")
+    else:
+        _record("ok", f"파이썬 {sys.version_info.major}.{sys.version_info.minor} (3.10 이상 요구 충족)")
     print(f"  플랫폼  : {sys.platform}   arch={'aarch64' if IS_ARM64 else 'x86_64/기타'}")
     model = device_tree_model()
     if model:
@@ -185,7 +192,20 @@ def check_opencv():
                 return "YES" in line.upper()
         return False
 
-    _record("ok", f"OpenCV {cv2.__version__}")
+    _record("ok", f"OpenCV {cv2.__version__}", f"실제 로드된 경로: {getattr(cv2, '__file__', '?')}")
+
+    # ⚠️ mediapipe는 opencv-contrib-python을 의존성으로 끌고 온다(pip show mediapipe로 확인).
+    # 그래서 CSI 카메라를 쓰려고 apt의 python3-opencv(GStreamer 포함)를 깔아놔도, pip이
+    # 설치한 opencv가 앞서 잡혀 GStreamer 없는 쪽이 로드되는 일이 생긴다. 위의 "실제 로드된
+    # 경로"가 dist-packages(apt)가 아니라 site-packages(pip)면 그 상황이다.
+    if IS_LINUX:
+        path = getattr(cv2, "__file__", "") or ""
+        if "dist-packages" in path:
+            _record("info", "apt(python3-opencv) 쪽 OpenCV가 로드되었습니다.")
+        elif "site-packages" in path:
+            _record("info", "pip 쪽 OpenCV가 로드되었습니다"
+                            " — CSI 카메라를 쓸 계획이면 아래 GStreamer 줄을 반드시 확인하세요.")
+
     gst = has("GStreamer")
     _record("ok" if gst else "warn", f"GStreamer 지원: {'YES' if gst else 'NO'}",
             "" if gst else

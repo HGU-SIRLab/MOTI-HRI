@@ -94,3 +94,56 @@ def env_flag(name: str, default: bool = False) -> bool:
     if raw is None:
         return default
     return raw.strip().lower() not in ("0", "false", "no", "off", "")
+
+
+# ---------------------------------------------------------------------------
+# 파이썬 버전 호환 (2026-08-24, Ubuntu 22.04 / Python 3.10 대응)
+#
+# 개발 PC는 Python 3.11이고 Ubuntu 22.04(JetPack 6 계열)의 기본 파이썬은 3.10이다.
+# 전 소스를 3.10 문법으로 파싱해 본 결과 위반은 0건이었고, 걸리는 건 API 하나뿐이다:
+# `asyncio.timeout()`은 3.11에 추가됐다(scripts/test_quiz_live.py에서 사용).
+# 젯슨에서 그 테스트를 돌리면 AttributeError로 죽으므로 대체 구현을 둔다.
+# ---------------------------------------------------------------------------
+class _Timeout310:
+    """3.10용 `asyncio.timeout()` 대체. 타이머가 만료되면 현재 태스크를 취소하고,
+    그 취소를 TimeoutError로 바꿔서 내보낸다.
+
+    한계: 3.11 본판이 하는 취소 부기(uncancel) 처리는 없다. 중첩해서 쓰거나 바깥에서
+    들어온 취소와 정교하게 구분해야 하는 상황에는 부족하다 — 지금 쓰이는 곳은
+    테스트 스크립트의 단순한 대기 루프뿐이라 이 정도면 충분하다."""
+
+    def __init__(self, delay: float):
+        self._delay = delay
+        self._handle = None
+        self._task = None
+        self._expired = False
+
+    async def __aenter__(self):
+        import asyncio
+        self._task = asyncio.current_task()
+        self._handle = asyncio.get_running_loop().call_later(self._delay, self._on_timeout)
+        return self
+
+    def _on_timeout(self):
+        self._expired = True
+        if self._task is not None:
+            self._task.cancel()
+
+    async def __aexit__(self, exc_type, exc, tb):
+        import asyncio
+        if self._handle is not None:
+            self._handle.cancel()
+        # 우리 타이머가 건 취소일 때만 TimeoutError로 바꾼다. 바깥에서 들어온 취소는
+        # 그대로 통과시켜야 Ctrl+C나 상위 태스크 종료가 정상 동작한다.
+        if self._expired and exc_type is asyncio.CancelledError:
+            raise TimeoutError from None
+        return False
+
+
+def async_timeout(delay: float):
+    """`async with async_timeout(3): ...` — asyncio.timeout(3)과 같은 뜻이되
+    Python 3.10에서도 동작한다. 3.11 이상에서는 표준 구현을 그대로 쓴다."""
+    import asyncio
+    if hasattr(asyncio, "timeout"):
+        return asyncio.timeout(delay)
+    return _Timeout310(delay)

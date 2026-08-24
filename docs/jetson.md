@@ -1,6 +1,15 @@
 # Jetson Orin Nano 이식 (jetson-moti 브랜치)
 
 대상 하드웨어: **Jetson Orin Nano Super Developer Kit 8GB + NVMe SSD 256GB**
+대상 OS: **Ubuntu 22.04 LTS (aarch64)** — Orin 계열에서 22.04는 JetPack 6.x(Jetson Linux 36.x) 계열이다.
+정확한 버전은 실물에서 확인할 것(onnxruntime-gpu 휠을 고를 때 이 값이 기준이 된다):
+
+```bash
+lsb_release -a                 # Ubuntu 22.04.x 인지
+cat /etc/nv_tegra_release      # L4T(Jetson Linux) 버전
+apt show nvidia-jetpack 2>/dev/null | head -3
+```
+
 목표: 지금까지 Windows에서 돌던 모티 기능 전부(얼굴추적·인식 → Live API 대화 → 표정 UI →
 제스처 → 퀴즈 3라운드 → 결과지 저장)를 젯슨에서 그대로 재현.
 
@@ -11,7 +20,7 @@
 
 ## 0. 이 브랜치가 Windows 브랜치와 다른 점
 
-`main`은 Windows에서만 돌아가는 전제로 쓰여 있었다. 갈리는 지점이 여섯 군데 있었고,
+`main`은 Windows에서만 돌아가는 전제로 쓰여 있었다. 갈리는 지점이 일곱 군데 있었고,
 전부 **Windows 동작을 바꾸지 않는 방식**(플랫폼 분기 + `.env` 스위치)으로 고쳤다.
 즉 이 브랜치는 개발 PC에서도 예전과 똑같이 돌아간다.
 
@@ -23,6 +32,13 @@
 | 4 | ONNX 프로바이더를 검증 없이 요청 | 얼굴인식이 **조용히** CPU로 떨어짐 | `vision/vision_brain.py` |
 | 5 | 오디오가 시스템 기본 장치 고정 | ALSA가 HDMI를 잡아 소리가 안 남 | `media/audio_manager.py` (`MIC_DEVICE`/`SPEAKER_DEVICE`) |
 | 6 | `pyworld`/`aec` 를 최상단 import | 그 패키지 빌드가 실패하면 **로봇 자체가 안 뜸** | `media/voice_shift.py`, `media/audio_manager.py` |
+| 7 | `asyncio.timeout()` 은 파이썬 3.11 전용 | Ubuntu 22.04 기본 파이썬 3.10에서 `AttributeError` | `bootstrap.async_timeout()`, `scripts/test_quiz_live.py` |
+
+**파이썬 버전(7번)**: 개발 PC는 3.11인데 Ubuntu 22.04의 기본 파이썬은 **3.10**이다. 전 소스를
+3.10 문법으로 파싱해 확인한 결과 **문법 위반은 0건**이었고, 걸리는 건 API 하나뿐이었다 —
+`asyncio.timeout()`(3.11 추가, `scripts/test_quiz_live.py`에서 사용). 3.10에서도 도는 대체
+구현을 `bootstrap.async_timeout()`에 두고 호출부를 바꿨다. **즉 22.04 기본 파이썬을 그대로
+쓰면 되고, 3.11을 따로 깔 필요가 없다.**
 
 6번이 특히 중요하다. 두 패키지는 aarch64 미리 빌드 휠이 없을 수 있는데, 예전 구조에서는
 `ENABLE_VOICE_SHIFT=false`로 꺼둬도 `launcher.py`의 import 단계에서 죽었다. 지금은 없으면
@@ -47,9 +63,13 @@
 ## 2. OS / 시스템 준비
 
 ```bash
-# 전원 모드를 최대로 — 기본 저전력 모드면 대화 응답 지연이 눈에 띄게 늘어난다
-sudo nvpmodel -m 0
-sudo jetson_clocks
+# 전원 모드를 최대로 — 기본 저전력 모드면 대화 응답 지연이 눈에 띄게 늘어난다.
+# 모드 번호는 보드/JetPack 버전마다 다르다(Orin Nano Super는 MAXN SUPER 모드가 따로 있다).
+# 번호를 외워 넣지 말고 먼저 열거해서 최대 성능 모드를 고를 것.
+sudo nvpmodel -p --verbose     # 이 보드가 지원하는 모드 목록
+nvpmodel -q                    # 지금 걸린 모드
+sudo nvpmodel -m <최대성능_모드번호>
+sudo jetson_clocks             # 재부팅하면 풀린다
 
 # 시리얼 포트 권한. 재로그인해야 반영된다
 sudo usermod -aG dialout $USER
@@ -70,11 +90,12 @@ Tkinter 창 + Live API 스트림이 동시에 뜬다. 스왑이 없으면 모델
 `requirements-jetson.txt` 의 주석이 단계별 명령을 그대로 담고 있다. 요약하면:
 
 ```bash
-sudo apt install -y python3-pip python3-dev python3-tk \
+sudo apt install -y python3-pip python3-dev python3-venv python3-tk \
                     libportaudio2 portaudio19-dev v4l-utils build-essential cmake
 
 python3 -m venv ~/moti-venv --system-site-packages   # apt로 깐 opencv를 쓰려면 이 옵션 필요
 source ~/moti-venv/bin/activate
+python -V                                            # 3.10.x 면 정상
 pip install -r requirements-jetson.txt
 ```
 
@@ -82,6 +103,16 @@ pip install -r requirements-jetson.txt
 
 - **OpenCV** — USB 웹캠만 쓸 거면 `pip install opencv-python`으로 충분하다. CSI 카메라를
   쓰려면 GStreamer 지원이 필요하고, 그건 `sudo apt install python3-opencv` 쪽이다.
+
+  ⚠️ **함정**: `mediapipe`는 `opencv-contrib-python`을 **의존성으로 끌고 온다**
+  (`pip show mediapipe`로 확인됨). 그래서 apt로 GStreamer 포함 OpenCV를 깔아놔도
+  `pip install mediapipe` 한 방에 pip쪽 OpenCV가 venv에 들어와 그쪽이 먼저 로드된다.
+  CSI 카메라를 쓸 계획이라면 설치 후 반드시 확인할 것:
+  ```bash
+  python -c "import cv2; print(cv2.__file__)"   # dist-packages(apt)인지 site-packages(pip)인지
+  ```
+  `jetson_doctor.py`가 이 경로와 GStreamer 지원 여부를 같이 찍어준다.
+  USB 웹캠만 쓸 거라면 이 충돌은 신경 쓸 필요 없다.
 - **onnxruntime** — `pip install onnxruntime`은 **CPU 전용**이다. GPU 가속을 쓰려면
   설치된 JetPack 버전에 맞는 `onnxruntime-gpu` 휠을 받아야 한다. 먼저
   `cat /etc/nv_tegra_release`로 L4T 버전을 확인하고 그에 맞는 휠을 설치할 것.
@@ -158,7 +189,7 @@ python launcher.py
 | 말이 중간에 끊긴다 | 세션 종료 로그의 "스피커 언더런" 수치를 보고 `PLAYOUT_PRIME_MS`를 올린다(`.env.example` 주석 참고). **`VOICE_SHIFT_BUFFER_MS`는 올리지 말 것** — 2026-08-10에 효과 없음이 실측으로 확정됨 |
 | 퀴즈 사진 창이 안 뜬다 | `python3-tk` 설치 여부, `DISPLAY` 설정, 그리고 콘솔에 "퀴즈 사진 창 프로세스가 죽었습니다" 경고가 떴는지 |
 | 모터를 못 연다 | `dialout` 그룹 + **재로그인**. `ls -l /dev/ttyUSB0`로 권한 확인 |
-| 대화 응답이 전반적으로 굼뜨다 | `sudo nvpmodel -m 0 && sudo jetson_clocks` (재부팅하면 풀린다) |
+| 대화 응답이 전반적으로 굼뜨다 | `nvpmodel -q`로 전원 모드 확인 → 최대 성능 모드 + `sudo jetson_clocks` (재부팅하면 풀린다) |
 
 ---
 
