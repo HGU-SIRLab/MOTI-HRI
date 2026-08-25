@@ -12,6 +12,7 @@
 
 Windows에서 돌려도 동작한다(Jetson 전용 항목은 건너뜀) — 옮기기 전 기준선 확인용.
 """
+from __future__ import annotations
 import argparse
 import os
 import shutil

@@ -14,6 +14,7 @@ assets/quiz/questions.json에 추가한다.
        확대 사진을 그대로 재사용한다.
     3. python scripts/build_quiz_bank.py
 """
+from __future__ import annotations
 import json
 import os
 import sys

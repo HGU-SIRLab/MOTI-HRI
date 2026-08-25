@@ -15,6 +15,7 @@ F0 추출은 `pw.dio`(빠름, ~47ms/500ms청크)가 아니라 `pw.harvest`(느�
 정규화 없이 그대로 재생하면 파열음 근처에서 하드 클리핑이 난다 — 반드시 피크를 0.98
 이하로 스케일해야 한다.
 """
+from __future__ import annotations
 import os
 import queue
 import threading

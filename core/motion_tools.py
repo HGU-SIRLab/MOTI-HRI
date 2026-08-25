@@ -14,6 +14,7 @@ test_motions.py는 메뉴 입력이 사람 페이스라 문제가 드러날 수 
 위치를 써서 예측 불가능한 움직임이 나올 수 있다. play_gesture와 express_gesture가 같은
 `busy` 가드를 공유해서, Layer 1/Layer 2 동작끼리도 서로 끼어들지 못하게 막는다.
 """
+from __future__ import annotations
 import threading
 import time
 

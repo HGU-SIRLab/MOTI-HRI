@@ -20,6 +20,7 @@
     user_result/에 대화록+결과지가 남고, 퀴즈를 진행했다면 core/quiz_export.py가
     같은 폴더 아래 참가자+시각 단위 하위 폴더에 모드(1/2/3)별 결과 파일도 남긴다.
 """
+from __future__ import annotations
 import asyncio
 import multiprocessing
 import os

@@ -1,3 +1,4 @@
+from __future__ import annotations
 # core/utils.py
 import os
 from datetime import datetime, timedelta

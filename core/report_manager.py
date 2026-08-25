@@ -18,6 +18,7 @@ JSON과 반드시 같은 폴더에 들어가게 하기 위함. 동시에 **이�
 user_name이 없으면 그대로 return해서, 참가자가 끝내 이름을 말하지 않으면 그 사람 대화록이
 통째로 사라졌다(N=30 실험에서는 그대로 데이터 손실).
 """
+from __future__ import annotations
 import os
 from datetime import datetime
 

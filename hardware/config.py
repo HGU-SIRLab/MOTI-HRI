@@ -1,3 +1,4 @@
+from __future__ import annotations
 import os
 
 from bootstrap import IS_LINUX, ensure_utf8_console

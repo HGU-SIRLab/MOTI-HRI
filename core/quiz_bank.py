@@ -4,6 +4,7 @@ docs 참고: `소셜 로봇 의도적 비완전성 실험 설계.docx`의 "부�
 모든 참가자에게 같은 문제/같은 순서를 보여줘야 하므로(조건 간 비교 오염 방지),
 `load_question_bank()`는 JSON 파일에 적힌 순서를 그대로 유지한다 — 셔플하지 않음.
 """
+from __future__ import annotations
 import difflib
 import json
 import os
