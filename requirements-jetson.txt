@@ -54,6 +54,15 @@ pynput
 #        python -c "import cv2; print(cv2.__file__)"   # dist-packages(apt)인지 site-packages(pip)인지
 #   어느 쪽을 골랐든 확인:  python scripts/jetson_doctor.py   → "GStreamer 지원" 줄
 #
+#   ⚠️ 함정 2 (2026-08-26 검증): mediapipe가 opencv-contrib-python을 끌고 오므로
+#      USB 웹캠 경로라도 opencv-python을 따로 먼저 깔아두면 같은 cv2/ 경로에 두 패키지가
+#      겹쳐 설치돼 파일이 깨진다(cv2.__version__ 사라짐 등). 반드시 opencv-python은 지우고
+#      opencv-contrib-python만 남길 것(--force-reinstall로 정리):
+#        pip uninstall -y opencv-python opencv-contrib-python
+#        pip install --force-reinstall --no-cache-dir opencv-contrib-python
+#      pip이 "insightface requires opencv-python" 경고를 내지만 무시해도 된다 —
+#      opencv-contrib-python도 동일한 cv2 모듈을 제공하는 상위호환 패키지라 실제로는 충족됨.
+#
 # onnxruntime
 #   pip install onnxruntime 은 **CPU 전용**이다. 그걸 깔면 얼굴인식이 GPU를 전혀 못 쓴다
 #   (조용히 느려지기만 해서 알아채기 어렵다 — 그래서 vision/vision_brain.py가 실제
@@ -65,6 +74,23 @@ pynput
 #     python -c "import onnxruntime; print(onnxruntime.get_available_providers())"
 #   → CUDAExecutionProvider 가 보여야 성공. 안 보이면 CPU로 도는 것이고,
 #     그 경우 .env에 FACE_DET_SIZE=320 을 넣어 검출 해상도를 낮춰 버틸 수 있다.
+#
+#   ⚠️ 함정 2 (2026-08-26 Xavier NX 실물 확인): pip 최신 onnxruntime(1.23.2)은 import
+#      시점에 core dump로 죽는다 — cpuinfo가 NVIDIA Carmel 코어를 "Unknown CPU vendor"로
+#      못 알아보고 벡터 인덱스 assertion에 걸림. 1.19.2~1.20.1은 import는 되지만, 실제로
+#      InferenceSession을 만드는 순간(=insightface가 얼굴인식 모델을 로드하는 순간) 같은
+#      assertion으로 죽는다 — 그것도 **nvpmodel이 6코어 중 일부를 꺼둔 전원 모드일 때만**
+#      (기본값 MODE_10W_DESKTOP이 그렇다. sess_options.intra_op_num_threads를 명시해도
+#      안 고쳐짐 — 스레드 개수 문제가 아니라 ORT 내부 코어 topology 탐지 버그로 보임).
+#      "그럼 6코어 모드로 바꾸면?"이라고 생각하기 쉽지만, 이 보드는 6코어 모드일수록
+#      코어당 최대 클럭이 1.9GHz -> 1.42GHz로 낮아져서 media/voice_shift.py의 실시간
+#      오디오 처리가 오히려 못 버틴다(scripts/test_playout_margin.py로 확인). 즉 "onnxruntime
+#      버전만 바꾸면 전원 모드에 안 얽매여도 되는" 쪽이 정답이었다 — **1.18.1로 검증됨**
+#      (4코어 MODE_10W_DESKTOP에서도 크래시 없이 정상 동작, CPUExecutionProvider).
+#      1.18.1은 NumPy를 1.26.4로 끌어내리지만(1.x 전용 빌드) opencv-contrib-python/
+#      mediapipe는 여전히 정상 임포트됨(pip이 버전 경고를 내도 무시 가능, 실측 확인됨).
+#      pip으로 그냥 최신을 깔지 말고 반드시:
+#        pip install onnxruntime==1.18.1
 #
 # === 3단계: 있으면 좋지만 없어도 로봇은 도는 것들 ===
 #   둘 다 aarch64 미리 빌드 휠이 없을 수 있다. 설치가 실패하면 그냥 넘어가도 된다 —

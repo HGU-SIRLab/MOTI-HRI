@@ -88,9 +88,17 @@ def check_platform():
         out = _run(["nvpmodel", "-q"])
         if out:
             _record("ok", "전원 모드(nvpmodel)", out)
-            if "MAXN" not in out.upper():
-                _record("warn", "최대 성능 모드가 아닙니다",
-                        "실험/시연 전에는 `sudo nvpmodel -m 0 && sudo jetson_clocks` 를 권장합니다.")
+            # Xavier NX는 MAXN(=6코어 모드)이 무조건 좋지 않다 — 2026-08-26 실물 확인:
+            # 6코어 모드는 코어당 최대 클럭이 1.9GHz -> 1.42GHz로 낮아져 media/voice_shift.py의
+            # 실시간 오디오 처리가 오히려 못 버틴다(docs/jetson.md 8번 항목 참고). 기본값
+            # MODE_10W_DESKTOP(4코어, 1.9GHz)이 이 저장소 기준 검증된 값이니 그냥 두는 게
+            # 맞다 — 여기서는 정보만 보여주고 모드를 바꾸라고 권하지 않는다.
+            if "10W_DESKTOP" not in out.upper():
+                _record("info", "기본값(MODE_10W_DESKTOP)이 아닙니다",
+                        "이 저장소는 4코어 @ 1.9GHz(MODE_10W_DESKTOP)에서 오디오 실시간\n"
+                        "처리가 검증됐습니다. 6코어 모드는 코어당 클럭이 낮아져 오히려\n"
+                        "끊김이 심해질 수 있으니(docs/jetson.md 8번), 성능이 아쉬워도\n"
+                        "바로 MAXN으로 바꾸지 말고 docs/jetson.md를 먼저 확인하세요.")
         else:
             _record("info", "nvpmodel 명령을 찾지 못했습니다.")
 
