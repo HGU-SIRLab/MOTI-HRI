@@ -10,7 +10,6 @@ name_state["name"]에 따라 분기하는 것과 같은 패턴을 그대로 확�
 이 모듈은 순수 로직만 다룬다 — asyncio/하드웨어/UI 큐를 몰라야 core/quiz_tools.py 없이도
 독립적으로 유닛 테스트할 수 있다.
 """
-from __future__ import annotations
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone

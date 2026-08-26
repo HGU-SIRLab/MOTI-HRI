@@ -3,7 +3,6 @@
 docs/architecture.md §04 — 고정 슬롯(STAGES) 대신 자유 key-value facts를
 누적한다. 같은 field로 다시 부르면 정정(덮어쓰기)으로 취급한다.
 """
-from __future__ import annotations
 import json
 import os
 import shutil

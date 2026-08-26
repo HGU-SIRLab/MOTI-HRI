@@ -13,7 +13,6 @@ core/quiz_state.py는 순수 로직이라 asyncio/모션을 모른다. request_h
 Live 세션의 tool_call 처리가 동기적이라 즉시 반환해야 하므로, 실제 지연은
 asyncio 태스크로 예약하고 그 태스크가 나중에 `inject_turn()`으로 새 히든 턴을 보낸다.
 """
-from __future__ import annotations
 import asyncio
 import os
 import random

@@ -20,7 +20,6 @@
   - 논문 데이터가 실명 없이 익명화된다.
   - 동명이인이 섞이지 않는다.
 """
-from __future__ import annotations
 import json
 import os
 from datetime import datetime

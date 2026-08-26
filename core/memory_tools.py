@@ -14,7 +14,6 @@ remember_fact(field="name", value=...)를 호출하는 순간 그 값을 이름�
 방식을 택했다. 이름이 확정되기 전에 다른 field로 먼저 부르면 이름부터 알려달라고
 안내만 하고 아무것도 저장하지 않는다.
 """
-from __future__ import annotations
 from . import profile_manager as profiles
 
 

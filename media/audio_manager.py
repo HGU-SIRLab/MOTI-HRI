@@ -5,7 +5,6 @@ AEC 연결 시점 — docs/integration-points.md에 "AEC 연결할 때 media/로
 같이 고려"라고 미리 적어뒀던 계획). AEC는 `aec-audio-processing`(WebRTC AEC3 파이썬
 바인딩)을 쓴다 — 합성 신호로 30~36dB 에코 감쇠 확인됨(docs/progress.md 6단계 참고).
 """
-from __future__ import annotations
 import asyncio
 import os
 import threading
