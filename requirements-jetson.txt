@@ -28,7 +28,12 @@
 # === 1단계: 그냥 pip으로 되는 것들 ===
 google-genai
 google-generativeai
-mediapipe
+# ⚠️ mediapipe 1.0.x(XNNPACK 최신 빌드)는 dotprod(asimddp) CPU 확장을 무조건 요구해서
+# Xavier NX의 Carmel 코어에서 FaceLandmarker 생성 즉시 SIGILL로 죽는다(Python에서 못 잡음,
+# 2026-08-26 실물 확인 — /proc/cpuinfo Features에 asimddp 없음). Orin Nano(Cortex-A78AE)는
+# dotprod 지원 코어라 이 문제가 없을 가능성이 높지만, 실물 도착 시 가정하지 말고 먼저 확인할 것.
+# 재현되면 0.10.18로 고정(0.10.9 이하는 protobuf를 3.x까지 끌어내려 google-genai와 충돌한다).
+mediapipe==0.10.18
 insightface
 dynamixel-sdk
 pyserial
