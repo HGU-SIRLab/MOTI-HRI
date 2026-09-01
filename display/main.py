@@ -43,7 +43,9 @@ class RobotFaceApp:
         self.scaled_width = int(self.original_width * self.scale_factor)
         self.scaled_height = int(self.original_height * self.scale_factor)
         
-        self.screen = pygame.display.set_mode((self.scaled_width, self.scaled_height), pygame.NOFRAME, display=monitor_index)
+        # FULLSCREEN도 같이 줘야 창 매니저가 "전체화면 앱"으로 인식해서 GNOME 상단바/독처럼
+        # NOFRAME과 무관하게 항상 위에 떠있는 데스크톱 패널까지 같이 가려준다.
+        self.screen = pygame.display.set_mode((self.scaled_width, self.scaled_height), pygame.NOFRAME | pygame.FULLSCREEN, display=monitor_index)
         self.base_surface = pygame.Surface((self.original_width, self.original_height))
 
         pygame.display.set_caption("Moti Face (경량화 버전)")

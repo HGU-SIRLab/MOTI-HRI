@@ -50,6 +50,12 @@ def _place_fullscreen(root) -> tuple[int, int]:
 
 
 def quiz_window_process(quiz_q: "multiprocessing.Queue"):
+    # 얼굴 UI(display/main.py)는 로봇에 물린 물리 화면에 남겨두고, 퀴즈 창만 다른
+    # X 서버(예: 참가자 노트북으로 온 ssh -X 포워딩 디스플레이)로 보내고 싶을 때 쓴다.
+    # spawn 자식은 부모 os.environ을 그대로 물려받으므로 Tk() 생성 전에 덮어써야 먹힌다.
+    quiz_display = os.getenv("QUIZ_WINDOW_DISPLAY")
+    if quiz_display:
+        os.environ["DISPLAY"] = quiz_display
     try:
         root = tk.Tk()
         root.title("Moti Quiz")
