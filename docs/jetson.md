@@ -161,6 +161,11 @@ export DISPLAY=:0        # SSH로 접속했다면 반드시 (안 하면 표정 �
 python launcher.py
 ```
 
+> ⚠️ **보드마다 다르다.** Orin Nano Super 실물(JetPack 6.2.3)에서는 GDM이 사용자 X
+> 세션을 `:0`이 아니라 **`:1`** 에 띄웠다. `DISPLAY=:0`으로는 `xcb_connection_has_error`
+> 만 난다. `ls /tmp/.X11-unix/` 로 실제 디스플레이 번호를 확인하고, SSH 세션이면
+> `XAUTHORITY` 도 같이 줘야 한다. 상세는 아래 **§9**.
+
 ---
 
 ## 6. 실물에서 처음 켤 때 확인할 순서
@@ -203,3 +208,81 @@ python launcher.py
   `DISPLAY`가 필요한 GUI 프로세스라 사용자 세션에 붙여야 한다. 실행이 안정된 뒤에 할 일.
 - **CSI 카메라 경로 미검증.** 코드 경로는 만들어 뒀지만(`vision/camera.py`의
   `csi_pipeline()`) USB 웹캠을 계속 쓸 거면 손댈 필요 없다.
+
+---
+
+## 9. Orin Nano Super 실물 이식 메모 (2026-09-01)
+
+Jetson Orin Nano Super Developer Kit 실물에 이식하면서 실측한 것. 위 절차의 보완/정정.
+보드/OS: **JetPack 6.2.3 (L4T R36.5.2) / Ubuntu 22.04.5 / Python 3.10.12 / MAXN_SUPER / NVMe 부팅.**
+`jetson-moti` 브랜치 전제와 일치 → 재플래싱 불필요. (JetPack 7/Ubuntu 24.04면 6.2.x로 다시 깔 것.)
+
+### 파이썬 의존성 — 핀 없이 설치하면 세 군데서 깨진다
+
+`requirements-jetson.txt` 상단 주석의 "실측 검증된 버전" 블록 참고. 요약:
+- `numpy==1.26.4` (pip 기본 2.x → `--system-site-packages` matplotlib과 ABI 충돌로 mediapipe import 크래시. dotprod SIGILL 아님 — Orin A78AE엔 `asimddp` 있음).
+- `opencv-contrib-python==4.11.0.86` 단독 (opencv-python과 동시설치 시 cv2 깨짐).
+- `onnx==1.17.0` (1.22는 ml_dtypes>=0.5.4 → numpy>=2 악순환).
+- `onnxruntime-gpu==1.23.0` from `https://pypi.jetson-ai-lab.io/jp6/cu126` (CPU판 먼저 제거).
+  검증: `get_available_providers()`에 `CUDAExecutionProvider`. recognize_face 중앙 75ms @640.
+- `pyworld==0.3.5` 소스빌드 OK (cython+build-essential 있으면).
+
+### 디스플레이 — 로봇 화면은 `:0`이 아니라 `:1` (이 보드 기준)
+
+GDM이 사용자 X 세션을 `:1`에 띄운다(`/tmp/.X11-unix/`에 `X1`만). 연결 패널은 **DP-1, 800×480 native**.
+SSH 세션에서 얼굴 UI를 로봇 화면에 띄우려면:
+```bash
+export DISPLAY=:1 XAUTHORITY=/run/user/1000/gdm/Xauthority
+```
+얼굴 UI(`:1`)와 퀴즈 창(참가자 노트북, `ssh -X` 포워딩 디스플레이)을 **동시에** 쓰려면 두
+디스플레이 쿠키를 한 파일에 합쳐야 한다(안 하면 퀴즈 자식이 `couldn't connect to display`):
+```bash
+XAUTHORITY=/run/user/1000/gdm/Xauthority xauth nextract - :1 | xauth nmerge -   # :1 쿠키를 ~/.Xauthority에
+# 이후 launcher 실행: DISPLAY=:1  XAUTHORITY=$HOME/.Xauthority
+# .env: QUIZ_WINDOW_DISPLAY=localhost:10.0  (참가자 노트북 ssh -X 디스플레이)
+```
+`display/main.py`는 `pygame.NOFRAME | pygame.FULLSCREEN` (커밋 09c496f) — NOFRAME만으론
+GNOME 상단바/독이 얼굴 위에 남는다.
+
+### 오디오 — USB 스피커가 48kHz 전용이라 PulseAudio 경유 필수
+
+- 스피커 = USB "UACDemoV1.0" (48kHz 전용), 마이크 = C922 웹캠 내장 (32kHz).
+- 코드는 스피커를 Gemini 출력 그대로 24kHz로 여는데 raw ALSA `hw:`로는 `paInvalidSampleRate`.
+  → **PulseAudio 경유**로 리샘플. `libasound2-plugins` + `/usr/share/alsa/alsa.conf.d/pulse.conf`
+  덕에 ALSA `default` PCM이 PulseAudio로 라우팅됨. sounddevice 목록엔 `pulse`가 안 뜨고
+  `default`만 뜬다 → **`.env`: `MIC_DEVICE=default` / `SPEAKER_DEVICE=default`**.
+- `pactl` CLI는 `PULSE_SERVER=unix:/run/user/1000/pulse/native` 를 줘야 붙는다(앱이 쓰는
+  ALSA pulse 플러그인은 이 env 없이도 붙음).
+
+### AEC — `aec-audio-processing` 없음, PulseAudio module-echo-cancel 로 (`.env` ENABLE_AEC=false)
+
+`~/.config/pulse/default.pa` (Xavier에서 확정, `extended_filter=1` 단독):
+```
+.include /etc/pulse/default.pa
+set-default-source alsa_input.usb-046d_C922_Pro_Stream_Webcam_<SERIAL>-02.analog-stereo
+set-default-sink   alsa_output.usb-Jieli_Technology_UACDemoV1.0_<SERIAL>-00.analog-stereo
+load-module module-echo-cancel aec_method=webrtc aec_args="extended_filter=1" source_name=echocancel_source sink_name=echocancel_sink
+set-default-source echocancel_source
+set-default-sink   echocancel_sink
+```
+`systemctl --user restart pulseaudio.service` 로 적용/검증. (장치명 시리얼은 `pactl list short sinks/sources`.)
+
+### 시리얼 (U2D2) 권한 — udev 규칙
+
+`usermod -aG dialout` 후에도 재로그인 전 셸은 반영 안 됨. 영구:
+`/etc/udev/rules.d/99-moti-u2d2.rules`:
+```
+SUBSYSTEM=="tty", ATTRS{idVendor}=="0403", ATTRS{idProduct}=="6014", OWNER="jetson-moti", MODE="0660"
+```
+`sudo udevadm control --reload-rules && sudo udevadm trigger`.
+
+### launcher.py 실행 (검증됨 2026-09-01)
+
+```bash
+cd ~/moti
+export DISPLAY=:1 XAUTHORITY=$HOME/.Xauthority PULSE_SERVER=unix:/run/user/1000/pulse/native
+~/moti-venv/bin/python -u launcher.py
+```
+확인됨: 모터 홈, insightface CUDA, mediapipe 트래킹 로딩, Live API 대화, 얼굴 재인식,
+프라이버시 안내, 제스처, 퀴즈 창 기동(xauth 합친 뒤), `[대화종료]` → 대화록/메타 저장.
+**아직 안 본 것**: 퀴즈 3모드 실제 진행, barge-in, 완전 재부팅 후 자동복구, 장시간 keepalive.

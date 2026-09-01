@@ -79,3 +79,44 @@ pynput
 #   실패하면 .env에 ENABLE_AEC=false (스피커 볼륨을 낮추고 마이크를 떼어놓아 보완)
 #
 # websockets 는 google-genai 가 의존성으로 끌어온다(Live API가 WebSocket 기반).
+
+# ===========================================================================
+# 실측 검증된 버전 (2026-09-01, Jetson Orin Nano Super Developer Kit)
+#   보드/OS: JetPack 6.2.3 (L4T R36.5.2) / Ubuntu 22.04.5 / Python 3.10.12
+#   CUDA 12.6.68 / cuDNN 9.3.0.75 / TensorRT 10.3
+#   venv: python3 -m venv ~/moti-venv --system-site-packages
+#
+# 위 1단계를 그냥 `pip install` 하면 pip이 최신을 잡아서 세 군데서 깨진다.
+# 아래 순서/핀으로 설치해야 launcher.py 까지 실제로 돈다:
+#
+#   pip install cython numpy==1.26.4
+#   pip install -r requirements-jetson.txt        # (1단계 목록)
+#   pip uninstall -y opencv-python opencv-contrib-python
+#   pip install "numpy<2" "opencv-contrib-python==4.11.0.86" "onnx==1.17.0"
+#   pip install "ml-dtypes<0.5"
+#   # onnxruntime-gpu (아래 참고) + pyworld
+#
+#   numpy==1.26.4          ← pip 기본은 numpy 2.x. --system-site-packages로 딸려온
+#                            시스템 matplotlib(numpy 1.x 빌드)를 mediapipe가 import하다
+#                            `_ARRAY_API not found` 로 크래시. (dotprod SIGILL 아님 —
+#                            Orin A78AE엔 asimddp 있어서 mediapipe 1.0.1 그대로 OK.)
+#   opencv-contrib-python==4.11.0.86  ← opencv-python 과 동시설치되면 cv2/ 파일 충돌.
+#                            둘 다 제거 후 contrib 단독(mediapipe가 요구, USB 웹캠엔 충분).
+#                            `pip check`가 "insightface requires opencv-python" 경고를
+#                            내지만 같은 cv2라 무해.
+#   onnx==1.17.0           ← insightface가 끌어오는 onnx 1.22는 ml_dtypes>=0.5.4 요구 →
+#                            그건 numpy>=2 요구 → numpy<2와 악순환. 1.17.0으로 내리면 해결.
+#   mediapipe==1.0.1, insightface==1.0.1, protobuf==5.29.6, scipy==1.15.3,
+#   pyworld==0.3.5 (소스빌드 성공), sounddevice==0.5.6, pygame==2.6.1
+#
+# onnxruntime-gpu (JetPack 6.2.x / CUDA 12.6 / cp310):
+#   pip uninstall -y onnxruntime      # CPU판 먼저 제거 (같은 패키지 디렉터리 충돌)
+#   pip install "onnxruntime-gpu==1.23.0" \
+#       --extra-index-url https://pypi.jetson-ai-lab.io/jp6/cu126
+#   확인: python -c "import onnxruntime;print(onnxruntime.get_available_providers())"
+#     → ['TensorrtExecutionProvider','CUDAExecutionProvider','CPUExecutionProvider']
+#   실측(@FACE_DET_SIZE=640): recognize_face 중앙 75ms, 검출 100%. CPU판은 229ms/@320.
+#   jp6/cu126 인덱스엔 1.23.0 / 1.24.0 (cp310) 만 있음.
+#
+# aec-audio-processing: Linux 휠이 아예 없음(재확인). .env ENABLE_AEC=false 로 두고
+#   PulseAudio module-echo-cancel 로 우회 — 절차는 docs/jetson.md §9.
