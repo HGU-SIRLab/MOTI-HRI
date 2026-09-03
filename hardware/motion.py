@@ -71,6 +71,53 @@ def perform_head_nod(port: PortHandler, pkt: PacketHandler, lock: threading.Lock
         print("✅ 고개 끄덕이기 완료! (Face Tracking 재개)")
 
 
+SPIN_SETTLE_SEC = 0.4  # 회전 정지 후 관성으로 미끄러지는 시간을 흡수
+
+
+def perform_spin(port: PortHandler, pkt: PacketHandler, lock: threading.Lock, shared_state: dict,
+                  turns: float = 1.0, home_pan: int | None = None, home_tilt: int | None = None):
+    """바퀴만으로 제자리에서 turns바퀴 회전한다(무선화 시연용).
+
+    perform_head_nod와 같은 관례로 실행 중 얼굴추적을 멈춘다 — shared_state['mode']가
+    'tracking'이 아니면 vision/face.py가 PID 추적을 건너뛰고, 끝나고 'tracking'으로
+    되돌리면 그쪽이 현재 모터 위치를 다시 읽어 튐 없이 추적을 재개한다.
+
+    회전 시간은 config.SPIN_360_DURATION_SEC(1바퀴 기준) × turns. 이 값은 로봇/바닥에
+    따라 달라 실물에서 눈으로 맞춰야 한다(scripts/test_motions.py 'spin' 메뉴 참고).
+    """
+    turns = max(0.0, float(turns))
+    duration = turns * C.SPIN_360_DURATION_SEC
+    spd = C.SPIN_SPEED_UNITS * (1 if C.SPIN_DIR >= 0 else -1)
+    print(f"🌀 제자리 회전 {turns:g}바퀴 시작 (약 {duration:.1f}초) — Face Tracking 일시 정지")
+
+    if shared_state:
+        shared_state['mode'] = 'spinning'
+        time.sleep(0.1)
+
+    try:
+        # 돌면서 고개는 정면을 보게 정렬해두면 시연상 깔끔하다(_dance_routine과 같은 처리).
+        if home_pan is not None:
+            with lock:
+                io.write4(pkt, port, C.PAN_ID, C.ADDR_GOAL_POSITION, home_pan)
+                if home_tilt is not None:
+                    io.write4(pkt, port, C.TILT_ID, C.ADDR_GOAL_POSITION, home_tilt)
+            time.sleep(0.3)
+
+        # dance 1단계 "몸 전체 왼쪽 회전"과 같은 부호 조합 = 제자리 스핀
+        wheel.set_wheel_speed(pkt, port, lock, C.RIGHT_ID, -C.RIGHT_DIR * spd)
+        wheel.set_wheel_speed(pkt, port, lock, C.LEFT_ID, C.LEFT_DIR * spd)
+        time.sleep(duration)
+    finally:
+        # 무슨 일이 있어도 바퀴는 세우고 얼굴추적은 되살린다 — 여기서 빠지면 로봇이
+        # 계속 돌거나 'spinning' 모드에 갇혀 추적이 영영 안 돌아온다.
+        wheel.set_wheel_speed(pkt, port, lock, C.RIGHT_ID, 0)
+        wheel.set_wheel_speed(pkt, port, lock, C.LEFT_ID, 0)
+        time.sleep(SPIN_SETTLE_SEC)
+        if shared_state:
+            shared_state['mode'] = 'tracking'
+        print("✅ 제자리 회전 완료 — Face Tracking 재개")
+
+
 # ---- 퀴즈 모드 전용 리액션(docs/architecture.md와 별개, 2026-07-28 하찮미 실험 2차) ----
 # 이름 있는 매크로(Layer 1)도, LLM이 파라미터를 고르는 express_gesture(Layer 2)도 아닌,
 # core/quiz_state.py가 판정한 결과에 딸려오는 전용 리액션이라 여기 따로 묶어둔다.

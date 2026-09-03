@@ -26,7 +26,7 @@
 1. `vision_brain.RobotBrain` + `vision.face.face_tracker_worker(..., brain=brain)`로 얼굴인식과 팬/틸트 추적을 같은 스레드/카메라 세션에서 함께 수행 — ✅ (2026-07-27 통합. 세션 시작 시 확정된 이름을 그 세션 내내 고정하고 이후 다른 사람이 감지돼도 무시함 — `is_initial_recognition_active`가 이미 이 동작을 구현하고 있어 그대로 활용. `launcher.py`의 `wait_for_identification()` 참고)
 2. `profiles.load_profile_for_chat(name)` 호출(이름 확정 시) — ✅
 3. `build_persona_system_instruction(name, facts_summary)` — ✅
-4. `tools=[remember_fact, set_emotion, play_gesture, express_gesture]` — ✅ `remember_fact`는 이름을 몰라도 항상 붙는다(아래 8번 참고).
+4. `tools=[remember_fact, set_emotion, play_gesture, express_gesture, spin_around]` — ✅ `remember_fact`는 이름을 몰라도 항상 붙는다(아래 8번 참고). `spin_around`는 "한 바퀴 돌아봐" 같은 명시적 요청 시 얼굴추적을 멈추고 바퀴로 제자리 회전(무선화 시연용, 2026-09-03).
 5. 오디오 in/out + AEC (`media/audio_manager.py`의 `MicStreamer`/`Speaker`/`EchoCanceller`) — ✅ (2026-07-27. `launcher.py` 인라인 클래스를 `media/`로 분리하면서 AEC 연결. 실제 오디오 장치로 2초간 End-to-end 스모크 테스트 통과 → **이어폰 없이 실제 대화로 최종 검증까지 완료**, 기본 `AEC_STREAM_DELAY_MS`(100ms) 그대로 잘 작동함 — 튜닝 불필요했음)
 6. `message.tool_call` 수동 처리 — ✅
 7. `extract_exit_tag()`로 `[대화종료]` 감지 → `report_manager.generate_and_save_reports(name, log, 최신_facts_summary)` — ✅

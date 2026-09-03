@@ -17,14 +17,14 @@ test_motions.py는 메뉴 입력이 사람 페이스라 문제가 드러날 수 
 import threading
 import time
 
-from hardware.motion import EXPRESS_JOINTS, is_dancing, play_express_gesture, play_manual_motion
+from hardware.motion import EXPRESS_JOINTS, is_dancing, perform_spin, play_express_gesture, play_manual_motion
 
 VALID_GESTURES = ("greeting", "wave", "hug", "shy", "dance")
 
 
 def make_motion_tools(port, pkt, lock, shared_state, home_pan=2081, home_tilt=2071, emotion_queue=None,
                        busy: threading.Event | None = None):
-    """play_gesture, express_gesture 두 툴을 함께 만들어 반환한다(하나의 busy 가드 공유).
+    """play_gesture, express_gesture, spin_around 세 툴을 함께 만들어 반환한다(하나의 busy 가드 공유).
 
     busy를 외부에서 넘기면(예: core/quiz_tools.py의 퀴즈 리액션 모션과 공유) 그 이벤트를
     그대로 쓴다 — LLM이 부르는 제스처와 퀴즈 리액션 모션이 서로 다른 관절이라도 동시에
@@ -46,6 +46,13 @@ def make_motion_tools(port, pkt, lock, shared_state, home_pan=2081, home_tilt=20
     def _run_express(joint, intensity, speed, repeat):
         try:
             play_express_gesture(joint, intensity, speed, repeat, port, pkt, lock, shared_state)
+        finally:
+            busy.clear()
+
+    def _run_spin(turns):
+        try:
+            perform_spin(port, pkt, lock, shared_state, turns=turns,
+                         home_pan=home_pan, home_tilt=home_tilt)
         finally:
             busy.clear()
 
@@ -103,4 +110,32 @@ def make_motion_tools(port, pkt, lock, shared_state, home_pan=2081, home_tilt=20
         threading.Thread(target=_run_express, args=(joint, intensity, speed, repeat), daemon=True).start()
         return f"expressing gesture: {joint} (intensity={intensity})"
 
-    return play_gesture, express_gesture
+    def spin_around(turns: float = 1.0) -> str:
+        """Make the robot spin in place using its wheels (a full turn by default).
+
+        Call this ONLY when the user explicitly asks the robot to physically
+        rotate on the spot — e.g. "한 바퀴 돌아봐", "제자리에서 빙 돌아봐",
+        "turn around". It's a showcase move for the now-untethered robot.
+
+        Face tracking automatically pauses while spinning and resumes when it
+        finishes. Don't offer or trigger it on your own during ordinary
+        greetings or reactions — only on a direct request.
+
+        Args:
+            turns: how many full rotations, 0.25-3.0 (default 1.0 = one full turn).
+        """
+        if busy.is_set() or is_dancing():
+            print("⚠️ 이미 다른 제스처가 실행 중이라 회전 요청을 무시합니다.")
+            return "ignored — another gesture is already playing"
+
+        try:
+            turns = float(turns)
+        except (TypeError, ValueError):
+            turns = 1.0
+        turns = max(0.25, min(turns, 3.0))
+
+        busy.set()
+        threading.Thread(target=_run_spin, args=(turns,), daemon=True).start()
+        return f"spinning in place: {turns:g} turn(s)"
+
+    return play_gesture, express_gesture, spin_around

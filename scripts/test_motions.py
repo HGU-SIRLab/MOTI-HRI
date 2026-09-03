@@ -35,6 +35,7 @@ MENU = """
  6) express   (Layer 2 파라미터 제스처: 관절/intensity/speed/repeat 직접 입력)
  7) look_away (퀴즈 모드: 부끄러워하며 시선 회피)
  8) thinking  (퀴즈 모드: 짜증유발 모드의 생각 스톨, 약 11초)
+ 9) spin      (제자리 회전 — SPIN_360_DURATION_SEC 튜닝용, 바퀴 수 입력)
  q) 종료
 ──────────────────────────────
 """.format(duration=M.DANCE_DURATION)
@@ -95,6 +96,16 @@ def main():
                 M.play_look_away_motion(port, pkt, lock, shared_state, home_pan)
             elif choice == "8":
                 M.play_thinking_stall(port, pkt, lock, shared_state)
+            elif choice == "9":
+                try:
+                    turns = float(input("  바퀴 수 (기본 1.0) > ").strip() or "1.0")
+                except ValueError:
+                    print("⚠️ 숫자로 입력해주세요.")
+                    continue
+                print(f"  (현재 SPIN_360_DURATION_SEC={C.SPIN_360_DURATION_SEC}s, "
+                      f"SPIN_TURN_RPM={C.SPIN_TURN_RPM}, SPIN_DIR={C.SPIN_DIR})")
+                M.perform_spin(port, pkt, lock, shared_state, turns=turns,
+                                home_pan=home_pan, home_tilt=home_tilt)
             else:
                 print("⚠️ 알 수 없는 입력입니다.")
     finally:

@@ -1,8 +1,8 @@
 """로봇의 전체 인지 루프 — scripts/run_no_robot.py를 승격한 실제 진입점(2026-07-27).
 
 웹캠 얼굴인식 + 팬/틸트 추적(vision/face.py, 같은 스레드에서 함께 동작) → 프로필 로드 →
-페르소나 조립 → Live API 음성 대화(remember_fact, set_emotion, play_gesture, express_gesture
-툴 연결) → 표정 UI(display) → [대화종료] 감지 시 결과지 생성, 이 흐름을 전부 실제로 연결한다.
+페르소나 조립 → Live API 음성 대화(remember_fact, set_emotion, play_gesture, express_gesture,
+spin_around 툴 연결) → 표정 UI(display) → [대화종료] 감지 시 결과지 생성, 이 흐름을 전부 실제로 연결한다.
 **로봇(다이나믹셀 모터)이 연결되어 있어야 한다** — 로봇 없이 대화 파이프라인만
 테스트하려면 git 이력의 scripts/run_no_robot.py 버전 참고(현재는 이 파일에 흡수됨).
 
@@ -859,7 +859,7 @@ def main():
     # Layer 1/2(LLM이 부르는 제스처)와 퀴즈 모드 리액션 모션(core/quiz_tools.py)이 같은
     # busy 게이트를 공유해야 서로 다른 관절이라도 동시에 실행되며 충돌하지 않는다.
     motion_busy = threading.Event()
-    play_gesture, express_gesture = make_motion_tools(
+    play_gesture, express_gesture, spin_around = make_motion_tools(
         port, pkt, lock, shared_state, home_pan, home_tilt, emotion_queue, busy=motion_busy
     )
     display_stop = threading.Event()
@@ -906,7 +906,7 @@ def main():
         asyncio.run(
             run_conversation(
                 name_state, facts_summary, emotion_queue,
-                motion_tools=[play_gesture, express_gesture],
+                motion_tools=[play_gesture, express_gesture, spin_around],
                 shared_state=shared_state, brain=brain,
                 quiz_ui_q=quiz_ui_q, quiz_busy=motion_busy,
                 port=port, pkt=pkt, lock=lock, home_pan=home_pan, home_tilt=home_tilt,

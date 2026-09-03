@@ -123,6 +123,18 @@ TURN_SPEED_UNITS = rpm_to_unit(TURN_RPM)
 DANCE_TURN_RPM = TURN_RPM * 2
 DANCE_TURN_SPEED_UNITS = rpm_to_unit(DANCE_TURN_RPM)
 
+# ---- 제자리 한 바퀴 회전 (무선화 시연용, 2026-09-03) ----
+# "모티야 한 바퀴 돌아봐" → 얼굴추적을 멈추고 바퀴만으로 제자리 360° 회전.
+# SPIN_360_DURATION_SEC(1바퀴에 걸리는 시간)은 로봇마다·바닥마다 달라서 실물에서
+# 눈으로 보며 맞춰야 한다 — scripts/test_motions.py의 'spin' 메뉴로 튜닝한 뒤
+# .env의 SPIN_360_DURATION_SEC에 박아두면 된다(아래 기본값은 첫 시도용 어림값).
+SPIN_TURN_RPM = float(os.getenv("SPIN_TURN_RPM", str(TURN_RPM)))
+SPIN_SPEED_UNITS = rpm_to_unit(SPIN_TURN_RPM)
+SPIN_360_DURATION_SEC = float(os.getenv("SPIN_360_DURATION_SEC", "4.0"))
+# +1이면 dance 1단계와 같은 방향(몸 전체 왼쪽 회전), -1이면 반대. 방향이 반대로
+# 돌면 이 값의 부호만 뒤집으면 된다(회전량은 어차피 한 바퀴라 결과는 같다).
+SPIN_DIR = int(os.getenv("SPIN_DIR", "1"))
+
 # ---- 고개 끄덕임 ----
 # 2026-07-27 실물 재보정(홈 4000→4022, hardware/init.py MOTOR_HOME_POSITIONS 참고)에
 # 맞춰 DOWN_POS·MAX_POS도 동일 델타(+22)만큼 평행이동함 — 끄덕임 폭(홈 대비 -200)과
