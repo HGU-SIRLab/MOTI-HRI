@@ -8,17 +8,24 @@ import time
 # 잡은 뒤 scripts/read_positions.py로 실측해 v1/v2 값에서 갱신함(v1/v2 실측값은
 # git 이력 참고). ID 10은 config.py 어디에도 이름이 없는 모터지만 용도가
 # 불명확해도 미초기화 상태로 남기지 않기 위해 계속 초기화 대상에 포함.
+#
+# 2026-09-03 Orin Nano 실물 재보정: 옷을 벗기고 자세를 다시 잡은 뒤 실측해
+# 팬/틸트 포함 9개 관절을 갱신함. HEAD_NOD_ID(ID 1)만 예외로 4022 유지 —
+# 토크 OFF 상태에서 손으로 머리를 움직여도 이 모터축은 돌지 않고(비역구동
+# 추정) 항상 56으로 되돌아온다. 56은 0/4095 경계를 넘어간 값이라 홈으로 쓰면
+# 끄덕임 수식(HEAD_NOD_DOWN_POS = 홈-200)이 음수가 되어 깨진다. init 시
+# 토크가 켜지면 모터가 4022(의도된 정면)로 구동되므로 그대로 둔다.
 MOTOR_HOME_POSITIONS = {
     C.HEAD_NOD_ID: 4022,
-    C.PAN_ID: 2079,
-    C.SHOULDER_ID: 2113,
-    C.AUX_ID: 2061,
-    C.RIGHT_ARM_ID: 3660,
-    C.RIGHT_HAND_ID: 2139,
-    C.TILT_ID: 2074,
-    10: 1016,
-    C.LEFT_ARM_ID: 1387,
-    C.LEFT_HAND_ID: 2068,
+    C.PAN_ID: 2124,
+    C.SHOULDER_ID: 2057,
+    C.AUX_ID: 2058,
+    C.RIGHT_ARM_ID: 3647,
+    C.RIGHT_HAND_ID: 2135,
+    C.TILT_ID: 2075,
+    10: 1029,
+    C.LEFT_ARM_ID: 1369,
+    C.LEFT_HAND_ID: 2109,
 }
 
 
