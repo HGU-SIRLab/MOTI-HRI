@@ -59,6 +59,7 @@ from core.result_paths import (make_session_dir, parse_participant_id,
                                write_session_meta)
 from core.quiz_tools import make_quiz_tools
 from core import trust_notice
+from core import local_live
 from core.utils import (build_persona_system_instruction, extract_exit_tag,
                         short_name)
 from display.main import RobotFaceApp
@@ -91,6 +92,14 @@ class _SessionExpired(Exception):
 
 
 LIVE_MODEL = os.getenv("LIVE_MODEL_NAME", "models/gemini-3.1-flash-live-preview")
+# MOTI_BRAIN(로컬 뇌, AGX Orin) 연결 주소 — docs/robot_integration.md 참고.
+# local_live.connect()가 google-genai의 client.aio.live.connect()와 같은 겉면을
+# 흉내내므로, 이 상수만 바꾸면 launcher.py의 나머지 코드는 그대로 동작한다.
+BRAIN_URI = os.getenv("BRAIN_URI", "ws://192.168.0.5:8765")
+# 뇌가 대답을 만드는 동안 "음...", "흠..." 같은 맞장구를 먼저 흘려보내는 기능(뇌 스펙 EXP-12).
+# 실사용에선 타이밍이 대화 흐름과 안 맞아 인위적으로 들렸다(2026-09-22 실물 확인) — 그래서
+# .env로 끌 수 있게 했다. 뇌 쪽 기본값은 켜짐이므로, 끄는 결정은 .env에만 적어둔다.
+BRAIN_BACKCHANNEL = os.getenv("BRAIN_BACKCHANNEL", "true").strip().lower() == "true"
 # 퀴즈 모드가 히든 턴을 주입(inject_turn)할 때, 로봇이 아직 이전 턴을 말하는 도중이면 곧장
 # 보내지 말고 기다려야 한다 — 안 그러면 새 응답 생성이 이전 발화 위에 겹쳐서 음성이
 # 끊기거나 뭉개지는 사고가 난다(2026-07-30 실사용 중 발견, 하찮미 모드의 "저도 맞춰볼게요"
@@ -537,7 +546,8 @@ async def run_conversation(name_state: dict, facts_summary: str | None, emotion_
                     ),
                 )
                 try:
-                    async with client.aio.live.connect(model=LIVE_MODEL, config=config) as session:
+                    async with local_live.connect(BRAIN_URI, config=config,
+                                                  backchannel=BRAIN_BACKCHANNEL) as session:
                         session_holder["session"] = session
 
                         if not greeted["value"]:

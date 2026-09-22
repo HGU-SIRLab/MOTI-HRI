@@ -227,6 +227,26 @@ class RobotBrain:
             self.save_brain() # 즉시 저장
         return msg
 
+    def relabel_face(self, old: str, new: str) -> int:
+        """등록된 얼굴의 이름표만 바꾼다 — 전사 오인식으로 잘못 붙은 이름 정정용.
+
+        forget_face + register_face로 대신하면 학습된 카테고리(W)를 버리고 그 순간의
+        임베딩 하나로 다시 배우게 된다. 이름만 틀렸을 뿐 얼굴은 맞게 학습돼 있으므로
+        라벨만 갈아끼우는 편이 인식 정확도를 지킨다. 한 사람이 여러 카테고리로 나뉘어
+        있을 수 있어(forget_face 주석 참고) 일치하는 전부를 바꾼다.
+        """
+        if not old or not new or old == new:
+            return 0
+        with self._lock:
+            changed = 0
+            for i, label in enumerate(self.art.labels):
+                if label == old:
+                    self.art.labels[i] = new
+                    changed += 1
+            if changed:
+                self.save_brain()
+        return changed
+
     def forget_face(self, name: str) -> int:
         """해당 이름으로 기억된 얼굴 카테고리를 전부 지운다(사용자 삭제 요청용).
 

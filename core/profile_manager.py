@@ -115,6 +115,36 @@ def touch_last_seen(name: str):
             _save_all(data)
 
 
+def rename_user(old: str, new: str) -> bool:
+    """프로필을 다른 이름 키로 옮긴다 — 전사 오인식으로 잘못 저장된 이름 정정용.
+
+    이 저장소는 이름을 **키**로 쓴다(remember_fact의 data.setdefault(name, ...)). 그래서
+    잘못 들은 이름으로 한 번 저장되면, 나중에 remember_fact(field="name", ...)로 값을
+    고쳐도 키는 그대로 남아 유령 프로필이 생긴다(2026-09-22에 '조효형민'/'조현경민'이
+    실제로 이렇게 쌓였다). 이름 정정은 값 갱신이 아니라 키 이동이어야 한다.
+
+    new 키가 이미 있으면(예전에 제대로 저장된 적이 있는 사람) 그쪽을 정본으로 두고,
+    old에만 있던 field를 채워 넣는 식으로 병합한다 — 이미 확정된 값을 오인식 세션의
+    값으로 덮어쓰지 않기 위해서다. 반환값은 실제로 옮겼으면 True.
+    """
+    if not old or not new or old == new:
+        return False
+    with _LOCK:
+        data = _load_all()
+        if old not in data:
+            return False
+        src = data.pop(old)
+        dst = data.get(new)
+        if dst is None:
+            data[new] = src
+        else:
+            have = {f["field"] for f in dst["facts"]}
+            dst["facts"].extend(f for f in src["facts"] if f["field"] not in have)
+            dst["last_seen"] = _now()
+        _save_all(data)
+        return True
+
+
 def forget_user(name: str):
     """테스트/관리 목적 — 특정 사용자의 프로필을 완전히 삭제한다."""
     with _LOCK:

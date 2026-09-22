@@ -28,10 +28,14 @@ def make_remember_fact_tool(name_state: dict, shared_state: dict | None = None, 
         Call this whenever the person reveals something worth remembering —
         their name, major, MBTI, a hobby, a worry, anything — not only for a
         fixed checklist. Call it again with the same field to correct an
-        earlier value; do not ask the person to confirm first unless you are
-        genuinely unsure what they meant. If you don't know this person's name
-        yet, the very first call you make MUST be field="name" — you cannot
-        remember anything else about someone before you know who they are.
+        earlier value. For every field EXCEPT "name", save silently without
+        asking the person to confirm. For field="name", repeat the name back
+        once to confirm it (speech recognition mishears Korean names often, and
+        a wrong name sticks), and then call this in the very same turn the
+        person confirms it — confirming without calling loses the name. If you
+        don't know this person's name yet, the very first call you make MUST be
+        field="name" — you cannot remember anything else about someone before
+        you know who they are.
 
         Args:
             field: what kind of information this is (e.g. "name", "grade", "major", "mbti", "gender", "rc"), or any free-form label if it doesn't fit those.
@@ -48,6 +52,22 @@ def make_remember_fact_tool(name_state: dict, shared_state: dict | None = None, 
                     emb = shared_state.get('current_face_embedding')
                     if emb is not None:
                         print(brain.register_face(emb, value))
+
+        elif field == "name" and value != name_state["name"]:
+            # 이름 정정은 값 갱신이 아니라 '키 이동'이다. 프로필 저장소도 얼굴 기억도
+            # 이름을 키/라벨로 쓰기 때문에, 그냥 remember_fact로 값만 고치면 처음 잘못
+            # 들은 이름의 항목이 그대로 남아 유령 프로필이 된다 — 2026-09-22에
+            # '조효형민'/'조현경민'이 실제로 이렇게 쌓였다. 페르소나에 확인 턴을 넣어도
+            # 모델이 확인 전에 먼저 저장해버리는 경우가 실측됐으므로(같은 날 2차 검증),
+            # 문구가 아니라 여기서 구조적으로 처리한다.
+            old_name = name_state["name"]
+            moved = profiles.rename_user(old_name, value)
+            relabeled = brain.relabel_face(old_name, value) if brain is not None else 0
+            name_state["name"] = value
+            if shared_state is not None:
+                shared_state['detected_user'] = value
+            print(f"✏️  이름 정정: {old_name} → {value} "
+                  f"(프로필 {'이동' if moved else '이동 없음'}, 얼굴 라벨 {relabeled}개 갱신)")
 
         profiles.remember_fact(name_state["name"], field, value, confidence)
         return f"remembered {field}={value}"
