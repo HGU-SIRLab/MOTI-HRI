@@ -638,8 +638,19 @@ EXIT_TAG = "[대화종료]"
 #   (a) 명령형만 받고, (b) 발화 끝에 올 때만 인정하며, (c) 화제로 쓰는 신호가 있으면 뺀다.
 _EXIT_CMD = re.compile(r"대화종료(하자고|하자니까|해달라고|하자|해줘|해주세요|해라|해야지|해야겠|할게|할래|할거야|하고싶|합시다|시켜줘|시켜|해)?(다|요)?$")
 # 종료를 '이야기 소재'로 쓰는 신호 — 하나라도 있으면 백스톱을 발동하지 않는다.
-_EXIT_TOPIC = ("안돼", "안되", "안됨", "왜", "어떻게", "기능", "테스트", "확인해봐",
-               "무슨뜻", "라고하면", "라고말하면")
+# 2026-09-22 실물에서 오탐 방지가 지나쳐 **놓치는** 사고가 났다: "너 목소리를 너가 직접
+# 들으면 안 되는데 그러고 있거든 일단 대화 종료하자"가 "안 되"에 걸려 백스톱이 안 떴고,
+# 사용자가 "대화 종료하자고 멍청아"라고 다시 말해야 했다. 종료어가 **발화 끝의 명령형**일
+# 때만 매칭되므로("대화 종료가 안 되냐"는 어미가 안 맞아 애초에 매칭 자체가 안 된다)
+# 광범위한 부정어/의문사는 불필요하게 해롭기만 했다 — 기능을 '화제로' 말하는 표현만 남긴다.
+_EXIT_TOPIC = ("기능", "테스트", "라고하면", "라고말하면", "무슨뜻", "이라고하면")
+
+
+# 명령 뒤에 붙는 호격·군말. 종료를 재촉하거나 짜증내며 덧붙이는 말이라 명령의 일부로 본다
+# ("대화 종료하자고 멍청아" — 2026-09-22 실물). 화이트리스트로만 좁게 허용한다:
+# "대화 종료하자고 말하면"처럼 종료를 '화제로' 만드는 꼬리말이 통과하면 안 되기 때문이다.
+_EXIT_TRAILERS = ("멍청아", "바보야", "모티야", "뭐티야", "제발", "빨리", "진짜",
+                  "좀", "야", "응", "어", "그만", "알겠지", "알았지")
 
 
 def is_explicit_exit_request(user_text: str) -> bool:
@@ -657,7 +668,45 @@ def is_explicit_exit_request(user_text: str) -> bool:
     # 마지막 구두점 뒤 조각만 검사(없으면 전체).
     tail = re.split(r"[.!?…]", flat)
     tail = next((t for t in reversed(tail) if t), "")
+    # 뒤에 붙은 호격/군말은 떼어내고 본다 — 여러 개 붙을 수 있어 반복한다.
+    changed = True
+    while changed:
+        changed = False
+        for w in _EXIT_TRAILERS:
+            if tail.endswith(w) and len(tail) > len(w):
+                tail = tail[: -len(w)]
+                changed = True
     return bool(_EXIT_CMD.search(tail))
+
+
+def is_injected_echo(transcript: str, injected: "list[str] | tuple[str, ...]") -> bool:
+    """전사된 '사용자 발화'가 사실은 로봇이 주입한 히든 턴의 되돌이면 True.
+
+    프라이버시 안내와 퀴즈 진행 지시는 launcher.inject_turn()이 `role="user"` 턴으로
+    보낸다(Live API에서 로봇이 먼저 말하게 만드는 유일한 방법). 뇌는 그 텍스트를
+    input_transcription으로 되돌려주고, launcher는 그걸 사용자 발화로 알고 `[나]`에
+    찍고 대화록(user_result/*/대화.txt)에 남긴다 — 연구 데이터가 오염된다.
+
+    2026-09-22 실물에서 이게 음향 에코로 오해됐다. 갈라준 근거: (a) 같은 세션의 진짜
+    사용자 발화는 심하게 깨졌는데 이 문장만 토씨 하나까지 정확했고, (b) 문자열이
+    trust_notice.OPENING_NOTICE 상수와 정확히 일치했으며, (c) AEC 통과 후 실측 잔향
+    (청크 RMS 중앙값 101)으로는 그런 정확한 전사가 나올 수 없다.
+
+    주입문에는 "(진행자 지시: ...)" 같은 머리말이 붙는데 되돌아오는 전사에는 없을 수
+    있어서, 양방향 부분 일치로 본다. 공백은 무시한다(전사가 띄어쓰기를 다르게 넣는다).
+    """
+    if not transcript or not injected:
+        return False
+    t = re.sub(r"\s+", "", transcript)
+    if len(t) < 8:          # 너무 짧으면 우연히 겹칠 수 있다 — 거르지 않는다
+        return False
+    for raw in injected:
+        j = re.sub(r"\s+", "", raw or "")
+        if not j:
+            continue
+        if t in j or j in t:
+            return True
+    return False
 
 
 def extract_exit_tag(text: str) -> tuple[str, bool]:

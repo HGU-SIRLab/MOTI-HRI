@@ -21,6 +21,7 @@ spin_around 툴 연결) → 표정 UI(display) → [대화종료] 감지 시 결
     같은 폴더 아래 참가자+시각 단위 하위 폴더에 모드(1/2/3)별 결과 파일도 남긴다.
 """
 import asyncio
+import collections
 import multiprocessing
 import os
 import queue
@@ -61,7 +62,7 @@ from core.quiz_tools import make_quiz_tools
 from core import trust_notice
 from core import local_live
 from core.utils import (build_persona_system_instruction, extract_exit_tag,
-                        is_explicit_exit_request, short_name)
+                        is_explicit_exit_request, is_injected_echo, short_name)
 from display.main import RobotFaceApp
 from display.quiz_window import quiz_window_process
 from hardware import config as C
@@ -289,6 +290,10 @@ async def run_conversation(name_state: dict, facts_summary: str | None, emotion_
         else:
             await fn()
 
+    # 주입한 히든 턴 텍스트를 기억해둔다 — 뇌가 이걸 input_transcription으로 되돌려주면
+    # 사용자 발화로 오인돼 대화록에 남는다(core/utils.is_injected_echo 주석 참고).
+    injected_turns: "collections.deque[str]" = collections.deque(maxlen=8)
+
     async def inject_turn(text: str):
         if session_holder["session"] is None:
             return
@@ -308,6 +313,7 @@ async def run_conversation(name_state: dict, facts_summary: str | None, emotion_
                 turns=types.Content(role="user", parts=[types.Part(text=text)]),
                 turn_complete=True,
             )
+            injected_turns.append(text)
         except Exception as e:
             # 여기서 예외가 새어나가면 호출한 태스크(정답 공개 전환 등)가 통째로 죽어
             # 퀴즈가 그 문제에서 멈춘다 — 한 번의 주입 실패로 그렇게 되면 안 된다.
@@ -703,6 +709,12 @@ async def run_conversation(name_state: dict, facts_summary: str | None, emotion_
                                         speaking_done.set()
                                         turn_seq[0] += 1
                                         u = "".join(turn_user).strip()
+                                        if is_injected_echo(u, injected_turns):
+                                            # 로봇이 주입한 히든 턴이 사용자 발화로 되돌아온 것 —
+                                            # 대화록(연구 데이터)에 남으면 안 된다.
+                                            print(f"🔁 히든 턴 되돌이 감지 — 사용자 발화에서 제외: "
+                                                  f"{u[:40]}...")
+                                            u = ""
                                         m_raw = "".join(turn_moti).strip()
                                         m_clean, should_end = extract_exit_tag(m_raw)
                                         # 백스톱 — 모델의 [대화종료] 방출률이 ~40%라(뇌 측정)
