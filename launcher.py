@@ -61,7 +61,7 @@ from core.quiz_tools import make_quiz_tools
 from core import trust_notice
 from core import local_live
 from core.utils import (build_persona_system_instruction, extract_exit_tag,
-                        short_name)
+                        is_explicit_exit_request, short_name)
 from display.main import RobotFaceApp
 from display.quiz_window import quiz_window_process
 from hardware import config as C
@@ -118,6 +118,11 @@ TRUST_CLOSING_TIMEOUT_SEC = 25.0
 # 퀴즈 진행 중에는 barge-in(끼어들기)을 끈다 — 아래 should_withhold_mic() 주석 참고.
 # 일반 대화의 barge-in은 이 값과 무관하게 항상 켜져 있다.
 QUIZ_DISABLE_BARGE_IN = os.getenv("QUIZ_DISABLE_BARGE_IN", "true").lower() not in ("0", "false", "no")
+# 첫 인사와 프라이버시 안내가 나가는 동안에는 barge-in을 막는다 — 이 구간의 끼어들기는
+# 사실상 전부 오탐이다(사용자가 아직 말을 시작하지도 않았거나, 연구상 반드시 전달돼야
+# 하는 고지다). 2026-09-22 실물에서 연구실 다른 사람들 말소리에 첫 인사가 세 세션 연속
+# 통째로 날아갔다. 퀴즈 차단과 별개로 끌 수 있게 env를 따로 둔다.
+PROTECT_OPENING_BARGE_IN = os.getenv("PROTECT_OPENING_BARGE_IN", "true").lower() not in ("0", "false", "no")
 # 기본 대화 상태(퀴즈 제외)에서 IDLE_SLEEP_SEC(core/idle_watcher.py)만큼 사용자가 조용하면
 # SLEEPY로 전환하고 팬/틸트 추적도 멈춘다 — 사용자 요청(2026-07-29). display/emotions/
 # sleepy.py·wake.py는 v1(capston_mk1/motirobotics)에서 재이식.
@@ -362,6 +367,8 @@ async def run_conversation(name_state: dict, facts_summary: str | None, emotion_
     def _inject_trust(text: str):
         """안내 멘트 히든 턴을 예약한다. recv_loop 안에서 inject_turn을 직접 await하면
         재생 드레인을 기다리는 동안 수신 처리가 멈추므로 퀴즈 툴과 같이 태스크로 띄운다."""
+        protected_utterance[0] = True   # 프라이버시 안내는 끊기면 안 된다(연구 데이터)
+        protect_started_at[0] = time.monotonic()
         task = loop.create_task(inject_turn(text))
         trust_tasks.append(task)
         task.add_done_callback(lambda t: trust_tasks.remove(t) if t in trust_tasks else None)
@@ -430,6 +437,10 @@ async def run_conversation(name_state: dict, facts_summary: str | None, emotion_
     # 죽는 것보단 낫다(2026-08-07, 아래 connection_manager 참고).
     resumption_handle = {"value": None}
     greeted = {"value": False}
+    # 지금 나가는 발화가 끊기면 안 되는 것(첫 인사 / 프라이버시 안내)인가.
+    # 턴이 끝나거나(turn_complete) 중단되면(interrupted) 반드시 내려간다.
+    protected_utterance = [False]
+    protect_started_at = [0.0]      # 보호가 켜진 시각(monotonic) — 상한을 여기서 잰다
 
     with MicStreamer(loop, echo_canceller=echo_canceller) as mic, Speaker(echo_canceller=echo_canceller) as speaker:
         # Fenrir 프리셋은 여전히 성인 성우 음색이라, 재생 직전에 피치+포먼트를 시프트해
@@ -468,6 +479,7 @@ async def run_conversation(name_state: dict, facts_summary: str | None, emotion_
             0으로 만들고 잘려나간 턴의 잔여 오디오도 버린다 — 어차피 그 발화는 중간에 끊겼다.
             """
             speaking_done.set()
+            protected_utterance[0] = False
             turn_seq[0] += 1
             if shifter is not None:
                 shifter.reset()
@@ -491,6 +503,9 @@ async def run_conversation(name_state: dict, facts_summary: str | None, emotion_
                 sec_since_last_audio=time.monotonic() - last_audio_time[0],
                 enabled=QUIZ_DISABLE_BARGE_IN,
                 max_withhold_sec=MAX_MIC_WITHHOLD_SEC,
+                protected_utterance=protected_utterance[0],
+                protect_enabled=PROTECT_OPENING_BARGE_IN,
+                protected_elapsed_sec=time.monotonic() - protect_started_at[0],
             )
 
         # SLEEPY 배경음 — API를 다시 부르지 않고 캐시된 클립만 읽는다(_load_snore_clip
@@ -498,6 +513,7 @@ async def run_conversation(name_state: dict, facts_summary: str | None, emotion_
         snore_pcm, snore_duration_sec = _load_snore_clip()
 
         turn_user, turn_moti = [], []
+        barge_in_count = [0]      # EXP-9 계수용(위 interrupted 처리 참고)
         # idle_watcher()와 recv_loop() 둘 다 읽고/쓰는 공유 상태라 nonlocal 없이
         # 클로저에서 갱신 가능하도록 리스트(가변 컨테이너)로 감싼다(core/quiz_tools.py의
         # _pending_stall 딕셔너리 패턴과 같은 이유). "활동"은 사용자 발화뿐 아니라
@@ -564,6 +580,8 @@ async def run_conversation(name_state: dict, facts_summary: str | None, emotion_
                                 turn_complete=True,
                             )
                             greeted["value"] = True
+                            protected_utterance[0] = True   # 첫 인사는 끊기면 안 된다
+                            protect_started_at[0] = time.monotonic()
                         else:
                             print("🔄 세션 재연결됨 — 대화를 계속합니다.")
 
@@ -609,6 +627,12 @@ async def run_conversation(name_state: dict, facts_summary: str | None, emotion_
 
                                     sc = message.server_content
                                     if sc and sc.interrupted:
+                                        # 로봇은 여태 barge-in을 조용히 처리만 하고 기록은 안 남겼다 —
+                                        # 뇌 로그의 barge-in 줄과 맞춰볼 로봇 쪽 근거가 없어서, EXP-9
+                                        # 끼어들기 계수(시도/안 멈춤/혼자 멈춤)를 사후에 셀 수가 없었다.
+                                        barge_in_count[0] += 1
+                                        print(f"✂️  재생 중단(interrupted) #{barge_in_count[0]} "
+                                              f"— 턴 {turn_seq[0]}")
                                         speaker.stop_immediately()
                                         if shifter:
                                             shifter.reset()
@@ -616,6 +640,7 @@ async def run_conversation(name_state: dict, facts_summary: str | None, emotion_
                                         # inject_turn()이 여기서 계속 기다리며 멈춰있지 않게 한다.
                                         speaking_done.set()
                                         turn_seq[0] += 1
+                                        protected_utterance[0] = False
 
                                     if message.data:
                                         # mute_speech는 퀴즈 판정 직후의 "침묵" 턴에서만 켜진다 —
@@ -666,6 +691,8 @@ async def run_conversation(name_state: dict, facts_summary: str | None, emotion_
                                         await session.send_tool_response(function_responses=responses)
 
                                     if sc and sc.turn_complete:
+                                        # 보호 구간(첫 인사/안내)은 그 턴이 끝나면 반드시 풀린다.
+                                        protected_utterance[0] = False
                                         if shifter:
                                             # 버퍼 임계값(기본 500ms) 미만으로 남은 발화 꼬리를 흘려보낸다
                                             # — 안 하면 매 턴 마지막 조각이 조용히 잘려나간다.
@@ -678,6 +705,15 @@ async def run_conversation(name_state: dict, facts_summary: str | None, emotion_
                                         u = "".join(turn_user).strip()
                                         m_raw = "".join(turn_moti).strip()
                                         m_clean, should_end = extract_exit_tag(m_raw)
+                                        # 백스톱 — 모델의 [대화종료] 방출률이 ~40%라(뇌 측정)
+                                        # 태그에만 의존하면 사용자가 세션에서 못 빠져나온다.
+                                        # 실제로 "대화 종료하자"를 세 번 말해도 안 끝나 터미널에서
+                                        # 강제 종료해야 했다(2026-09-22, 하루 두 번). 태그가 오면
+                                        # 기존 경로 그대로이고, 안 왔을 때만 사용자 발화로 판단한다.
+                                        if not should_end and is_explicit_exit_request(u):
+                                            print("🛟 모델이 [대화종료] 태그를 안 냈지만 "
+                                                  "사용자가 명시적으로 종료를 요청했습니다 — 백스톱 발동")
+                                            should_end = True
                                         if u or m_clean:
                                             session_history.append(f"User: {u} | Moti: {m_clean}")
                                             print(f"\n[나] {u}\n[모티] {m_clean}")
@@ -687,7 +723,18 @@ async def run_conversation(name_state: dict, facts_summary: str | None, emotion_
                                         # 마무리 안내가 빠졌으면 곧장 끊지 않고 한 번 더
                                         # 시킨 뒤(그 턴이 끝나면 다시 여기로 온다) 마친다.
                                         if handle_trust_notice(m_clean, should_end):
-                                            print("\n👋 [대화종료] 감지 — 세션을 마칩니다.")
+                                            print("\n👋 [대화종료] 감지 — 작별 인사 재생을 마저 기다립니다...")
+                                            # 여기서 곧장 break하면 Speaker 컨텍스트가 닫히면서 아직
+                                            # 스피커/VoiceShifter 버퍼에 남아 있던 작별 인사 꼬리가
+                                            # 통째로 버려진다 — 사용자가 "마지막 문장을 끝까지 다 말하지
+                                            # 못하고 끊긴다"고 느낀 원인(2026-09-22 실물). turn_complete가
+                                            # 온 시점은 '생성'이 끝난 것이지 '재생'이 끝난 게 아니다.
+                                            # 드레인 함수는 이미 있었는데(wait_for_playback_drain) 퀴즈
+                                            # 턴 주입에서만 쓰고 종료 경로에서는 안 쓰고 있었다.
+                                            drain = drain_holder.get("fn")
+                                            if drain is not None:
+                                                await drain()
+                                            print("👋 세션을 마칩니다.")
                                             stop_event.set()
                                             break
                                     if stop_event.is_set():

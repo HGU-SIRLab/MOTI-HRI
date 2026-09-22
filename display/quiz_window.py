@@ -27,6 +27,12 @@ MONITOR_INDEX = int(os.getenv("QUIZ_WINDOW_MONITOR_INDEX", "0"))
 # 화면에서 터미널에 명령을 입력하며 테스트할 때는 전체화면 창이 터미널을 가려서 타이핑이
 # 안 되는 문제가 있다 — 그럴 땐 0으로 꺼서 Alt+Tab/클릭으로 터미널을 앞으로 꺼낼 수 있게 한다.
 TOPMOST = os.getenv("QUIZ_WINDOW_TOPMOST", "1") != "0"
+# 원격(ssh -X)으로 퀴즈 창을 받아보며 로봇을 테스트할 때, 테두리 없는 전체화면이 노트북
+# 화면을 통째로 덮어 로그도 못 보고 창 정리도 못 하는 문제가 있다(2026-09-22). 실험 본
+# 운용은 전체화면이어야 하므로 **기본값은 그대로 두고**, 테스트할 때만 창모드로 연다.
+#   QUIZ_WINDOW_WINDOWED=1 ./run_jetson.sh         (기본 1000x700)
+#   QUIZ_WINDOW_WINDOWED=1280x800 ./run_jetson.sh  (크기 지정)
+WINDOWED = os.getenv("QUIZ_WINDOW_WINDOWED", "").strip()
 
 
 def _place_fullscreen(root) -> tuple[int, int]:
@@ -49,6 +55,16 @@ def _place_fullscreen(root) -> tuple[int, int]:
     return w, h
 
 
+def _place_windowed(root) -> tuple[int, int]:
+    """테두리 있는 일반 창으로 배치하고 (width, height)를 반환한다 — 테스트 전용."""
+    try:
+        w, h = (int(v) for v in WINDOWED.lower().split("x", 1))
+    except ValueError:
+        w, h = 1000, 700
+    root.geometry(f"{w}x{h}+60+60")
+    return w, h
+
+
 def quiz_window_process(quiz_q: "multiprocessing.Queue"):
     # 얼굴 UI(display/main.py)는 로봇에 물린 물리 화면에 남겨두고, 퀴즈 창만 다른
     # X 서버(예: 참가자 노트북으로 온 ssh -X 포워딩 디스플레이)로 보내고 싶을 때 쓴다.
@@ -60,14 +76,18 @@ def quiz_window_process(quiz_q: "multiprocessing.Queue"):
         root = tk.Tk()
         root.title("Moti Quiz")
         root.configure(bg="black")
-        if TOPMOST:
+        windowed = bool(WINDOWED) and WINDOWED != "0"
+        if TOPMOST and not windowed:
             root.wm_attributes("-topmost", 1)
-        win_w, win_h = _place_fullscreen(root)
+        win_w, win_h = _place_windowed(root) if windowed else _place_fullscreen(root)
+        if windowed:
+            print(f"🪟 퀴즈 창: 창모드 {win_w}x{win_h} (QUIZ_WINDOW_WINDOWED) — "
+                  f"실험 본 운용에서는 이 값을 주지 마세요(전체화면이 기본)")
         # overrideredirect(테두리 없는 전체화면)는 닫기 버튼이 없어 갇힐 수 있으므로 탈출구를
         # 두되, TOPMOST=1인 실제 로봇 운용 모드에서는 절대 바인딩하지 않는다 — 실험 중
         # 실수로 Esc를 눌러 이 프로세스가 조용히 죽으면(daemon이라 launcher.py가 감지 못함)
         # 그 세션 내내 퀴즈 화면이 복구 불가능하게 사라진다. 개발/테스트(TOPMOST=0)에서만 유효.
-        if not TOPMOST:
+        if not TOPMOST or windowed:
             root.bind("<Escape>", lambda e: root.destroy())
 
         prompt_label = tk.Label(root, text="", font=("Malgun Gothic", 22), fg="white",

@@ -32,6 +32,14 @@ MAX_MIC_WITHHOLD_SEC = 3.0
 # 통과한다. 의심스러우면 .env의 SLEEP_MIC_RMS_THRESHOLD=0으로 이 기능만 끌 수 있다.
 SLEEP_MIC_RMS_THRESHOLD = 500.0
 
+# 보호 구간(첫 인사/프라이버시 안내)에서 마이크를 막아두는 절대 상한(초).
+# 퀴즈용 MAX_MIC_WITHHOLD_SEC은 "마지막 로봇 오디오 이후"를 재는데, 보호가 정작 필요한
+# 순간은 **로봇이 아직 아무 소리도 내지 않은** 생성 구간이다(2026-09-22: last_audio_time이
+# 0.0으로 초기화돼 경과시간이 수천 초로 잡히는 바람에 상한에 즉시 걸려 보호가 무력화됐다).
+# 그래서 보호 구간만은 "보호 시작 이후"로 시간을 재고, 이 값으로 못을 박는다 — 어떤 신호가
+# 잘못되든 이 시간이 지나면 마이크는 반드시 열린다.
+MAX_PROTECT_SEC = 12.0
+
 
 def should_send_while_sleeping(is_sleeping: bool, chunk_rms: float,
                                threshold: float = SLEEP_MIC_RMS_THRESHOLD) -> bool:
@@ -48,7 +56,11 @@ def should_send_while_sleeping(is_sleeping: bool, chunk_rms: float,
 def decide_withhold_mic(quiz_active: bool, robot_speaking: bool,
                         sec_since_last_audio: float,
                         enabled: bool = True,
-                        max_withhold_sec: float = MAX_MIC_WITHHOLD_SEC) -> bool:
+                        max_withhold_sec: float = MAX_MIC_WITHHOLD_SEC,
+                        protected_utterance: bool = False,
+                        protect_enabled: bool = True,
+                        protected_elapsed_sec: float = 0.0,
+                        max_protect_sec: float = MAX_PROTECT_SEC) -> bool:
     """마이크 오디오를 서버로 보내지 **않아야** 하면 True.
 
     quiz_active: 퀴즈가 진행 중인가(퀴즈 밖 일반 대화의 barge-in은 v3의 핵심 기능이라
@@ -56,7 +68,17 @@ def decide_withhold_mic(quiz_active: bool, robot_speaking: bool,
     robot_speaking: 로봇이 생성 중이거나 아직 스피커로 흘러나오는 중인가.
     sec_since_last_audio: 로봇 오디오 청크가 마지막으로 도착한 뒤 지난 시간(초).
     enabled: .env의 QUIZ_DISABLE_BARGE_IN — 문제가 생기면 통째로 끌 수 있게.
+    protected_utterance: 지금 나가는 발화가 **끊기면 안 되는 것**인가 — 첫 인사와
+        프라이버시 안내 두 가지다. 둘 다 "사용자가 아직 말을 시작하지도 않은 시점"이거나
+        연구상 반드시 전달돼야 하는 고지라, 이 구간의 barge-in은 사실상 전부 오탐이다.
+        2026-09-22 실물에서 연구실의 다른 사람들 말소리에 첫 인사가 통째로 날아갔다
+        (턴 0에서 interrupted, [모티] 전사 줄이 아예 안 남음). 세 세션 연속 재현.
+    protect_enabled: .env의 PROTECT_OPENING_BARGE_IN — 이 보호만 따로 끌 수 있게.
     """
+    # 보호 구간은 로봇이 아직 소리를 내기 전(생성 중)에도 막아야 하므로 robot_speaking과
+    # sec_since_last_audio를 보지 않는다 — 대신 보호 시작 이후 경과로 못을 박는다.
+    if protected_utterance and protect_enabled:
+        return protected_elapsed_sec <= max_protect_sec
     if not enabled or not quiz_active:
         return False
     if sec_since_last_audio > max_withhold_sec:
