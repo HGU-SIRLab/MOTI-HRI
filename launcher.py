@@ -119,6 +119,10 @@ TRUST_CLOSING_TIMEOUT_SEC = 25.0
 # 퀴즈 진행 중에는 barge-in(끼어들기)을 끈다 — 아래 should_withhold_mic() 주석 참고.
 # 일반 대화의 barge-in은 이 값과 무관하게 항상 켜져 있다.
 QUIZ_DISABLE_BARGE_IN = os.getenv("QUIZ_DISABLE_BARGE_IN", "true").lower() not in ("0", "false", "no")
+# 퀴즈 사진 창 자체를 띄우지 않는다. 퀴즈를 안 쓰는 세션(일반 대화 시연·촬영)에서 창이
+# 전체화면으로 화면을 덮어버리는 걸 막는다. false면 퀴즈 기능 전체가 비활성이 된다
+# (run_conversation의 quiz_ui_q=None 경로 — 원래 테스트 스크립트용으로 있던 길).
+QUIZ_WINDOW_ENABLED = os.getenv("QUIZ_WINDOW_ENABLED", "true").lower() not in ("0", "false", "no")
 # 첫 인사와 프라이버시 안내가 나가는 동안에는 barge-in을 막는다 — 이 구간의 끼어들기는
 # 사실상 전부 오탐이다(사용자가 아직 말을 시작하지도 않았거나, 연구상 반드시 전달돼야
 # 하는 고지다). 2026-09-22 실물에서 연구실 다른 사람들 말소리에 첫 인사가 세 세션 연속
@@ -944,9 +948,13 @@ def main():
     # 이 신규 기능의 버그가 검증된 얼굴 UI를 절대 건드리지 않는다(2026-07-28 하찮미
     # 실험 2차, docs/progress.md 참고). quiz_ui_q가 항상 존재하므로 퀴즈 기능은 사실상
     # 상시 활성 — 트리거되지 않으면(사용자가 "퀴즈 풀자" 등을 말하지 않으면) 그냥 안 쓰인다.
-    quiz_ui_q: "multiprocessing.Queue" = multiprocessing.Queue()
-    quiz_proc = multiprocessing.Process(target=quiz_window_process, args=(quiz_ui_q,), daemon=True)
-    quiz_proc.start()
+    if QUIZ_WINDOW_ENABLED:
+        quiz_ui_q: "multiprocessing.Queue | None" = multiprocessing.Queue()
+        quiz_proc = multiprocessing.Process(target=quiz_window_process, args=(quiz_ui_q,), daemon=True)
+        quiz_proc.start()
+    else:
+        print("🚫 퀴즈 사진 창 비활성 (.env QUIZ_WINDOW_ENABLED=false) — 퀴즈 기능도 함께 꺼집니다.")
+        quiz_ui_q, quiz_proc = None, None
 
     # 이 프로세스는 daemon이라 죽어도 launcher.py가 자동으로 알 수 없다 — 그러면 퀴즈
     # 사진이 안 뜨는데 원인을 몰라 한참 헤매게 된다(실제로 "화면이 안 불러와진다"로
@@ -962,7 +970,8 @@ def main():
                 return
             time.sleep(2.0)
 
-    threading.Thread(target=watch_quiz_window, name="quiz-window-watch", daemon=True).start()
+    if quiz_proc is not None:
+        threading.Thread(target=watch_quiz_window, name="quiz-window-watch", daemon=True).start()
 
     # 둘 다 run_conversation이 "시작 시점에" 채우는 가변 컨테이너 — 세션이 [대화종료]가
     # 아니라 Ctrl+C로 끝나도 아래 finally에서 그때까지의 대화록/퀴즈 결과를 저장할 수 있다.
@@ -988,8 +997,9 @@ def main():
     finally:
         display_stop.set()
 
-        quiz_ui_q.put("__QUIT__")
-        quiz_proc.join(timeout=3.0)
+        if quiz_proc is not None:
+            quiz_ui_q.put("__QUIT__")
+            quiz_proc.join(timeout=3.0)
 
         track_stop.set()
         t_face.join(timeout=5.0)
