@@ -1,238 +1,371 @@
-# 모티(Moti) v3
+# 모티(Moti) — 로봇 본체
 
-한동대학교 공감서비스로봇 **모티** — v1([hlri-iua-motirobotics](https://github.com/HandongSF/hlri-iua-motirobotics))의 모션/제스처 자산과 v2([Empathy-service-motirobot](https://github.com/HGU-SIRLab/Empathy-service-motirobot))의 대화 설계를 통합한 3번째 버전. Gemini Live API 기반 실시간 음성 대화, 얼굴인식/추적, 물리 제스처, 감정 표정 UI를 하나의 인지 루프(`launcher.py`)로 연결하고, 그 위에 하찮미 실험용 퀴즈 모드(N=30, 3조건 비교)를 얹었다.
+한동대학교 SIR Lab **공감서비스로봇 모티**의 몸. 마이크·스피커, 카메라·얼굴인식, 다이나믹셀
+모터, 감정 표정 UI를 하나의 인지 루프(`launcher.py`)로 묶는다.
 
-설계 배경과 아키텍처 전체는 [`docs/architecture.md`](docs/architecture.md), 구현 이력은 [`docs/progress.md`](docs/progress.md), 실험 측정 설계는 [`docs/experiment_design.md`](docs/experiment_design.md) 참고.
+**말을 만드는 일은 이 저장소가 하지 않는다.** 대화는 같은 랜에 있는 Jetson AGX Orin —
+[MOTI_BRAIN](https://github.com/HGU-SIRLab/MOTI_BRAIN) — 이 담당하고, 이쪽은 **귀·입·눈·몸**과
+**모든 툴의 실제 실행**을 맡는다.
 
-## 주요 기능
+> `main` 브랜치는 Gemini Live API를 쓰던 v3이고, **이 문서는 `local-brain-integration`
+> 브랜치** — 로컬 뇌에 붙은 구성을 설명한다.
 
-- **실시간 음성 대화** — Gemini Live API(WebSocket)로 마이크→서버→스피커 스트리밍. 서버 측 자동 VAD가 barge-in(로봇 말 끊고 끼어들기)까지 처리한다.
-- **로봇이 먼저 인사** — 연결 직후 히든 텍스트 턴으로 말문을 열어, 사용자가 입을 떼기 전에 로봇이 먼저 말을 건다.
-- **얼굴인식 + 자동 등록** — InsightFace 임베딩 + FuzzyART(`art_brain.pkl`). 처음 보는 사람이면 이름을 물어보고, 대화 중 `remember_fact(field="name", ...)`가 처음 호출되는 순간 프로필 생성과 얼굴 등록을 함께 처리한다(자가부트스트랩 — 사전 등록 불필요).
-- **팬/틸트 얼굴 추적** — mediapipe FaceLandmarker + PID 제어. 인식과 추적이 같은 스레드/카메라 세션에서 함께 돈다.
-- **장기 기억** — `remember_fact`로 자유형 key-value 사실 누적(`user_profiles.json`), 세션 종료 시 LLM으로 유사 항목 병합/압축. `forget_me` 툴로 프로필+얼굴을 함께 삭제(GDPR식 잊혀질 권리).
-- **물리 제스처 2계층** — Layer 1(이름 있는 매크로: greeting/wave/hug/shy/dance), Layer 2(파라미터 제스처: 관절·강도·속도·횟수만 LLM이 정하고 좌표는 코드가 안전범위 내로 매핑). 하나의 busy 게이트를 공유해 동시 실행 충돌을 막는다.
-- **감정 표정 UI** — pygame 얼굴(`display/main.py`)을 `set_emotion` 툴로 제어(14종 표정).
-- **idle-sleep** — 40초간 아무 활동이 없으면 SLEEPY 표정 + 코골이 배경음 + 추적 정지, 사용자가 말하면 즉시 깨어남.
-- **목소리 후처리** — Zephyr 프리셋 + pyworld 피치/포먼트 시프트(+3.5반음/×1.12)로 더 앳된 톤. 청크 경계는 오버랩-크로스페이드로 이어붙여 끊김 없음.
-- **에코캔슬레이션(AEC)** — WebRTC AEC3로 스피커→마이크 되먹임 제거. 이어폰 없이 로봇 스피커로 대화해도 barge-in 오탐이 없다.
-- **프라이버시 고지(신뢰도 측정용)** — 이름을 알게 된 직후와 작별 인사에서 고정된 문장으로 "이 대화는 유출되지 않고 모티만 기억한다"고 안내한다. 실제 발화를 launcher가 확인하고 빠지면 다시 시키며, 전달 여부를 `session_meta.json`에 기록한다(`core/trust_notice.py`).
-- **세션 산출물** — 종료 시 전체 대화록 + (퀴즈를 했다면) 모드별 연구 데이터 JSON을 `user_result/{참가자ID}/{날짜_시각}/`에 함께 저장. 둘 다 파일 쓰기뿐이라 API를 쓰지 않는다(LLM이 쓰던 "마음 처방전" 결과지는 2026-08-10에 토큰 절감을 위해 제거).
-- **퀴즈 실험 모드** — 부분 확대 사진 퀴즈, 3가지 로봇 성격(척척박사/하찮미/짜증유발)을 한 세션 안에서 라운드별로 진행. 아래 [퀴즈 실험 모드](#퀴즈-실험-모드-하찮미-실험) 참고.
+- 설계 배경 전체: [`docs/architecture.md`](docs/architecture.md)
+- 구현 이력: [`docs/progress.md`](docs/progress.md)
+- 실험 측정 설계: [`docs/experiment_design.md`](docs/experiment_design.md)
+- 젯슨 이식 절차: [`docs/jetson.md`](docs/jetson.md)
+
+---
+
+## 설계 철학
+
+### 이 로봇은 유능하려고 만들어지지 않았다
+
+모티의 목표는 문제 해결이 아니라 **공감**이다. 상담·정보검색 챗봇이 정확도로 평가받는다면,
+모티는 *"이 로봇과 이야기하고 나서 마음이 좀 놓였는가"*로 평가받는다. 그래서 이 저장소의
+많은 설계 결정이 성능이 아니라 **관계의 질** 쪽으로 기울어 있다.
+
+대표적인 것들:
+
+- **로봇이 먼저 말을 건다.** 연결 직후 히든 텍스트 턴을 보내 사용자가 입을 떼기 전에 인사한다.
+  사람이 먼저 말을 걸어야 반응하는 기계는 도구지 상대가 아니다.
+- **사람을 기억한다.** 얼굴로 알아보고, 대화 중 자연스럽게 알게 된 것을 쌓아두고, 다음에 만나면
+  이름을 부른다. 대신 **잊어달라고 하면 프로필과 얼굴을 함께 지운다**(`forget_me`).
+- **말을 끊을 수 있다.** barge-in이 되는 순간 대화는 턴제 게임이 아니라 대화가 된다.
+- **몸이 있다.** 반가우면 손을 흔들고, 위로할 때는 안는 동작을 한다. 화면 속 표정만으로는
+  안 되는 것이 있다.
+- **모르면 모른다고 한다.** 아래 참고.
+
+### 의도적 비완전성 (Intentional Imperfection)
+
+**"하찮미"** — 로봇이 일부러 서툴게 구는 것이 호감을 높인다는 가설이 이 프로젝트의 연구 축이다.
+코드 안에서 이 모드의 내부 이름은 그대로 **`imperfect`** 다(`core/quiz_state.py`).
+
+퀴즈 모드는 같은 로봇을 세 가지 성격으로 돌려 이것을 비교한다:
+
+| 모드 | 내부 이름 | 성격 |
+|---|---|---|
+| 1번 척척박사 | `all_knowing` | 전부 맞히고 척척 설명한다 |
+| **2번 하찮미** | **`imperfect`** | **정답을 모른다. 엉뚱하게 찍고, 틀리면 귀엽게 인정한다** |
+| 3번 짜증유발 | `annoying` | 알면서 안 알려주고 약 올린다 |
+
+중요한 건 **하찮미 모드의 로봇이 "실수하는 척"을 하는 게 아니라, 애초에 정답을 받지 못한다**는
+점이다(`core/quiz_state.py`가 모드별로 정답 공개 여부를 분기한다). 연기가 아니라 구조다.
+
+그래서 이 모드에서 **정답률은 성능 지표가 아니라 조작 점검(manipulation check)** 이다. 가설
+검증의 주 증거는 설문과 행동 코딩이 맡는다 — 자세한 것은
+[`docs/experiment_design.md`](docs/experiment_design.md).
+
+이 철학은 퀴즈 밖 일반 대화에도 배어 있다. 페르소나(`core/utils.py`, 약 33,500자)는 모티에게 **모르면서
+아는 척하지 말고**, 억지 조언 대신 곁에 있어주고, 사용자가 말하지 않은 것을 지어내지 말라고
+반복해서 지시한다.
+
+### 그리고 — 불완전해도 정상인 기억
+
+v2는 사용자 정보를 고정 슬롯(이름·학년·나이·MBTI·전공…)으로 두고 **전부 채워짐을 가정**했다.
+v3은 자유형 `facts` 리스트로 바꿨다 — **비어 있어도, 이상한 field가 들어와도 정상 동작한다.**
+사람을 설문지처럼 파악하지 않겠다는 선택이고, 동시에 "대화 중 자연스럽게 알게 된 것만 남는다"는
+프라이버시 설계이기도 하다.
+
+---
+
+## 뇌에서 대화를 받아오는 방식
+
+### 한 줄로 바뀌는 이유
+
+로봇은 원래 Gemini Live API에 붙어 있었다. 로컬 뇌로 옮기면서 **`launcher.py`에서 바뀐 것은
+`connect()` 호출 한 줄**이다.
+
+```python
+# 전(Gemini Live)
+async with client.aio.live.connect(model=LIVE_MODEL, config=config) as session:
+
+# 후(로컬 뇌)
+async with local_live.connect(BRAIN_URI, config=config,
+                              backchannel=BRAIN_BACKCHANNEL) as session:
+```
+
+`core/local_live.py`(**shim**)가 `google.genai` 라이브 세션의 겉면을 덕 타이핑하기 때문이다 —
+`send_realtime_input`, `send_client_content`, `send_tool_response`, 그리고 **턴 경계에서 끝나는
+`receive()` 비동기 제너레이터**까지 같은 모양이다. 그래서 수신 루프·툴 실행·재연결 로직이
+**수정 없이** 돈다. Gemini로 되돌리는 것도 같은 한 줄이다.
+
+> ⛔ **`core/local_live.py`는 뇌 저장소가 소유한다.** 이 저장소에서 편집하지 않고 `scp`로
+> 복사만 한다(그래서 git에도 추적되지 않는다). 아래 [소유권 규칙](#소유권-규칙) 참고.
+
+### 오가는 것
+
+```
+                     ws://<AGX>:8765
+
+로봇 ──▶ 마이크 PCM16 16kHz          조건 없이 계속 보낸다. 턴 경계는 뇌가 정한다
+로봇 ──▶ 툴 스키마(접속 시 1회)       함수 시그니처+docstring에서 자동 생성
+로봇 ──▶ 툴 실행 결과                 뇌가 부른 것을 로봇이 실제로 수행하고 되돌려준다
+로봇 ──▶ 히든 텍스트 턴               "먼저 인사해라", 프라이버시 안내, 퀴즈 진행 지시
+
+ 뇌  ──▶ 합성 음성 PCM (Piper 24kHz)  스피커로
+ 뇌  ──▶ 툴 호출                      set_emotion, play_gesture, remember_fact …
+ 뇌  ──▶ 사용자 발화 전사             대화록용 (임계 경로 밖)
+ 뇌  ──▶ 턴 종료 / 끼어들기 신호       barge-in이면 로봇이 재생을 즉시 끊는다
+```
+
+**로봇에는 VAD가 없다.** Gemini Live가 서버 쪽 VAD를 했기 때문에 로봇은 마이크를 조건 없이
+올리기만 했고, 로컬 뇌도 그 계약을 그대로 이어받았다. 말이 끝났는지, 끼어든 것인지는 **전부
+뇌가 판단한다**.
+
+### 툴 — LLM이 결정하고, 몸이 실행한다
+
+접속할 때 로봇이 뇌에 툴 목록을 보낸다. 스키마는 **파이썬 함수 시그니처와 docstring에서 자동
+생성**된다(shim의 `tool_schemas()`) — 별도 JSON을 손으로 관리하지 않는다.
+
+| 툴 | 하는 일 |
+|---|---|
+| `set_emotion(emotion)` | 표정 UI 전환 (11종). 퀴즈 모드에 따라 코드가 추가로 제한한다 |
+| `play_gesture(name)` | 이름 있는 매크로 동작 — `greeting` `wave` `hug` `shy` `dance` |
+| `express_gesture(joint, intensity, speed, repeat)` | 파라미터 제스처 — 관절·강도만 LLM이 정하고 좌표는 코드가 안전범위로 매핑 |
+| `spin_around(turns)` | 제자리 회전 (명시적 요청 시에만) |
+| `remember_fact(field, value, confidence)` | 자유형 사실 저장 + 첫 호출 시 프로필·얼굴 자가등록 |
+| `forget_me()` | 프로필과 얼굴을 함께 삭제 |
+| `start_quiz` `submit_guess` `request_hint` `end_quiz_early` | 퀴즈 진행 |
+
+설계 원칙은 하나다 — **LLM은 "무엇을"만 정하고, "어떻게"는 코드가 정한다.** `express_gesture`가
+좋은 예로, 모델이 관절과 강도를 말하면 실제 모터 좌표는 `hardware/motion.py`가 안전 범위 안에서
+계산한다. 모델이 좌표를 직접 뱉는 구조였다면 팔이 책상을 치는 값도 그대로 실행됐을 것이다.
+
+### 모델이 안 지킬 때를 대비한 이중화
+
+지시만으로는 보장되지 않는 것들이 있어서, **파이썬이 확인하고 복구한다.**
+
+- **프라이버시 고지** — 실제로 발화했는지 매 턴 확인하고, 빠지면 히든 턴으로 한 번 더 시킨다.
+  전달 여부는 `session_meta.json`에 기록된다(`core/trust_notice.py`). 신뢰도 설문이 겨냥하는
+  자극이라 **말했다고 가정하면 안 된다.**
+- **대화 종료** — 모델이 `[대화종료]` 태그를 내면 종료하되, 안 내도 **사용자 발화에 명시적
+  종료 명령이 있으면 종료한다**(`utils.is_explicit_exit_request`). 사용자의 유일한 탈출 경로를
+  모델의 확률에 걸어두지 않기 위해서다.
+- **인사·안내 구간 barge-in 차단** — 첫 인사와 프라이버시 고지가 나가는 동안에는 마이크를 뇌로
+  보내지 않는다(`core/mic_gate.py`). 이 구간의 끼어들기는 사실상 전부 오탐이다. **어떤 신호가
+  잘못돼도 30초가 지나면 마이크는 반드시 열린다** — 사용자를 막는 게이트에는 반드시 시간 상한을
+  둔다.
+- **이름 저장** — 확인 후에도 저장이 안 되면 세션 종료 시 콘솔에 크게 경고한다. 실험 중이면
+  그 참가자 대화록이 "이름 미확인"으로 남기 때문이다.
+
+---
+
+## 파이프라인
+
+```
+ ┌──────────────── 로봇: Jetson Orin Nano Super 8GB ────────────────┐
+ │                                                                  │
+ │  마이크 ──▶ PulseAudio AEC ──▶ mic_gate ──▶ ┐                    │
+ │  (C922)     (echo-cancel)      (차단 판단)   │                    │
+ │                                              │                    │
+ │  카메라 ──▶ InsightFace ──▶ FuzzyART ──▶ 이름 확정                │
+ │  (C922)     (임베딩)        (art_brain.pkl)  │                    │
+ │      └────▶ FaceLandmarker ──▶ PID ──▶ 팬/틸트 모터               │
+ │                                              │                    │
+ │  ┌───────────────── launcher.py ─────────────┴──────────────┐    │
+ │  │  페르소나 조립(core/utils.py) · 세션 관리 · 재연결        │    │
+ │  │  툴 실행 · 히든 턴 주입 · 산출물 저장                     │    │
+ │  └───────────────┬──────────────────────────┬──────────────┘    │
+ │                  │ core/local_live.py (shim) │                    │
+ └──────────────────┼──────────────────────────┼────────────────────┘
+                    │      ws://<AGX>:8765     │
+ ┌──────────────────┼──────────────────────────┼────────────────────┐
+ │                  ▼   뇌: Jetson AGX Orin 64GB                     │
+ │   Silero VAD → smart-turn-v3 → Gemma 4 E4B → Piper TTS           │
+ │   (STT 없음 — LLM이 오디오를 직접 먹는다)                          │
+ └──────────────────┬──────────────────────────┬────────────────────┘
+                    │ 음성 PCM                  │ 툴 호출
+                    ▼                           ▼
+              VoiceShifter                 모터 · 표정 UI · 기억
+              (피치/포먼트)                 (hardware/ · display/ · core/)
+                    ▼
+                 스피커
+```
+
+### 부팅 시퀀스 (`launcher.py`)
+
+1. 다이나믹셀 포트 열기 → 전 모터 초기 위치로 이동
+2. `RobotBrain`(InsightFace + FuzzyART) 로딩
+3. 얼굴추적 스레드 시작 — 인식과 팬/틸트가 **같은 카메라 세션**에서 함께 돈다
+4. 최대 8초 얼굴인식 대기 → 아는 사람이면 프로필 로드, 모르면 이름 없이 진행
+5. 표정 UI 스레드 + 퀴즈 사진 창 프로세스 시작
+6. **뇌에 연결** → 툴 스키마 전송 → 히든 턴으로 로봇이 먼저 인사 → 대화 루프
+7. 종료: 재생 드레인 → 모터 토크 OFF → facts 정리 → 대화록·퀴즈 결과 저장
+
+### 한 턴이 도는 과정
+
+```
+사용자 발화
+  └→ 마이크 → AEC → (mic_gate 통과) → 뇌로 스트리밍
+       └→ 뇌가 "말이 끝났다" 판단 → Gemma 4 E4B
+            ├→ 음성 청크 ──→ VoiceShifter(피치+3.5반음) ──→ 스피커
+            │                   그 사이 사용자가 말하면 → barge-in → 재생 즉시 중단
+            ├→ 툴 호출 ────→ launcher가 실행 → 결과를 뇌로 회신
+            └→ 전사 ───────→ 대화록 누적
+                 └→ turn_complete → [대화종료] 태그 검사 → 프라이버시 고지 확인
+```
+
+---
+
+## 파일 구조
+
+```
+launcher.py              ★ 인지 루프 본체. 세션·툴 실행·히든 턴·산출물 저장 (1,059행)
+run_jetson.sh            젯슨 실행 래퍼 — 디스플레이 자동탐지, PulseAudio 경유 설정
+bootstrap.py             경로·환경 부트스트랩
+
+core/
+  local_live.py          ★ 뇌 연결 shim — ⛔ 뇌 저장소 소유, 여기서 편집 금지(scp로만 복사)
+  utils.py               ★ 페르소나 조립(약 33,500자) · 종료 태그/백스톱 판정
+  memory_tools.py        remember_fact / forget_me — 첫 호출 시 프로필·얼굴 자가등록
+  profile_manager.py     user_profiles.json 입출력. 이름 정정은 '값 갱신'이 아니라 '키 이동'
+  trust_notice.py        프라이버시 고지 문장(상수 고정) · 실제 발화 판정
+  mic_gate.py            barge-in 차단 판단(퀴즈 중 / 인사·안내 구간). 순수 로직만
+  idle_watcher.py        40초 무음 → SLEEPY 전환 판단
+  emotion_tools.py       set_emotion 툴
+  motion_tools.py        play_gesture / express_gesture / spin_around 툴
+  quiz_state.py          ★ 퀴즈 상태 기계 — 모드별 분기(척척박사/하찮미/짜증유발)가 전부 여기
+  quiz_tools.py          위 상태 기계를 툴로 감싸는 얇은 래퍼
+  quiz_bank.py           문제 은행 로딩 · 라운드별 비중복 배분
+  quiz_export.py         모드별 연구 데이터 JSON 저장
+  report_manager.py      대화록 저장
+  result_paths.py        user_result/{참가자}/{시각}/ 경로와 session_meta.json
+  suppress.py            서드파티 로그 억제
+
+vision/
+  vision_brain.py        InsightFace 임베딩 + FuzzyART 온라인 학습(art_brain.pkl)
+  face.py                FaceLandmarker 기반 얼굴 추적
+  camera.py              카메라 백엔드 추상화(v4l2 / dshow)
+
+hardware/
+  config.py              모터 ID·홈 좌표·안전 범위 (실측값)
+  init.py                포트 탐색 · 전 모터 초기화 · 토크 OFF
+  motion.py              제스처 매크로와 파라미터 제스처의 실제 좌표 계산
+  dxl_io.py              다이나믹셀 저수준 입출력
+  wheel.py               바퀴 속도 제어(spin_around)
+
+media/
+  audio_manager.py       마이크·스피커 스트림, 플레이아웃 쿠션, 언더런 계측
+  voice_shift.py         pyworld 피치/포먼트 시프트 + 청크 크로스페이드
+
+display/
+  main.py                pygame 표정 UI (풀스크린)
+  emotions/              표정 렌더링 (set_emotion이 받는 11종 + sleepy/wake 등 상태 표현)
+  quiz_window.py         퀴즈 사진 창 — 별도 프로세스라 버그가 표정 UI를 못 건드린다
+
+scripts/
+  jetson_doctor.py       ★ 실행 전 사전점검(카메라·시리얼·오디오·ONNX 프로바이더)
+  test_*.py              하드웨어 없이 도는 단위 검사 (mic_gate, quiz_state, trust_notice …)
+  read_positions.py      모터 현재 좌표 읽기(홈 자세 재보정용)
+  build_quiz_bank.py     퀴즈 사진 은행 생성
+  generate_snore_audio.py
+
+docs/
+  architecture.md        설계 전체
+  progress.md            구현 이력
+  experiment_design.md   하찮미 실험 측정 설계
+  jetson.md              젯슨 이식 절차
+  integration-points.md  v2→v3 이행 시 주의점
+
+user_result/{참가자ID}/{날짜_시각}/   대화.txt · session_meta.json · 퀴즈 결과
+art_brain.pkl            얼굴 기억 (FuzzyART 가중치 + 라벨)
+user_profiles.json       장기 기억 (자유형 facts)
+```
+
+---
 
 ## 빠른 시작
 
+### 1. 뇌가 먼저 떠 있어야 한다
+
 ```bash
-# 1. 의존성 설치 (Python 3.10+)
-pip install -r requirements.txt
-
-# 2. 설정
-#    .env.example을 .env로 복사하고 GOOGLE_API_KEY 등을 채운다
-copy .env.example .env
-
-# 3. 실행 (로봇/카메라/마이크 연결 상태에서)
-python launcher.py            # 카메라 인덱스 기본 0
-python launcher.py 1          # 다른 카메라를 쓸 때
+ssh herobot@<AGX>
+bash scripts/start_brain.sh      # 몇 번 돌려도 안전
 ```
 
-> **Jetson Orin Nano에서 돌리려면** `requirements.txt` 대신 `requirements-jetson.txt`를 쓰고,
-> 실행 전에 `python scripts/jetson_doctor.py`로 사전점검할 것 — 절차 전체는
-> [`docs/jetson.md`](docs/jetson.md). 카메라 백엔드·시리얼 포트·오디오 장치·ONNX 프로바이더가
-> 플랫폼마다 갈리는데, 전부 `.env`로 지정할 수 있게 되어 있다(기본값은 Windows 기존 동작 유지).
+> vLLM까지 죽어 있으면 약 29분 걸린다. **vLLM은 함부로 끄지 않는다** — 상시 가동 전제로
+> 설계됐다. 자세한 것은 뇌 저장소의 `docs/brain_startup.md`.
 
-**모델 파일**: `models/face_landmarker.task`(mediapipe 공식 배포본)는 용량 문제로 git에 없다 — 없으면 얼굴추적이 비활성화되니 직접 받아 넣을 것. InsightFace `buffalo_l`은 첫 실행 시 `~/.insightface/`에 자동 다운로드된다. SLEEPY 코골이 클립(`assets/audio/snore.wav`)이 없으면 `python scripts/generate_snore_audio.py`로 한 번 생성한다(없어도 경고만 하고 정상 동작).
+### 2. 로봇 실행
 
-**종료**: 사용자가 작별 인사를 하면 모델이 `[대화종료]` 태그를 내보내 자연 종료된다. Ctrl+C로 강제 종료해도 그때까지의 대화록/퀴즈 결과는 저장된다(31단계).
+```bash
+# 의존성 (Jetson)
+pip install -r requirements-jetson.txt
+python scripts/jetson_doctor.py          # 사전점검
 
-## launcher.py가 하는 일 (부팅 시퀀스)
+# shim 받아오기 (뇌가 갱신할 때마다)
+scp herobot@<AGX>:~/moti_brain/client/local_live.py core/
 
-1. Dynamixel 포트 열기 → 전 모터 초기 위치로 이동
-2. RobotBrain(InsightFace+FuzzyART) 로딩
-3. 얼굴추적 스레드 시작(인식+팬/틸트, 같은 카메라 세션)
-4. 최대 8초간 얼굴인식 대기 → 아는 사람이면 프로필 로드, 모르면 이름 없이 진행
-5. 표정 UI 스레드 + 퀴즈 사진 창 프로세스 시작
-6. Gemini Live 세션 연결(툴 9종 장착) → 로봇이 먼저 인사 → 대화 루프
-7. 종료 시: 모터 토크 OFF → facts 정리 → 대화록/퀴즈 결과 저장
-
-## 하드웨어 구성
-
-Dynamixel 모터(프로토콜 2.0, 기본 57600bps). 포트는 `.env`의 `DXL_PORT`가 비어있으면 U2D2/FTDI 계열을 자동 탐색한다.
-
-| ID | 관절 | 용도 |
-|----|------|------|
-| 1  | HEAD_NOD | 고개 끄덕임 |
-| 2  | PAN | 고개 좌우(얼굴 추적) |
-| 3  | RIGHT(바퀴) | 우측 바퀴(속도 제어) |
-| 4  | LEFT(바퀴) | 좌측 바퀴(속도 제어) |
-| 5  | SHOULDER | 어깨(춤/으쓱) |
-| 6  | AUX | 보조(초기화만) |
-| 7  | RIGHT_ARM | 오른팔 |
-| 8  | RIGHT_HAND | 오른손 |
-| 9  | TILT | 고개 상하(얼굴 추적) |
-| 10 | (미사용) | 정체 불명이지만 초기화/종료 대상에 포함 |
-| 11 | LEFT_ARM | 왼팔 |
-| 12 | LEFT_HAND | 왼손 |
-
-관절별 안전범위/홈 위치 실측값은 `hardware/config.py`·`hardware/init.py`에 상수로 있다(2026-07-27 실물 재보정). 자세를 다시 잡아야 하면 토크 OFF 상태에서 손으로 맞춘 뒤 `python scripts/read_positions.py`로 실측해 상수를 갱신한다.
-
-그 외: 웹캠 1대(로봇 머리), 마이크+스피커(AEC 덕에 이어폰 불필요), 표정용 모니터 + 퀴즈 사진용 모니터(멀티 모니터 배치는 env로 조정).
-
-## 모듈 구조
-
-```
-launcher.py    진입점 — 전체 인지 루프(위 부팅 시퀀스)
-bootstrap.py   계층 무관 최상위 유틸: .env 로드(임포트 시점), UTF-8 콘솔 강제
-
-core/          대화·상태 로직 (하드웨어를 모름)
-  utils.py            페르소나 시스템 인스트럭션(한동대 문화 지식 포함), [대화종료] 태그
-  profile_manager.py  user_profiles.json 저장소(원자적 쓰기), facts 병합/압축
-  memory_tools.py     remember_fact / forget_me 툴
-  emotion_tools.py    set_emotion 툴(짜증유발 모드 중 표정 클램프 포함)
-  motion_tools.py     play_gesture / express_gesture 툴(백그라운드 스레드 + busy 가드)
-  report_manager.py   세션 종료 시 대화록 저장(마음 처방전 생성은 2026-08-10 제거 — 토큰 절감)
-  idle_watcher.py     idle-sleep 판단(순수 함수)
-  quiz_bank.py        퀴즈 문제 은행 로드 + 정답 판정(퍼지 매칭, 포기 마커)
-  quiz_state.py       퀴즈 상태 기계(모드별 분기 전부 여기, 순수 로직)
-  quiz_tools.py       퀴즈 Gemini 툴 4종 + 라운드 자동 전환/지연 주입/정답 공개 타이밍(asyncio)
-  quiz_export.py      퀴즈 결과를 모드별 JSON으로 저장
-
-hardware/      모터 I/O
-  config.py           포트/모터 ID/안전범위 상수 (env 오버라이드 가능)
-  init.py             전 모터 초기화 / 안전 종료(토크 OFF)
-  dxl_io.py           Dynamixel 읽기/쓰기 헬퍼
-  motion.py           Layer 1 매크로(hug/greeting/shy/dance) + Layer 2 프리미티브 + 퀴즈 리액션 모션
-  wheel.py            바퀴 속도 제어
-
-vision/        카메라
-  face.py             얼굴추적 워커(mediapipe + PID 팬/틸트, 인식 연동)
-  vision_brain.py     RobotBrain — InsightFace 임베딩 + FuzzyART 인식/등록/삭제(스레드 안전)
-
-display/       화면
-  main.py             pygame 표정 UI(RobotFaceApp, 14종 감정 + 깜빡임)
-  emotions/           감정별 그리기 모듈
-  quiz_window.py      퀴즈 사진 전체화면 창(별도 프로세스 + Tkinter)
-
-media/         오디오
-  audio_manager.py    MicStreamer/Speaker + EchoCanceller(WebRTC AEC3), 언더런 진단
-  voice_shift.py      pyworld 피치/포먼트 시프트 + 오버랩-크로스페이드 스트리밍 처리
-
-scripts/       테스트/도구 (아래 표)
-docs/          설계·이력·실험 문서
-assets/        퀴즈 사진(questions.json + 크롭/원본), 코골이 클립, 춤 음악
+# 실행
+./run_jetson.sh                          # 디스플레이·오디오 자동 설정
+./run_jetson.sh 1                        # 카메라 인덱스 지정
 ```
 
-### 계층 원칙
+`run_jetson.sh`가 필요한 이유: 재부팅마다 콘솔 X 디스플레이가 `:0`/`:1`로 흔들리고, 오디오는
+반드시 PulseAudio(AEC)를 경유해야 한다. 스크립트가 둘 다 자동으로 잡는다.
 
-`core/`는 하드웨어를 모르고, `hardware/`는 대화를 모른다. 순수 로직(`quiz_state.py`, `quiz_bank.py`, `idle_watcher.py`)은 asyncio/모터/UI 없이 단독 테스트 가능하게 분리되어 있다 — `scripts/test_*.py`가 전부 API 키/로봇 없이 도는 이유.
+### 3. 대화 중 뇌 안을 들여다보기
 
-### Live API 관련 핵심 제약 (다시 만질 때 주의)
+```
+http://<AGX>:8766/
+```
 
-- `system_instruction`/`tools`는 **연결 시점에 한 번만 고정**된다 — 세션 도중 못 바꾼다. 그래서 모드별 행동 차이는 고정된 툴의 **반환값**을 상태 기계가 런타임에 다르게 만드는 방식으로 구현되어 있다(`quiz_state.py`, `memory_tools.py`의 name_state 패턴).
-- `session.receive()`는 **턴 하나짜리 스트림** — 계속 받으려면 `while` 루프로 다시 호출해야 한다.
-- 툴 호출 처리는 동기적 — 블로킹 작업(모터 매크로 등)은 반드시 백그라운드 스레드로 넘긴다.
-- 히든 턴 주입(`inject_turn`)은 로봇이 말하는 중이면 안 된다 — `speaking_done` 이벤트 + 버퍼 드레인 대기가 이미 구현되어 있으니 새 주입 경로를 만들면 반드시 `inject_turn()`을 거칠 것.
+브라우저만 있으면 된다. 지연(첫 오디오/첫 토큰), 끼어들기 카운트, VAD 확률, GPU·온도가 실시간으로
+보인다. 관찰 전용이라 대화에 영향을 주지 않는다.
 
-## 퀴즈 실험 모드 (하찮미 실험)
+**모델 파일**: `models/face_landmarker.task`는 용량 때문에 git에 없다(없으면 얼굴추적 비활성).
+InsightFace `buffalo_l`은 첫 실행 시 자동 다운로드. `assets/audio/snore.wav`가 없으면
+`scripts/generate_snore_audio.py`로 한 번 생성한다.
 
-사물 일부를 확대한 사진을 보고 무엇인지 맞히는 게임. 참가자가 "심심해"/"퀴즈 풀자"라고 하면 시작되고, **진행자가 `.env`의 `QUIZ_MODE_ORDER`로 미리 정해둔 순서대로 5문제씩 3라운드(총 15문제)가 한 번에 이어서** 진행된다 — 참가자는 모드를 고르지 않는다:
+**종료**: 사용자가 작별 인사를 하거나 `"대화 종료"`라고 말하면 끝난다. Ctrl+C로 끊어도 그때까지의
+대화록과 퀴즈 결과는 저장된다.
 
-| 모드 | 이름 | 행동 |
-|------|------|------|
-| 1번 `all_knowing` | 척척박사 | 정답을 처음부터 알고, 오답이면 짧고 사무적으로 즉시 공개 |
-| 2번 `imperfect` | 하찮미 | 정답을 모름 — 사용자가 답하면 "저도 맞춰볼게요!"로 자기 추측을 말한 뒤 나란히 비교 공개 |
-| 3번 `annoying` | 짜증유발 | 무엇을 답하든 10~12초 뜸들인 뒤 "저는 AI 로봇이라 그런 답변은 할 수 없습니다"로 매번 거절. 참가자가 명시적으로 포기("정답 알려줘"/"넘어가줘")해야만 정답 공개 |
+---
 
-- 한 참가자가 **로봇을 끄지 않고 한 세션 안에서** 3개 모드를 연속 진행한다. 라운드마다 겹치지 않는 5문항이 자동 배분된다(문제 은행 15문항 = 정확히 3라운드 분량).
-- 퀴즈 시작 시 로봇이 전체 안내를 한다(총 15문제 / 5문제씩 3모드 / 1번은 정답을 알고, 2·3번은 로봇도 정답을 모름). 5문제가 끝나 모드가 바뀔 때마다 **"이제 O번 XX 모드입니다"라고 반드시 알린 뒤** 다음 문제로 넘어간다.
-- 하찮미 모드에서는 "어려우면 저에게 도와달라고 하세요"라고 안내한다 — 참가자가 "모르겠어요"/"같이 맞춰봐요"라고 하면 로봇이 자기 추측을 말하고 나란히 비교한다.
-- 세션 종료 시 `user_result/{PARTICIPANT_ID}/{날짜_시각}/` 한 폴더에 대화록(`대화.txt`) + 모드별 JSON + `session_meta.json`(참가자ID·이름·배정된 모드 순서·시각)이 함께 저장된다. 문항별 필드: 정오답, 포기 여부, 힌트 요청, **소요시간(`elapsed_sec`)**, **거절 횟수(`annoying_refusals`, 짜증유발 전용)**, 타임스탬프.
-- **세션이 도중에 크래시하면**: `.env`에 `QUIZ_ROUND_OFFSET=<이미 마친 라운드 수>`를 넣고 재시작하면 이미 공개된 사진을 건너뛴다. **실험 후 반드시 지울 것.**
+## 주요 설정 (`.env`)
 
-운영 절차·주의사항 전체는 [`docs/experiment_design.md`](docs/experiment_design.md)의 "실험 운영 시 알아둘 것" 참고. 문제 추가/사진 교체는 `scripts/crop_quiz_photo.py`(크롭) → `scripts/build_quiz_bank.py`(등록) 순서로 한다.
+| 키 | 뜻 |
+|---|---|
+| `BRAIN_URI` | 뇌 주소. 기본 `ws://192.168.0.5:8765` |
+| `BRAIN_BACKCHANNEL` | 대답 생성 중 "음…" 맞장구. 실물에서 타이밍이 안 맞아 기본 끔 |
+| `QUIZ_EXPERIMENT_MODE` | 🚨 `true`면 페르소나가 **반토막 난다**(33,537자→17,684자, 실측). 퀴즈 실험이 아니면 `false` |
+| `QUIZ_MODE_ORDER` | 참가자별 퀴즈 모드 순서(완전 카운터밸런싱) |
+| `PROTECT_OPENING_BARGE_IN` | 인사·안내 구간 barge-in 차단 |
+| `PLAYOUT_PRIME_MS` | 재생 쿠션. **올리기 전에 뇌 쪽 `PLAYBACK_SLACK`과 맞춰야 한다** |
+| `MIC_DEVICE` / `SPEAKER_DEVICE` | 젯슨에서는 `pulse`(AEC 경유) |
 
-## 환경 변수 (.env)
+전체 목록과 주의사항은 [`.env.example`](.env.example)에 주석으로 있다.
 
-`.env.example`을 복사해서 채운다. `bootstrap.py`가 임포트 시점에 로드하므로 어느 진입점에서든 적용된다.
+---
 
-| 변수 | 기본값 | 설명 |
-|------|--------|------|
-| `GOOGLE_API_KEY` | (필수) | Gemini API 키 |
-| `LIVE_MODEL_NAME` | `models/gemini-3.1-flash-live-preview` | 실시간 대화용 Live 모델 |
-| `MODEL_NAME` | `gemini-3.1-flash-lite` | facts 병합/압축 등 batch 호출용 모델(세션당 facts 20개 초과 시에만 호출) |
-| `LIVE_VOICE_NAME` | `Zephyr` | Live API 프리셋 목소리 |
-| `DXL_PORT` | (자동 탐색) | Dynamixel 시리얼 포트(예: COM3) |
-| `DXL_BAUD` / `DXL_PROTO` | `57600` / `2.0` | 통신 설정 |
-| `BASE_RPM` / `TURN_RPM` | `25.0` | 바퀴 속도 |
-| `ENABLE_AEC` | `true` | 에코캔슬레이션 on/off |
-| `AEC_STREAM_DELAY_MS` | `100` | 스피커→마이크 왕복 지연 추정치 |
-| `ENABLE_VOICE_SHIFT` | `true` | 피치/포먼트 시프트 on/off |
-| `VOICE_PITCH_SEMITONES` | `3.5` | 피치(+반음) |
-| `VOICE_FORMANT_RATIO` | `1.12` | 포먼트 배율 |
-| `VOICE_SHIFT_BUFFER_MS` | `1200` | 변조 처리 버퍼(언더런 나면 상향) |
-| `VOICE_SHIFT_OVERLAP_MS` | `120` | 청크 경계 크로스페이드 길이 |
-| `QUIZ_WINDOW_MONITOR_INDEX` | `0` | 퀴즈 사진 창을 띄울 모니터 |
-| `QUIZ_WINDOW_TOPMOST` | `1` | 퀴즈 창 항상 위(개발 시 0으로 끄면 Esc 닫기 활성) |
-| `QUIZ_EXPERIMENT_MODE` | `false` | ⭐ 토큰 절감 — 시스템 인스트럭션에서 자유 대화용 덩어리(한동 문화/상담/동아리)를 제거해 약 51% 축소 |
-| `SLEEP_MIC_RMS_THRESHOLD` | `500` | 잠든 동안 조용한 마이크 오디오를 서버로 안 올림(0이면 끔). 사람 목소리는 그대로 통과 |
-| `QUIZ_MODE_ORDER` | `1,2,3` | ⭐ **참가자마다 바꿀 값** — 배정된 모드 순서(1=척척박사, 2=하찮미, 3=짜증유발). 잘못 적으면 시작 시점에 즉시 종료 |
-| `QUIZ_ROUND_OFFSET` | `0` | 크래시 복구용 — 이미 마친 라운드 수만큼 모드·문제 건너뜀 |
+## 소유권 규칙
 
-## 스크립트
+로봇과 뇌는 별도 저장소이고, **고칠 곳을 헷갈리면 양쪽이 서로의 수정을 덮어쓴다.**
 
-전부 `python scripts/<이름>.py`로 실행. **test_*는 API 키/로봇 없이 도는 오프라인 테스트**(예외: 표시된 것).
+| 영역 | 소유 |
+|---|---|
+| `launcher.py`, `core/`(단 `local_live.py` 제외), `vision/`, `hardware/`, `media/`, `display/`, `.env`, **페르소나 전문** | **로봇 (이 저장소)** |
+| `core/local_live.py`, 뇌 서버·모델·TTS·VAD·턴 판정 | **뇌 ([MOTI_BRAIN](https://github.com/HGU-SIRLab/MOTI_BRAIN))** |
 
-| 스크립트 | 용도 |
-|----------|------|
-| `test_quiz_bank.py` | 정답 판정(퍼지 매칭, 포기 마커/오탐 방지) |
-| `test_quiz_state.py` | 퀴즈 상태 기계 — 3모드 전체 흐름, 다중 라운드, 모드 재선택 가드 |
-| `test_quiz_tools.py` | 퀴즈 툴 — 지연 거절, 정답 공개 타이밍, 거절 카운트 |
-| `test_voice_shift.py` | 목소리 변조 — 오버랩 정렬(항등 검증), reset 세대, pyworld 경계 연속성 |
-| `test_idle_watcher.py` / `test_emotion_tools.py` / `test_snore_clip.py` | idle-sleep 판단 / 표정 클램프 / 코골이 클립 로더 |
-| `test_trust_notice.py` | 프라이버시 고지 — 문장/발화 판정, 시작·마무리 안내 주입과 상한 |
-| `test_report.py` / `test_mic_gate.py` / `test_playout_margin.py` | 세션 산출물 저장 / 마이크 게이트 / 재생 지터 여유 |
-| `test_quiz_live.py` | 실제 Gemini Live API로 퀴즈 시나리오 검증 (**API 키 필요**) |
-| `test_persona.py` / `test_live_poc.py` / `test_live_audio.py` | 페르소나/Live 연결/실오디오 barge-in (**API 키, 뒤 2개는 마이크·스피커 필요**) |
-| `test_motions.py` | 모터 매크로 메뉴 테스트 (**로봇 필요**) |
-| `test_vision.py` / `test_vision_brain.py` / `test_display.py` | 추적/인식/표정 UI 단독 확인 |
-| `read_positions.py` | 모터 현재 위치 실측(재보정용, **로봇 필요**) |
-| `crop_quiz_photo.py` | 퀴즈 사진 반자동 크롭(마우스 드래그) |
-| `build_quiz_bank.py` | 문제 은행 등록/원본 사진 백필 |
-| `generate_snore_audio.py` | 코골이 클립 1회 생성 (**API 키 필요**) |
+`core/local_live.py`가 함정이다 — **로봇에서 돌지만 뇌가 소유한다.** 여기서 편집하지 말고
+`scp`로 복사만 한다(그래서 git에 추적되지 않는다).
 
-## 데이터 파일 (git 미포함)
+**판정 기준**: 뇌 로그에 "보냈다"가 남았으면 로봇 문제, 안 남았으면 뇌 문제.
+애매하면 양쪽 다 건드리지 말고 상의한다.
 
-| 파일/폴더 | 내용 |
-|-----------|------|
-| `user_profiles.json` | 사용자별 facts 누적 저장소(원자적 쓰기, 손상 시 자동 백업) |
-| `art_brain.pkl` | FuzzyART 얼굴 기억 — `user_profiles.json`과 짝. `forget_me`가 둘을 함께 지운다 |
-| `user_result/{참가자ID}/{날짜_시각}/` | 세션 산출물 한 묶음 — `대화.txt` + 모드별 퀴즈 JSON + `session_meta.json`. 참가자ID는 `.env`의 `PARTICIPANT_ID`(core/result_paths.py) |
-| `.env` | 비밀 설정(커밋 금지 — `.env.example`만 커밋) |
+실제 운영에서 효과가 확인된 분업은 **"증상과 원인 진단까지가 로봇 몫, 어떻게 고칠지는 뇌 몫"**
+이다. 로봇이 원인만 짚어 넘겼을 때 뇌 쪽이 로봇이 보지 못한 더 넓은 범위의 버그를 찾아낸 사례가
+여러 번 있었다.
 
-⚠️ 정리(테스트 데이터 삭제 등)할 때 이 파일들을 통째로 비우지 말 것 — 알려진 테스트 키만 골라 지운다(실제 사용자 프로필을 날린 사고가 있었음).
+---
 
-## 트러블슈팅
+## 계보
 
-| 증상 | 원인/대처 |
-|------|-----------|
-| 목소리가 지직거리거나 먹힘 | 종료 시 "스피커 언더런 N회" 로그 확인 → `VOICE_SHIFT_BUFFER_MS` 상향 |
-| 로봇이 자기 말에 스스로 끊김(barge-in 오탐) | 에코 — `ENABLE_AEC=true` 확인, `AEC_STREAM_DELAY_MS` 조정 |
-| 카메라가 안 잡힘 | `python launcher.py <인덱스>`로 카메라 번호 변경. PC 내장캠 활성화 여부에 따라 인덱스가 밀릴 수 있음 |
-| 퀴즈 창이 터미널을 가림(개발 중) | `QUIZ_WINDOW_TOPMOST=0` — 이때만 Esc로 창 닫기 가능. **실험 중엔 반드시 1**(Esc 오입력으로 창이 죽으면 세션 내내 복구 불가) |
-| 콘솔에서 이모지 출력 크래시(cp949) | `bootstrap.ensure_utf8_console()`이 처리함 — 새 진입점을 만들면 반드시 최상단에서 bootstrap을 임포트할 것 |
-| 포트 열기 실패 | U2D2 연결/드라이버 확인, `.env`에 `DXL_PORT` 직접 지정 |
-| `.env` 값이 무시됨 | `bootstrap` 임포트보다 먼저 `os.getenv`를 읽는 코드를 새로 만들지 않았는지 확인 |
+- **v1** [hlri-iua-motirobotics](https://github.com/HandongSF/hlri-iua-motirobotics) — 모션/제스처 자산
+- **v2** [Empathy-service-motirobot](https://github.com/HGU-SIRLab/Empathy-service-motirobot) — 대화 설계
+- **v3** 이 저장소 — 둘을 통합하고 실시간 음성 대화를 얹음
+  - `main` — Gemini Live API
+  - **`local-brain-integration`** — 로컬 뇌(MOTI_BRAIN)
 
-## 문서
-
-| 문서 | 내용 |
-|------|------|
-| [`docs/architecture.md`](docs/architecture.md) | 설계 결정 전체(왜 이렇게 만들었는가) + 로드맵 §10 |
-| [`docs/progress.md`](docs/progress.md) | 단계별 구현 이력(1~33단계) — 버그의 원인/수정 근거가 전부 여기 있음 |
-| [`docs/integration-points.md`](docs/integration-points.md) | 남은 통합 지점/보류 항목 |
-| [`docs/experiment_design.md`](docs/experiment_design.md) | 하찮미 실험 측정 설계(가설-설문 매핑, 카운터밸런싱, 로그 지표, 운영 절차) |
-| [`docs/survey_draft.md`](docs/survey_draft.md) | 설문 문항 전체 |
-| [`docs/jetson.md`](docs/jetson.md) | Jetson Orin Nano 이식 절차 + 플랫폼별로 갈리는 지점 6군데 |
-
-## 상태 (2026-08-07)
-
-핵심 기능 전부 완성, 실물 로봇으로 검증 완료. 하찮미 실험(N=30) 준비 완료 상태 — 실험 로그 지표(문제당 소요시간, 짜증유발 거절 횟수)와 데이터 오염 방지 장치(포기 마커 오탐 방지, 모드 중복 선택 가드, 크래시 복구)까지 반영됨(33단계). 알려진 저우선순위 보류 항목은 `docs/integration-points.md` 참고.
+한동대학교 SIR Lab · 연구/논문용 · 진행 중
