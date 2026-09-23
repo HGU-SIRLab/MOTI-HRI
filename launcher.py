@@ -998,6 +998,16 @@ def main():
         port.closePort()
 
         final_name = name_state["name"]
+        if final_name is None and session_history:
+            # 대화는 했는데 이름이 끝내 저장되지 않은 경우. 페르소나는 확인 후 remember_fact를
+            # 부르라고 하지만 모델이 안 부르는 일이 실제로 있었다(2026-09-23: 사용자가 이름을
+            # 세 번 말하고 확인까지 해줬는데 호출 0회, 대화록이 "이름 미확인"으로 저장됨).
+            # 실험 중이면 그 참가자 데이터가 누구 것인지 모르게 되므로 즉시 알아채야 한다.
+            print("\n" + "=" * 60)
+            print("🚨 이름이 저장되지 않은 채 세션이 끝났습니다 (remember_fact 미호출).")
+            print("   대화록이 '이름 미확인'으로 남고, 얼굴도 등록되지 않아 다음에 못 알아봅니다.")
+            print("   실험 중이라면 이 참가자 세션을 다시 진행하세요.")
+            print("=" * 60 + "\n")
         if final_name:
             # facts가 너무 많이 쌓였으면(v2의 batch_update_summary에 대응 — v3엔 없었음,
             # docs/integration-points.md) 세션 종료마다 유사 항목을 병합/압축한다. forget_me로
