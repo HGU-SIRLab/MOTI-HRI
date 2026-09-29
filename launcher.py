@@ -531,6 +531,9 @@ async def run_conversation(name_state: dict, facts_summary: str | None, emotion_
         # 실행 중인(quiz_busy가 곧 motion_busy) 경우도 포함한다 — 로봇이 뭔가
         # 하고 있는 동안은 사용자가 IDLE_SLEEP_SEC만큼 조용해도 잠들면 안 된다는 요구사항.
         last_activity_time = [time.monotonic()]
+        # 코골이 클립이 스피커로 흘러나가는 중인 시각의 상한(monotonic).
+        # snore_player가 갱신하고, 기상 분기가 '코골이만 울리는 중'인지 판단할 때 쓴다.
+        snore_playing_until = [0.0]
         is_sleeping = [False]
         # 로봇의 오디오 청크가 마지막으로 도착한 시각 — barge-in 차단 게이트가 영영 안
         # 풀리는 사고를 막는 시간 상한에만 쓴다(should_withhold_mic 참고). 0.0으로 시작하면
@@ -636,6 +639,15 @@ async def run_conversation(name_state: dict, facts_summary: str | None, emotion_
                                         raise _SessionExpired()
 
                                     sc = message.server_content
+                                    # 턴 경계 신호가 오는 것 자체가 "시스템이 일하고 있다"는
+                                    # 증거다. 여태 활동으로 잡은 건 로봇 오디오·사용자 전사·
+                                    # 퀴즈/모션뿐이라, 뇌가 턴을 시작했다가 오디오를 한 조각도
+                                    # 내지 못하고 취소하면(2026-09-28 실측: 턴 4·5·6 연속 취소)
+                                    # 로봇에게는 "아무 일도 없던 40초"로 보여 SLEEPY로 빠졌다.
+                                    # 그 직후 사용자가 말을 걸면 기상 분기가 스피커를 비우면서
+                                    # 막 들어오던 로봇 발화까지 함께 잘려나간다.
+                                    if sc and (sc.interrupted or sc.turn_complete):
+                                        last_activity_time[0] = time.monotonic()
                                     if sc and sc.interrupted:
                                         # 로봇은 여태 barge-in을 조용히 처리만 하고 기록은 안 남겼다 —
                                         # 뇌 로그의 barge-in 줄과 맞춰볼 로봇 쪽 근거가 없어서, EXP-9
@@ -824,7 +836,21 @@ async def run_conversation(name_state: dict, facts_summary: str | None, emotion_
                     # 코골이 소리가 재생/대기 중이었다면 즉시 끊는다 — snore_player()의
                     # 다음 폴링을 기다리면(최대 SNORE_POLL_SEC) 깬 직후에도 잠깐 더
                     # 들릴 수 있어서, 깨우는 시점에 확실하게 끊어준다.
-                    speaker.stop_immediately()
+                    #
+                    # 단 stop_immediately()는 스피커 버퍼를 통째로 버리므로 코골이인지 로봇
+                    # 발화인지 구분하지 못한다. 잠든 직후 사용자가 말을 걸면 뇌의 응답이 이미
+                    # 흘러들어오기 시작한 상태일 수 있고, 그걸 같이 버리면 사용자는 로봇이
+                    # 말을 삼킨 것으로 느낀다(2026-09-28 실측 — 사용자가 "답변을 제대로 못
+                    # 들었어"라고 말했다). 그래서 로봇이 말하는 중이면 건드리지 않는다.
+                    # 코골이가 조금 더 들리는 쪽이 대답이 잘리는 쪽보다 낫다.
+                    # 지금 스피커에 있는 게 코골이뿐이면 끊는다. 로봇이 실제로 말하는
+                    # 중이면(= 코골이 재생 구간이 아닌데 재생 잔량이 있으면) 건드리지 않는다.
+                    snore_is_playing = time.monotonic() < snore_playing_until[0]
+                    if snore_is_playing or not robot_is_speaking():
+                        speaker.stop_immediately()
+                        snore_playing_until[0] = 0.0
+                    else:
+                        print("   (로봇이 말하는 중이라 스피커 비우기는 건너뜁니다)")
                 elif action == "sleep":
                     is_sleeping[0] = True
                     print(f"💤 {IDLE_SLEEP_SEC:.0f}초간 조용해서 sleepy 상태로 전환합니다.")
@@ -844,6 +870,13 @@ async def run_conversation(name_state: dict, facts_summary: str | None, emotion_
                 if not is_sleeping[0]:
                     await asyncio.sleep(SNORE_POLL_SEC)
                     continue
+                # 코골이도 로봇 발화와 같은 스피커 버퍼를 쓴다. 그래서 robot_is_speaking()은
+                # 코골이가 울리는 동안에도 True가 되어 둘을 구분하지 못한다 — 기상 시
+                # "발화 중이면 스피커를 비우지 않는다"는 가드가 그 신호를 쓰면 코골이를
+                # 영영 못 끊는다(2026-09-28 실측: 로봇은 깨어났는데 코골이가 계속 울려서
+                # 사용자가 "일어나"를 열 번 넘게 외쳤다). 그래서 코골이 재생 구간을 따로
+                # 기록해서 구분한다.
+                snore_playing_until[0] = time.monotonic() + snore_duration_sec
                 speaker.play(snore_pcm)
                 remaining = snore_duration_sec + SNORE_GAP_SEC
                 while remaining > 0 and is_sleeping[0] and not stop_event.is_set():
