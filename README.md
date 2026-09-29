@@ -327,7 +327,7 @@ InsightFace `buffalo_l`은 첫 실행 시 자동 다운로드. `assets/audio/sno
 
 | 키 | 뜻 |
 |---|---|
-| `BRAIN_URI` | 뇌 주소. 기본 `ws://192.168.0.5:8765` |
+| `BRAIN_URI` | 뇌 주소. 같은 랜은 `ws://192.168.0.5:8765`, ZeroTier 경유는 `ws://10.188.190.223:8765` (아래 참고) |
 | `BRAIN_BACKCHANNEL` | 대답 생성 중 "음…" 맞장구. 실물에서 타이밍이 안 맞아 기본 끔 |
 | `QUIZ_EXPERIMENT_MODE` | 🚨 `true`면 페르소나가 **반토막 난다**(33,537자→17,684자, 실측). 퀴즈 실험이 아니면 `false` |
 | `QUIZ_MODE_ORDER` | 참가자별 퀴즈 모드 순서(완전 카운터밸런싱) |
@@ -336,6 +336,37 @@ InsightFace `buffalo_l`은 첫 실행 시 자동 다운로드. `assets/audio/sno
 | `MIC_DEVICE` / `SPEAKER_DEVICE` | 젯슨에서는 `pulse`(AEC 경유) |
 
 전체 목록과 주의사항은 [`.env.example`](.env.example)에 주석으로 있다.
+
+---
+
+## 랜 밖에서 쓰기 — ZeroTier
+
+로봇과 뇌가 같은 랜에 없어도 되게 오버레이 네트워크를 쓴다. Tailscale을 먼저 시도했으나
+학교망이 `controlplane.tailscale.com` SNI를 차단해서 **ZeroTier로 갈아탔다**(2026-09-28).
+
+```bash
+curl -s https://install.zerotier.com | sudo bash
+sudo zerotier-cli join 3b19b3a716435b0c     # Moti_net (PRIVATE)
+sudo zerotier-cli info                      # 10자리 노드 주소 → 뇌 쪽에 승인 요청
+```
+
+승인되면 `.env`의 `BRAIN_URI`만 바꾸면 된다 — **코드는 한 줄도 안 바뀐다.**
+
+```ini
+BRAIN_URI=ws://10.188.190.223:8765
+```
+
+실측(같은 랜에서 ZeroTier 주소로 붙였을 때):
+
+| | |
+|---|---|
+| 경로 | **DIRECT** — 같은 서브넷이면 홀펀칭 없이 서로를 찾는다 (2ms) |
+| ping | ZeroTier 평균 3.9ms / 직결 1.3ms. **지터는 mdev 5.0 vs 0.1ms로 50배** |
+| 첫 오디오 | **중앙값 1.46초** — 직결(약 2.0초)과 실질적 차이 없음 |
+| 모니터 | `http://10.188.190.223:8766/` 접근 가능 |
+
+랜 밖(폰 핫스팟 등)에서는 AGX가 UDP 홀펀칭을 못 해 **RELAY가 될 것으로 예상**되는데,
+그 구간은 **아직 검증하지 않았다.**
 
 ---
 
